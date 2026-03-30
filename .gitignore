@@ -1,0 +1,9 @@
+.env
+wireguard/conf/wg0.conf
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+.pytest_cache/
+.mypy_cache/
+data/

@@ -1,0 +1,24 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 80,
+        "network": "tcp"
+      },
+      "tag": "inbound-demo"
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    }
+  ]
+}
