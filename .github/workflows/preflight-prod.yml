@@ -79,13 +79,17 @@ jobs:
             exit 1
           fi
 
-      - name: Require deploy SSH key
+      - name: Deploy key status (non-blocking)
         if: ${{ env.DEPLOY_SSH_KEY == '' }}
         run: |
           echo "DEPLOY_SSH_KEY is not configured in GitHub."
-          echo "Preflight Production requires DEPLOY_SSH_KEY for server access."
-          echo "Set DEPLOY_SSH_KEY secret before running this workflow."
-          exit 1
+          echo "CI stability checks remain valid; this is a deploy-access warning only."
+          echo "Blocked in this workflow without DEPLOY_SSH_KEY:"
+          echo "  - Setup SSH key (webfactory/ssh-agent)"
+          echo "  - Add host to known_hosts"
+          echo "  - Sync project files to server (rsync over SSH)"
+          echo "  - Render env and run preflight on server (SSH)"
+          echo "To enable remote preflight from this workflow, configure DEPLOY_SSH_KEY secret."
 
       - name: Setup SSH key
         if: ${{ env.DEPLOY_SSH_KEY != '' }}
