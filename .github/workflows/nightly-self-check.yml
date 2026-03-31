@@ -19,15 +19,22 @@ jobs:
       SSH_USER: ${{ vars.SSH_USER }}
       DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
       VPN_PANEL_DOMAIN: ${{ vars.VPN_PANEL_DOMAIN }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
 
     steps:
       - name: Validate required CI vars
         run: |
           set -euo pipefail
-          test -n "${SSH_HOST}"
-          test -n "${SSH_USER}"
-          test -n "${DEPLOY_PATH}"
-          test -n "${VPN_PANEL_DOMAIN}"
+          missing=()
+          for name in SSH_HOST SSH_USER DEPLOY_PATH VPN_PANEL_DOMAIN DEPLOY_SSH_KEY; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("${name}")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required GitHub vars/secrets: ${missing[*]}"
+            exit 1
+          fi
 
       - name: Setup SSH key
         uses: webfactory/ssh-agent@v0.9.0
