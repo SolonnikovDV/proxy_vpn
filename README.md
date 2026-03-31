@@ -210,9 +210,16 @@ sudo TARGET_USER=root \
 
 What it does:
 - installs Docker Engine + Docker Compose plugin
-- installs Git + OpenSSH client
+- installs Git + OpenSSH client/server
 - enables Docker service
+- enables SSH service (`ssh`/`sshd`)
 - clones repository by SSH URL into deploy path
+
+If you want to prepare server environment first and clone later:
+
+```bash
+sudo TARGET_USER=root DEPLOY_PATH=/opt/proxy_vpn CLONE_REPO=0 bash ./scripts/bootstrap-ubuntu.sh
+```
 
 Prerequisite:
 - server must have SSH key configured to access the private GitHub repository.
