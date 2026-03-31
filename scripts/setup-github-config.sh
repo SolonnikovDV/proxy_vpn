@@ -131,13 +131,13 @@ else
   log "DEPLOY_SSH_KEY_PATH is empty, skip DEPLOY_SSH_KEY secret"
 fi
 
+set_repo_secret SSH_HOST "${SSH_HOST}"
+set_repo_secret SSH_USER "${SSH_USER}"
 if [ -n "${SSH_PASSWORD}" ]; then
-  set_repo_secret SSH_HOST "${SSH_HOST}"
-  set_repo_secret SSH_USER "${SSH_USER}"
   set_repo_secret SSH_PASSWORD "${SSH_PASSWORD}"
-  log "Set SSH_HOST/SSH_USER/SSH_PASSWORD secrets (password-based remote auth mode)"
+  log "Set SSH_HOST/SSH_USER/SSH_PASSWORD secrets"
 else
-  log "SSH_PASSWORD is empty, skip SSH_* secrets"
+  log "Set SSH_HOST/SSH_USER secrets; SSH_PASSWORD is empty and was skipped"
 fi
 
 if [ -n "${APP_SECRET_KEY}" ]; then

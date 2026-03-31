@@ -15,7 +15,6 @@ jobs:
     env:
       SSH_HOST: ${{ secrets.SSH_HOST != '' && secrets.SSH_HOST || vars.SSH_HOST }}
       SSH_USER: ${{ secrets.SSH_USER != '' && secrets.SSH_USER || vars.SSH_USER }}
-      SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
       DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
       VPN_PANEL_DOMAIN: ${{ vars.VPN_PANEL_DOMAIN }}
       CADDY_HTTP_PORT: ${{ vars.CADDY_HTTP_PORT }}
@@ -81,9 +80,9 @@ jobs:
           fi
 
       - name: Skip remote preflight when no deploy SSH key
-        if: ${{ env.DEPLOY_SSH_KEY == '' && env.SSH_PASSWORD == '' }}
+        if: ${{ env.DEPLOY_SSH_KEY == '' }}
         run: |
-          echo "Neither DEPLOY_SSH_KEY nor SSH_PASSWORD is configured in GitHub."
+          echo "DEPLOY_SSH_KEY is not configured in GitHub."
           echo "Remote preflight is skipped by design."
           echo "Use server-side auto-update timer and local SSH management."
 
@@ -93,14 +92,8 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
 
-      - name: Install sshpass for password auth
-        if: ${{ env.DEPLOY_SSH_KEY == '' && env.SSH_PASSWORD != '' }}
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y sshpass
-
       - name: Add host to known_hosts
-        if: ${{ env.DEPLOY_SSH_KEY != '' || env.SSH_PASSWORD != '' }}
+        if: ${{ env.DEPLOY_SSH_KEY != '' }}
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -H "${SSH_HOST}" >> ~/.ssh/known_hosts
@@ -109,18 +102,6 @@ jobs:
         if: ${{ env.DEPLOY_SSH_KEY != '' }}
         run: |
           rsync -az --delete \
-            --exclude ".git" \
-            --exclude ".venv" \
-            --exclude "__pycache__" \
-            --exclude ".pytest_cache" \
-            ./ "${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/"
-
-      - name: Sync project files to server (SSH password)
-        if: ${{ env.DEPLOY_SSH_KEY == '' && env.SSH_PASSWORD != '' }}
-        env:
-          SSHPASS: ${{ env.SSH_PASSWORD }}
-        run: |
-          sshpass -e rsync -az --delete -e "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no" \
             --exclude ".git" \
             --exclude ".venv" \
             --exclude "__pycache__" \
@@ -174,51 +155,3 @@ jobs:
             bash ./scripts/preflight-prod.sh
           "
 
-      - name: Render env and run preflight on server (SSH password)
-        if: ${{ env.DEPLOY_SSH_KEY == '' && env.SSH_PASSWORD != '' }}
-        env:
-          SSHPASS: ${{ env.SSH_PASSWORD }}
-        run: |
-          sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${SSH_USER}@${SSH_HOST}" "
-            set -euo pipefail
-            cd '${DEPLOY_PATH}'
-            if [ '${RENDER_ENV_FROM_CI:-0}' = '1' ]; then
-              export CADDYFILE_PATH='${CADDYFILE_PATH}'
-              export VPN_PANEL_DOMAIN='${VPN_PANEL_DOMAIN}'
-              export CADDY_HTTP_PORT='${CADDY_HTTP_PORT}'
-              export CADDY_HTTPS_PORT='${CADDY_HTTPS_PORT}'
-              export XRAY_PORT='${XRAY_PORT}'
-              export WG_PORT='${WG_PORT}'
-              export ADMIN_USERNAME='${ADMIN_USERNAME}'
-              export ADMIN_EMAIL='${ADMIN_EMAIL}'
-              export APP_SECRET_KEY_FILE='${APP_SECRET_KEY_FILE}'
-              export ADMIN_PASSWORD_FILE='${ADMIN_PASSWORD_FILE}'
-              export CAPACITY_TARGET_ACTIVE_USERS='${CAPACITY_TARGET_ACTIVE_USERS}'
-              export CAPACITY_CPU_WARN_P95='${CAPACITY_CPU_WARN_P95}'
-              export CAPACITY_CPU_CRIT_P95='${CAPACITY_CPU_CRIT_P95}'
-              export CAPACITY_RAM_WARN_P95='${CAPACITY_RAM_WARN_P95}'
-              export CAPACITY_RAM_CRIT_P95='${CAPACITY_RAM_CRIT_P95}'
-              export CAPACITY_DISK_WARN_P95='${CAPACITY_DISK_WARN_P95}'
-              export CAPACITY_DISK_CRIT_P95='${CAPACITY_DISK_CRIT_P95}'
-              export DASHBOARD_REFRESH_SECONDS='${DASHBOARD_REFRESH_SECONDS}'
-              export LOGIN_MAX_ATTEMPTS='${LOGIN_MAX_ATTEMPTS}'
-              export LOGIN_WINDOW_MINUTES='${LOGIN_WINDOW_MINUTES}'
-              export LOGIN_LOCK_MINUTES='${LOGIN_LOCK_MINUTES}'
-              export SECURITY_GEOIP_ENABLED='${SECURITY_GEOIP_ENABLED}'
-              export SECURITY_GEOIP_TIMEOUT_SECONDS='${SECURITY_GEOIP_TIMEOUT_SECONDS}'
-              export SECURITY_DEFAULT_BLOCK_SECONDS='${SECURITY_DEFAULT_BLOCK_SECONDS}'
-              export SECURITY_HTTP_WINDOW_SECONDS='${SECURITY_HTTP_WINDOW_SECONDS}'
-              export SECURITY_HTTP_MAX_REQUESTS='${SECURITY_HTTP_MAX_REQUESTS}'
-              export SECURITY_PROBE_PATH_THRESHOLD='${SECURITY_PROBE_PATH_THRESHOLD}'
-              export SECURITY_BLOCK_SECONDS_DDOS='${SECURITY_BLOCK_SECONDS_DDOS}'
-              export SECURITY_BLOCK_SECONDS_BRUTE='${SECURITY_BLOCK_SECONDS_BRUTE}'
-              export SECURITY_SERVER_CHECK_INTERVAL_SECONDS='${SECURITY_SERVER_CHECK_INTERVAL_SECONDS}'
-              export SECURITY_SERVER_EVENT_COOLDOWN_SECONDS='${SECURITY_SERVER_EVENT_COOLDOWN_SECONDS}'
-              export APP_SECRET_KEY='${APP_SECRET_KEY}'
-              export ADMIN_PASSWORD='${ADMIN_PASSWORD}'
-              bash ./scripts/render-prod-env.sh
-            else
-              echo 'Using server-side .env (RENDER_ENV_FROM_CI=0)'
-            fi
-            bash ./scripts/preflight-prod.sh
-          "

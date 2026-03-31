@@ -95,10 +95,10 @@ bash ./scripts/setup-github-config.sh
 # Optional only for GitHub -> SSH deploy:
 # DEPLOY_SSH_KEY_PATH="$HOME/.ssh/id_ed25519" bash ./scripts/setup-github-config.sh
 
-12) Optional: save root/password as GitHub secrets for login helper (same unified script):
+12) Optional: configure SSH key for GitHub remote workflows (same unified script):
 SSH_HOST="v734690.hosted-by-vdsina.com" \
 SSH_USER="root" \
-SSH_PASSWORD="CHANGE_ME_SERVER_PASSWORD" \
+DEPLOY_SSH_KEY_PATH="$HOME/.ssh/id_ed25519" \
 bash ./scripts/setup-github-config.sh
 
 13) Login helper:

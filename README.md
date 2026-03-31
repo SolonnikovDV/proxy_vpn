@@ -174,8 +174,7 @@ Workflow:
 
 Create GitHub **Secrets**:
 - none required for default pull-based mode
-- optional only if you intentionally enable remote deploy over GitHub SSH: `DEPLOY_SSH_KEY`
-- optional password-based remote auth: `SSH_PASSWORD` (workflow uses `sshpass` fallback when `DEPLOY_SSH_KEY` is missing)
+- required for GitHub-initiated remote deploy/preflight over SSH: `DEPLOY_SSH_KEY`
 
 Create GitHub **Variables**:
 - Minimal: `SSH_HOST`, `SSH_USER`, `DEPLOY_PATH`, `VPN_PANEL_DOMAIN` (or `SSH_HOST`/`SSH_USER` via secrets)
@@ -203,14 +202,6 @@ ADMIN_EMAIL="admin@example.com" \
 APP_SECRET_KEY_FILE="/etc/proxy-vpn/secrets/app_secret_key" \
 ADMIN_PASSWORD_FILE="/etc/proxy-vpn/secrets/admin_password" \
 RENDER_ENV_FROM_CI="0" \
-bash ./scripts/setup-github-config.sh
-
-# Optional: password-based remote auth secrets (SSH_HOST/SSH_USER/SSH_PASSWORD)
-SSH_HOST="v734690.hosted-by-vdsina.com" \
-SSH_USER="root" \
-SSH_PASSWORD="CHANGE_ME_SERVER_PASSWORD" \
-DEPLOY_PATH="/opt/proxy_vpn" \
-VPN_PANEL_DOMAIN="v734690.hosted-by-vdsina.com" \
 bash ./scripts/setup-github-config.sh
 
 # Optional: inline app secrets for RENDER_ENV_FROM_CI=1
@@ -323,14 +314,14 @@ bash ./scripts/setup-github-ssh.sh
 
 Then add printed public key as Deploy Key in GitHub repository (read-only is enough for pull).
 
-## Server login by GitHub secrets (root/password)
+## Server login by GitHub secrets (SSH key)
 
 Store server login data in repository secrets:
 
 ```bash
 SSH_HOST="v734690.hosted-by-vdsina.com" \
 SSH_USER="root" \
-SSH_PASSWORD="CHANGE_ME_SERVER_PASSWORD" \
+DEPLOY_SSH_KEY_PATH="$HOME/.ssh/id_ed25519" \
 bash ./scripts/setup-github-config.sh
 ```
 
