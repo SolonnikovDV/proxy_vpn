@@ -2,6 +2,35 @@
 
 Docker-based stack: WireGuard + Xray + FastAPI + Caddy.
 
+## Quick Start (server-only)
+
+Minimal path when you start from a clean Ubuntu server and want to configure everything from server console:
+
+```bash
+# 1) Connect to server and install base packages
+apt-get update -y && apt-get install -y git curl
+
+# 2) Clone private repository (ensure deploy key is available)
+mkdir -p /opt/proxy_vpn
+cd /opt/proxy_vpn
+test -d .git || git clone git@github.com:SolonnikovDV/proxy_vpn.git .
+
+# 3) Run interactive bootstrap (asks required values, configures repo/keys/vpn/env)
+sudo bash ./scripts/bootstrap-ubuntu.sh
+
+# 4) Start production stack
+bash ./scripts/run.sh prod up
+
+# 5) Validate health
+MODE=prod HEALTH_TIMEOUT=120 bash ./scripts/healthcheck-stack.sh
+
+# 6) Enable scheduled auto-update and backups
+sudo DEPLOY_PATH=/opt/proxy_vpn RUN_USER=root BRANCH=main MODE=prod ON_CALENDAR="*:0/15" UPDATE_APPROVAL_REQUIRED=0 \
+  bash ./scripts/setup-auto-update.sh
+sudo DEPLOY_PATH=/opt/proxy_vpn RUN_USER=root MODE=prod ON_CALENDAR="daily" RETENTION_COUNT=14 \
+  bash ./scripts/setup-backup.sh
+```
+
 ## Local dev
 
 ```bash
@@ -89,13 +118,13 @@ sudo sh -c "printf '%s' 'CHANGE_ME_STRONG_ADMIN_PASSWORD' > /etc/proxy-vpn/secre
 sudo chmod 600 /etc/proxy-vpn/secrets/app_secret_key /etc/proxy-vpn/secrets/admin_password
 ```
 
-3. Generate WireGuard server+client config:
+3. (Optional manual mode) Generate WireGuard server+client config:
 
 ```bash
 SERVER_PUBLIC_IP=YOUR_SERVER_IP_OR_DOMAIN bash ./scripts/setup-wireguard.sh
 ```
 
-4. Generate Xray VLESS+REALITY config:
+4. (Optional manual mode) Generate Xray VLESS+REALITY config:
 
 ```bash
 SERVER_PUBLIC_IP=YOUR_SERVER_IP_OR_DOMAIN XRAY_PORT=8443 bash ./scripts/setup-xray-reality.sh
@@ -165,7 +194,8 @@ bash ./scripts/run.sh prod up
 
 ## GitHub Secrets/Variables deploy
 
-Default recommended mode keeps secrets on server in root-only files, not in GitHub and not in repository.
+Default recommended mode keeps app secrets on server in root-only files (not in repository).
+For GitHub remote workflows (`Preflight Production`, `Deploy Production`), `DEPLOY_SSH_KEY` is required.
 
 Workflow:
 - `.github/workflows/ci-checks.yml`
@@ -175,8 +205,8 @@ Workflow:
 - runs preflight-only or preflight+deploy on the target host over SSH
 
 Create GitHub **Secrets**:
-- none required for default pull-based mode
 - required for GitHub-initiated remote deploy/preflight over SSH: `DEPLOY_SSH_KEY`
+- bootstrap can configure this from server interactively (`CONFIGURE_GITHUB_ACTIONS_FROM_SERVER=1`)
 
 Create GitHub **Variables**:
 - Minimal: `SSH_HOST`, `SSH_USER`, `DEPLOY_PATH`, `VPN_PANEL_DOMAIN` (or `SSH_HOST`/`SSH_USER` via secrets)
@@ -230,7 +260,6 @@ Recommended protection:
 - enable **required reviewers** for this environment
 - both workflows use `environment: production`, so deployment requires manual approval
 - run **Preflight Production** first, then **Deploy Production**
-- `Deploy Production` has a preflight gate: it fails if there is no successful recent preflight on the same branch
 
 Manual alternative:
 
@@ -261,20 +290,15 @@ CADDYFILE_PATH=Caddyfile.prod
 
 ## Bare Ubuntu bootstrap
 
-For a fresh Ubuntu 24.04 server, use:
+Run from the cloned repository on server:
 
 ```bash
-sudo TARGET_USER=root \
-  REPO_SSH_URL=git@github.com:SolonnikovDV/proxy_vpn.git \
-  DEPLOY_PATH=/opt/proxy_vpn \
-  VPN_PANEL_DOMAIN=vpn.example.com \
-  ADMIN_USERNAME=admin \
-  ADMIN_EMAIL=admin@example.com \
-  APP_SECRET_KEY_FILE=/etc/proxy-vpn/secrets/app_secret_key \
-  ADMIN_PASSWORD_FILE=/etc/proxy-vpn/secrets/admin_password \
-  BOOTSTRAP_ADMIN_PASSWORD='CHANGE_ME_STRONG_ADMIN_PASSWORD' \
-  bash ./scripts/bootstrap-ubuntu.sh
+cd /opt/proxy_vpn
+sudo bash ./scripts/bootstrap-ubuntu.sh
 ```
+
+In interactive mode, bootstrap asks required values in console (including `VPN_PANEL_DOMAIN`, `SERVER_PUBLIC_IP`, `ADMIN_EMAIL`, admin password) and can also configure GitHub Actions vars/secrets directly from server (with GitHub token). For `VPN_PANEL_DOMAIN` and `SERVER_PUBLIC_IP`, no defaults are used; values must be entered explicitly.
+For non-interactive runs, pass env vars explicitly.
 
 What it does:
 - installs Docker Engine + Docker Compose plugin
@@ -284,9 +308,12 @@ What it does:
 - installs and enables unattended-upgrades
 - enables Docker service
 - enables SSH service (`ssh`/`sshd`)
-- clones repository by SSH URL into deploy path
+- configures GitHub repository SSH access (generates deploy key, validates access, supports pre-seeded key)
+- clones repository by SSH URL into deploy path (and auto-pulls latest commit on rerun)
+- auto-generates WireGuard and Xray REALITY configs for production
 - creates secret files (`APP_SECRET_KEY_FILE`, `ADMIN_PASSWORD_FILE`) if missing
 - renders `${DEPLOY_PATH}/.env` with app/runtime variables and secret file paths
+- can configure GitHub Actions vars/secrets from server side (no local setup required)
 
 Optional bootstrap flags:
 - `FORCE_ROTATE_SECRETS=1` - rotate secret files even if they already exist
@@ -296,6 +323,15 @@ Optional bootstrap flags:
 - `ENABLE_FAIL2BAN=0` - skip fail2ban setup (not recommended)
 - `ENABLE_UNATTENDED_UPGRADES=0` - skip security auto-updates
 - `SSH_PORT=22` - custom SSH port for UFW/fail2ban profile
+- `AUTO_PULL_REPO=0` - skip auto `git pull --ff-only` on existing clone
+- `AUTO_GENERATE_VPN_CONFIGS=0` - skip automatic WireGuard/Xray config generation
+- `FORCE_REGENERATE_VPN_CONFIGS=1` - force regeneration of WireGuard/Xray configs
+- `CONFIGURE_GITHUB_REPO_ACCESS=0` - skip GitHub SSH key management and validation
+- `GITHUB_DEPLOY_KEY_B64=<base64-private-key>` - pre-seed deploy key for non-interactive bootstrap
+- `CONFIGURE_GITHUB_ACTIONS_FROM_SERVER=0` - skip server-side GitHub Actions vars/secrets setup
+- `GITHUB_ACTIONS_REPO=owner/repo` - explicit repository for server-side GitHub Actions config
+- `GITHUB_ACTIONS_TOKEN=<token>` - token for server-side GitHub Actions config
+- `GITHUB_ACTIONS_INCLUDE_SSH_PASSWORD=1` - additionally store `SSH_PASSWORD` secret from interactive prompt
 
 If you want to prepare server environment first and clone later:
 
@@ -306,23 +342,19 @@ sudo TARGET_USER=root DEPLOY_PATH=/opt/proxy_vpn CLONE_REPO=0 bash ./scripts/boo
 Prerequisite:
 - server must have SSH key configured to access the private GitHub repository.
 
-## GitHub SSH on server
+## GitHub Actions config paths
 
-Configure deploy SSH key for repository access:
+Two supported ways:
+- server-side (recommended for bare machine): bootstrap interactive flow with `CONFIGURE_GITHUB_ACTIONS_FROM_SERVER=1`
+- manual script mode: `bash ./scripts/setup-github-config.sh`
 
-```bash
-bash ./scripts/setup-github-ssh.sh
-```
-
-Then add printed public key as Deploy Key in GitHub repository (read-only is enough for pull).
-
-## Server login by GitHub secrets (SSH key)
-
-Store server login data in repository secrets:
+Manual script example:
 
 ```bash
 SSH_HOST="v734690.hosted-by-vdsina.com" \
 SSH_USER="root" \
+DEPLOY_PATH="/opt/proxy_vpn" \
+VPN_PANEL_DOMAIN="v734690.hosted-by-vdsina.com" \
 DEPLOY_SSH_KEY_PATH="$HOME/.ssh/id_ed25519" \
 bash ./scripts/setup-github-config.sh
 ```

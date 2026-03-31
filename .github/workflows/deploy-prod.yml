@@ -86,12 +86,13 @@ jobs:
             exit 1
           fi
 
-      - name: Skip remote deploy when no deploy SSH key
+      - name: Require deploy SSH key
         if: ${{ env.DEPLOY_SSH_KEY == '' }}
         run: |
           echo "DEPLOY_SSH_KEY is not configured in GitHub."
-          echo "Remote deploy is skipped by design."
-          echo "Use server-side auto-update timer and local SSH management."
+          echo "Deploy Production requires DEPLOY_SSH_KEY for server access."
+          echo "Set DEPLOY_SSH_KEY secret or run server-side auto-update strategy separately."
+          exit 1
 
       - name: Setup SSH key
         if: ${{ env.DEPLOY_SSH_KEY != '' }}
