@@ -7,10 +7,10 @@ services:
     container_name: proxy-vpn-caddy
     restart: unless-stopped
     ports:
-      - "80:80"
-      - "8443:443"
+      - "${CADDY_HTTP_PORT:-18080}:80"
+      - "${CADDY_HTTPS_PORT:-18443}:443"
     volumes:
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/${CADDYFILE_PATH:-Caddyfile.dev}:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
     networks:
@@ -32,6 +32,8 @@ services:
       - api-data:/data
       - ./xray:/xray-config:rw
       - ./wireguard/conf:/wireguard-config:rw
+      - ./logs:/logs:rw
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - proxy-vpn
     expose:
@@ -47,7 +49,7 @@ services:
     networks:
       - proxy-vpn
     ports:
-      - "${XRAY_PORT:-443}:443/tcp"
+      - "${XRAY_PORT:-14443}:443/tcp"
 
   wireguard:
     build:

@@ -1,4 +1,23 @@
 {
+  "api": {
+    "services": [
+      "StatsService"
+    ],
+    "tag": "api"
+  },
+  "stats": {},
+  "policy": {
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true
+    },
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true
+      }
+    }
+  },
   "log": {
     "loglevel": "warning"
   },
@@ -6,15 +25,44 @@
     {
       "listen": "0.0.0.0",
       "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "18a6ed8e-2890-4f43-8cec-84992827c764",
+            "flow": "xtls-rprx-vision",
+            "email": "admin-1@proxy-vpn"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "tag": "vless-dev-in"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10085,
       "protocol": "dokodemo-door",
       "settings": {
-        "address": "127.0.0.1",
-        "port": 80,
-        "network": "tcp"
+        "address": "127.0.0.1"
       },
-      "tag": "inbound-demo"
+      "tag": "api-in"
     }
   ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "api-in"
+        ],
+        "outboundTag": "api"
+      }
+    ]
+  },
   "outbounds": [
     {
       "protocol": "freedom",

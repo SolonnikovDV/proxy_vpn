@@ -1,0 +1,36 @@
+{
+    admin off
+}
+
+{$VPN_PANEL_DOMAIN} {
+    encode gzip
+
+    # Automatic HTTPS via Caddy + Let's Encrypt for real domain.
+    handle / {
+        reverse_proxy api:8000
+    }
+    handle /admin {
+        reverse_proxy api:8000
+    }
+    handle /cabinet {
+        reverse_proxy api:8000
+    }
+    handle /login {
+        reverse_proxy api:8000
+    }
+    handle /health {
+        reverse_proxy api:8000
+    }
+    handle /api/* {
+        reverse_proxy api:8000
+    }
+    handle /docs {
+        reverse_proxy api:8000
+    }
+    handle /openapi.json {
+        reverse_proxy api:8000
+    }
+    handle {
+        respond "proxy-vpn panel" 200
+    }
+}

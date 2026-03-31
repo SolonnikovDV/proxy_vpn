@@ -1,0 +1,69 @@
+name: Nightly Self Check
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
+
+jobs:
+  self_check:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    concurrency:
+      group: proxy-vpn-nightly-self-check
+      cancel-in-progress: true
+
+    env:
+      SSH_HOST: ${{ vars.SSH_HOST }}
+      SSH_USER: ${{ vars.SSH_USER }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+      VPN_PANEL_DOMAIN: ${{ vars.VPN_PANEL_DOMAIN }}
+
+    steps:
+      - name: Validate required CI vars
+        run: |
+          set -euo pipefail
+          test -n "${SSH_HOST}"
+          test -n "${SSH_USER}"
+          test -n "${DEPLOY_PATH}"
+          test -n "${VPN_PANEL_DOMAIN}"
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Add host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${SSH_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Check stack on target host
+        run: |
+          ssh "${SSH_USER}@${SSH_HOST}" "
+            set -euo pipefail
+            cd '${DEPLOY_PATH}'
+            MODE=prod HEALTH_TIMEOUT=120 bash ./scripts/healthcheck-stack.sh
+            if docker compose version >/dev/null 2>&1; then
+              docker compose -f compose.yaml -f compose.prod.yaml ps
+            elif command -v docker-compose >/dev/null 2>&1; then
+              docker-compose -f compose.yaml -f compose.prod.yaml ps
+            else
+              echo 'Docker Compose not found on target host'
+              exit 1
+            fi
+          "
+
+      - name: External HTTPS health check
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 10 "https://${VPN_PANEL_DOMAIN}/health" >/dev/null; then
+              echo "External health check passed"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "External health check failed"
+          exit 1

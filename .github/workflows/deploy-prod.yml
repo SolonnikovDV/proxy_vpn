@@ -1,0 +1,127 @@
+name: Deploy Production
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://${{ vars.VPN_PANEL_DOMAIN }}
+    concurrency:
+      group: proxy-vpn-production
+      cancel-in-progress: false
+
+    env:
+      SSH_HOST: ${{ vars.SSH_HOST }}
+      SSH_USER: ${{ vars.SSH_USER }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+      VPN_PANEL_DOMAIN: ${{ vars.VPN_PANEL_DOMAIN }}
+      CADDY_HTTP_PORT: ${{ vars.CADDY_HTTP_PORT }}
+      CADDY_HTTPS_PORT: ${{ vars.CADDY_HTTPS_PORT }}
+      XRAY_PORT: ${{ vars.XRAY_PORT }}
+      WG_PORT: ${{ vars.WG_PORT }}
+      CADDYFILE_PATH: Caddyfile.prod
+      ADMIN_USERNAME: ${{ vars.ADMIN_USERNAME }}
+      ADMIN_EMAIL: ${{ vars.ADMIN_EMAIL }}
+      PREFLIGHT_MAX_AGE_MIN: ${{ vars.PREFLIGHT_MAX_AGE_MIN }}
+      APP_SECRET_KEY: ${{ secrets.APP_SECRET_KEY }}
+      ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required CI vars
+        run: |
+          set -euo pipefail
+          test -n "${SSH_HOST}"
+          test -n "${SSH_USER}"
+          test -n "${DEPLOY_PATH}"
+          test -n "${VPN_PANEL_DOMAIN}"
+          test -n "${APP_SECRET_KEY}"
+          test -n "${ADMIN_PASSWORD}"
+
+      - name: Require recent successful preflight
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const branch = context.ref.replace('refs/heads/', '');
+            const maxAgeMin = Number(process.env.PREFLIGHT_MAX_AGE_MIN || '60');
+
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: 'preflight-prod.yml',
+              branch,
+              status: 'completed',
+              per_page: 30
+            });
+
+            const success = runs.data.workflow_runs
+              .filter(r => r.conclusion === 'success')
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+
+            if (!success) {
+              core.setFailed('No successful "Preflight Production" run found for this branch.');
+              return;
+            }
+
+            const ageMs = Date.now() - new Date(success.created_at).getTime();
+            const maxAgeMs = maxAgeMin * 60 * 1000;
+            if (ageMs > maxAgeMs) {
+              core.setFailed(
+                `Latest successful preflight is too old: ${Math.floor(ageMs / 60000)} min (allowed ${maxAgeMin} min).`
+              );
+              return;
+            }
+
+            core.info(`Preflight gate passed: run #${success.run_number}, age ${Math.floor(ageMs / 60000)} min.`);
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Add host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${SSH_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Sync project files to server
+        run: |
+          rsync -az --delete \
+            --exclude ".git" \
+            --exclude ".venv" \
+            --exclude "__pycache__" \
+            --exclude ".pytest_cache" \
+            ./ "${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/"
+
+      - name: Render env and deploy on server
+        run: |
+          ssh "${SSH_USER}@${SSH_HOST}" "
+            set -euo pipefail
+            cd '${DEPLOY_PATH}'
+            export CADDYFILE_PATH='${CADDYFILE_PATH}'
+            export VPN_PANEL_DOMAIN='${VPN_PANEL_DOMAIN}'
+            export CADDY_HTTP_PORT='${CADDY_HTTP_PORT}'
+            export CADDY_HTTPS_PORT='${CADDY_HTTPS_PORT}'
+            export XRAY_PORT='${XRAY_PORT}'
+            export WG_PORT='${WG_PORT}'
+            export ADMIN_USERNAME='${ADMIN_USERNAME}'
+            export ADMIN_EMAIL='${ADMIN_EMAIL}'
+            export APP_SECRET_KEY='${APP_SECRET_KEY}'
+            export ADMIN_PASSWORD='${ADMIN_PASSWORD}'
+            bash ./scripts/render-prod-env.sh
+            bash ./scripts/preflight-prod.sh
+            bash ./scripts/deploy-prod.sh
+          "

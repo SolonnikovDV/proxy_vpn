@@ -1,5 +1,11 @@
 .env
-wireguard/conf/wg0.conf
+wireguard/conf/*.conf
+!wireguard/conf/.gitkeep
+xray/config.json
+xray/client-connection.txt
+xray/clients/
+exports/*.csv
+exports/*.json
 .venv/
 __pycache__/
 *.py[cod]
