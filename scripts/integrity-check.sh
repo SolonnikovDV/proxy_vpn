@@ -17,8 +17,8 @@ require_file_nonempty() {
 check_repo_contract() {
   log "[repo] Checking repository integrity contract..."
   require_file_nonempty "compose.yaml"
-  require_file_nonempty ".env.example"
-  require_file_nonempty ".env.prod.example"
+  require_file_nonempty ".env.local.example"
+  require_file_nonempty ".env.production.example"
   require_file_nonempty "api/app/main.py"
   require_file_nonempty "scripts/backup-critical.sh"
   require_file_nonempty "scripts/restore-critical.sh"
@@ -30,7 +30,7 @@ check_repo_contract() {
   grep -Eq "security-guard:" compose.yaml || die "compose.yaml missing security-guard service"
 
   for k in APP_SECRET_KEY_FILE ADMIN_PASSWORD_FILE; do
-    grep -Eq "^${k}=" .env.prod.example || die ".env.prod.example missing ${k}"
+    grep -Eq "^${k}=" .env.production.example || die ".env.production.example missing ${k}"
   done
 
   for t in users sessions metric_samples system_config; do

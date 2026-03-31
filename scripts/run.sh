@@ -41,7 +41,7 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 run_local() {
-  [ -f .env ] || cp .env.example .env
+  bash ./scripts/sync-env.sh local
   export CADDYFILE_PATH="${CADDYFILE_PATH:-Caddyfile.dev}"
   export CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-18080}"
   export CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-18443}"
@@ -76,7 +76,7 @@ run_local() {
 }
 
 run_prod() {
-  [ -f .env ] || cp .env.prod.example .env
+  bash ./scripts/sync-env.sh prod
   case "${ACTION}" in
     up)
       bash ./scripts/preflight-prod.sh

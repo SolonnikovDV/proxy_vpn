@@ -44,11 +44,11 @@ for p in root.rglob("*"):
             violations.append(f"{p.relative_to(root)}: pattern={pat.pattern}")
             break
 
-env_prod = root / ".env.prod.example"
+env_prod = root / ".env.production.example"
 if env_prod.exists():
     txt = env_prod.read_text(encoding="utf-8", errors="ignore")
     if re.search(r"^APP_SECRET_KEY=", txt, flags=re.M) or re.search(r"^ADMIN_PASSWORD=", txt, flags=re.M):
-        violations.append(".env.prod.example: inline APP_SECRET_KEY/ADMIN_PASSWORD is not allowed")
+        violations.append(".env.production.example: inline APP_SECRET_KEY/ADMIN_PASSWORD is not allowed")
 
 if violations:
     print("Potential sensitive content found:")

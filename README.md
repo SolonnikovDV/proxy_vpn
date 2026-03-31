@@ -5,7 +5,6 @@ Docker-based stack: WireGuard + Xray + FastAPI + Caddy.
 ## Local dev
 
 ```bash
-cp .env.example .env
 bash ./scripts/run.sh local up
 ```
 
@@ -60,10 +59,13 @@ Recommended clients by platform (approved baseline):
 ## Production
 
 1. Prepare environment:
+- `.env` is auto-synced from `.env.production.example` by `scripts/run.sh` and `scripts/auto-update.sh`
+- existing values in `.env` are preserved and missing keys are filled from the template
 
-```bash
-cp .env.prod.example .env
-```
+Why `.env` exists:
+- `.env.local.example` and `.env.production.example` are templates
+- `.env` is auto-generated/synced runtime config consumed by Docker Compose and app services
+- sync script keeps your current `.env` values and adds missing keys from template
 
 2. Edit `.env`:
 - `VPN_PANEL_DOMAIN` -> your real domain (DNS A record to server IP)

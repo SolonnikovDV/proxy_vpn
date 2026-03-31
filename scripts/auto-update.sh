@@ -201,7 +201,7 @@ git pull --ff-only origin "${BRANCH}"
 
 deploy_current() {
   if [ "${MODE}" = "prod" ]; then
-    [ -f .env ] || cp .env.prod.example .env
+    bash ./scripts/sync-env.sh prod
     log "Running production preflight"
     bash ./scripts/preflight-prod.sh
     log "Rebuilding/restarting production stack"
@@ -209,7 +209,7 @@ deploy_current() {
     dc -f compose.yaml -f compose.prod.yaml ps
     MODE=prod HEALTH_TIMEOUT=90 bash ./scripts/healthcheck-stack.sh
   else
-    [ -f .env ] || cp .env.example .env
+    bash ./scripts/sync-env.sh local
     log "Rebuilding/restarting local stack"
     dc -f compose.yaml up -d --build
     dc -f compose.yaml ps

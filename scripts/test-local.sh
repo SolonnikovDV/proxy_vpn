@@ -76,7 +76,7 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-test -f .env || cp .env.example .env
+bash ./scripts/sync-env.sh local
 
 # Compose interpolates ${...}; shell env overrides .env.
 # If user didn't set ports explicitly, pick a free one from a short fallback list.
