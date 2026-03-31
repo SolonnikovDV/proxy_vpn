@@ -1,36 +1,48 @@
-[x] вместо хранение в env секретов, исопльзование github Secrets and variables (Encrypted Secrets) с передачей ссылок на переменные в скрипты деплоя
+## Done Log
 
-[x] внедрить меанизм подготовки голой машины для разертывания инфраструктуры для проекта:
-    - docker, docker compose, git
-    - клонирование git@github.com:SolonnikovDV/proxy_vpn.git
-    - реализовано в `scripts/bootstrap-ubuntu.sh`
+### Platform and Deployment
+- [x] Bare Ubuntu bootstrap for Docker/Git/SSH and app env/secrets provisioning in `scripts/bootstrap-ubuntu.sh`
+- [x] GitHub SSH helper for private repository mode in `scripts/setup-github-ssh.sh`
+- [x] Scheduled pull-based update and rebuild via `scripts/auto-update.sh` + `scripts/setup-auto-update.sh`
+- [x] Safe rollback on failed deploy/update via `scripts/healthcheck-stack.sh`, `scripts/deploy-prod.sh`, `scripts/auto-update.sh`
+- [x] Deployment history log in `logs/deploy-history.log` with admin dashboard visibility
+
+### Security and Secrets
+- [x] File-based secrets support (`APP_SECRET_KEY_FILE`, `ADMIN_PASSWORD_FILE`) wired in app config and preflight
+- [x] Sensitive-data repository scanner in `scripts/audit-sensitive.sh`
+- [x] Optional generated bootstrap admin password report in `scripts/bootstrap-ubuntu.sh`
+
+### Admin/User Functionality
+- [x] Registration approval flow and admin-driven user/admin creation
+- [x] User block/unblock/delete actions in Admin -> Users
+- [x] Live online users, system metrics, and combined WG+Xray per-user traffic monitoring
+- [x] Service health dashboard with container states and modal logs
+- [x] User cabinet improvements: profile card/edit modal and device setup card
+
+### UI/UX
+- [x] Section organizer tabs with active highlighting
+- [x] Modal create-user flow and improved admin actions feedback
+- [x] Simplified recommended free clients per platform with one-click install links
+
+### Quality and CI
+- [x] Smoke test one-command runner `scripts/test-smoke.sh`
+- [x] FastAPI startup migration from `@app.on_event` to lifespan
+- [x] CI checks workflow `.github/workflows/ci-checks.yml` (sensitive audit + smoke tests)
+- [x] Keep both deployment modes: local and production
 
 
-вижу ключевую проблему администрирования и аутентификации:
-ui совершенно не информативный
-[x] регистрация нового пользователя отправляет запрос на апрув админу и позволяет зарегистрироваться только после апрува с записью в БД
-[x] админ может сам создать учетную запись пользователя или админа с выбором роли
-[x] админская панель показывает пользователей онлайн (по активным сессиям)
-[x] показывает расход трафика и нагрузку на сервер в динамике (реализовано: серверный realtime + точный per-user WireGuard/Xray при bind peer/client -> user)
-[x] показывает summary трафика (24h) и среднюю нагрузку на сервер (1h)
-инымисловами, в UI отсутствуют какие либо элементы администрирования и управления системой и пользаками, мониторинга состояния системы и ее элементов
-[x] просканировать сеть на предмет таких реализаций (администрирование, управление, апрувы, изменения, мониторинг, логи)
-
-[x] на админской панели во вкладке Users в Recent users добавить функции удалить/блокировать пользователя (delete из БД, block = ограничение пользования сервисом)
-
-[x] Create user/admin сделать кнопкой с модальным окном формы добавления пользователя
-[x] переключатели секций (Overview/Approvals/Users/Traffic/Logs) оформить как вкладки органайзера с подсветкой активной вкладки
-[x] в карточке пользователя добавить подбор устройства (mobile/desktop + platform), готовый конфиг и кликабельные ссылки на бесплатные клиенты (store/github) с приоритетом доступности для РФ
 
 
-[x] отстроить сш на гитхаб (реализовано: `scripts/setup-github-ssh.sh`)
 
-[x] обновление репозитрия по расписанию (cd стадия) и обновление и пересборка системы при обнаружении изменений в компонентах системы (реализовано: `scripts/auto-update.sh` + `scripts/setup-auto-update.sh`)
 
-[x] безопасный rollback после неуспешного деплоя/автообновления (реализовано: `scripts/healthcheck-stack.sh`, fallback в `scripts/deploy-prod.sh` и `scripts/auto-update.sh`)
 
-новый блок надежности эксплуатации:
-[x] журнал деплоя/отката в файл (`logs/deploy-history.log`) с commit/status/reason
-[x] nightly self-check workflow (cron) с проверкой `/health` и статусов контейнеров на проде
-[x] миграция FastAPI startup/shutdown с `@app.on_event` на lifespan
+- [x] Приложение адаптировано для мобильных устройств: динамическая адаптация контента и поддержка поворота экрана
+- [x] Добавлено переключение в ночную цветовую схему
 
+
+
+- [x] В страницу About добавлена информация об авторстве, правах и лицензии
+- [x] Добавлена MIT лицензия и ссылки на лицензию в приложении
+- [x] Добавлен автор приложения в футер с контактом Telegram: https://t.me/Dmitry_as_Solod
+
+- [x] Панель администратора разгружена: контент разделен на дочерние блоки (sub-tabs) внутри основных разделов

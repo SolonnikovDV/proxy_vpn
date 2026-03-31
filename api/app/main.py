@@ -1,11 +1,14 @@
 import hashlib
 import hmac
+import ipaddress
 import os
 import re
 import secrets
 import sqlite3
 import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -32,26 +35,57 @@ SESSION_COOKIE = "proxy_vpn_session"
 CSRF_COOKIE = "proxy_vpn_csrf"
 CSRF_HEADER = "x-csrf-token"
 PBKDF2_ITERATIONS = 150_000
-LOGIN_MAX_ATTEMPTS = 5
-LOGIN_WINDOW_MINUTES = 10
-LOGIN_LOCK_MINUTES = 15
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
+LOGIN_WINDOW_MINUTES = int(os.getenv("LOGIN_WINDOW_MINUTES", "10"))
+LOGIN_LOCK_MINUTES = int(os.getenv("LOGIN_LOCK_MINUTES", "15"))
 ONLINE_WINDOW_SECONDS = 300
 METRICS_SAMPLE_INTERVAL_SECONDS = 10
+CAPACITY_TARGET_ACTIVE_USERS = int(os.getenv("CAPACITY_TARGET_ACTIVE_USERS", "15"))
+CAPACITY_CPU_WARN_P95 = float(os.getenv("CAPACITY_CPU_WARN_P95", "70"))
+CAPACITY_CPU_CRIT_P95 = float(os.getenv("CAPACITY_CPU_CRIT_P95", "80"))
+CAPACITY_RAM_WARN_P95 = float(os.getenv("CAPACITY_RAM_WARN_P95", "80"))
+CAPACITY_RAM_CRIT_P95 = float(os.getenv("CAPACITY_RAM_CRIT_P95", "85"))
+CAPACITY_DISK_WARN_P95 = float(os.getenv("CAPACITY_DISK_WARN_P95", "85"))
+CAPACITY_DISK_CRIT_P95 = float(os.getenv("CAPACITY_DISK_CRIT_P95", "92"))
+DEFAULT_TRAFFIC_LIMIT_TB = float(os.getenv("TRAFFIC_LIMIT_TB", "32"))
+DEFAULT_AVG_USER_TRAFFIC_GB = float(os.getenv("AVG_USER_TRAFFIC_GB", "50"))
+DEFAULT_ACTIVE_USER_RATIO_PCT = float(os.getenv("ACTIVE_USER_RATIO_PCT", "25"))
+DEFAULT_MAX_REGISTERED_USERS = int(os.getenv("MAX_REGISTERED_USERS", "0"))
+DEFAULT_DASHBOARD_REFRESH_SECONDS = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "30"))
 WG_DUMP_PATH = "/wireguard-config/wg_dump.txt"
 XRAY_STATS_PATH = "/xray-config/stats_raw.txt"
 XRAY_CONFIG_PATH = "/xray-config/config.json"
 XRAY_CLIENT_INFO_PATH = "/xray-config/client-connection.txt"
 DEPLOY_HISTORY_PATH = os.getenv("DEPLOY_HISTORY_PATH", "/logs/deploy-history.log")
+APP_RELEASE_STATE_PATH = os.getenv("APP_RELEASE_STATE_PATH", "/logs/app-release-state.json")
+UPDATE_CHECK_REQUEST_PATH = os.getenv("UPDATE_CHECK_REQUEST_PATH", "/logs/update-check-request.json")
+UPDATE_APPLY_REQUEST_PATH = os.getenv("UPDATE_APPLY_REQUEST_PATH", "/logs/update-apply-request.json")
+BACKUP_STATUS_PATH = os.getenv("BACKUP_STATUS_PATH", "/logs/backup-status.json")
+SECURITY_GUARD_URL = os.getenv("SECURITY_GUARD_URL", "http://security-guard:9100").rstrip("/")
+SECURITY_HTTP_WINDOW_SECONDS = int(os.getenv("SECURITY_HTTP_WINDOW_SECONDS", "10"))
+SECURITY_HTTP_MAX_REQUESTS = int(os.getenv("SECURITY_HTTP_MAX_REQUESTS", "120"))
+SECURITY_PROBE_PATH_THRESHOLD = int(os.getenv("SECURITY_PROBE_PATH_THRESHOLD", "12"))
+SECURITY_BLOCK_SECONDS_DDOS = int(os.getenv("SECURITY_BLOCK_SECONDS_DDOS", "600"))
+SECURITY_BLOCK_SECONDS_BRUTE = int(os.getenv("SECURITY_BLOCK_SECONDS_BRUTE", "900"))
+SECURITY_SERVER_CHECK_INTERVAL_SECONDS = int(os.getenv("SECURITY_SERVER_CHECK_INTERVAL_SECONDS", "60"))
+SECURITY_SERVER_EVENT_COOLDOWN_SECONDS = int(os.getenv("SECURITY_SERVER_EVENT_COOLDOWN_SECONDS", "300"))
+SECURITY_GUARD_UNAVAILABLE_REASON = "security guard unavailable"
 XRAY_USER_STATS_RE = re.compile(r"user>>>(.+?)>>>traffic>>>(uplink|downlink)")
 XRAY_CONTAINER_NAME = "proxy-vpn-xray"
 STACK_CONTAINERS = [
     "proxy-vpn-caddy",
     "proxy-vpn-api",
+    "proxy-vpn-security-guard",
     XRAY_CONTAINER_NAME,
     "proxy-vpn-wireguard",
 ]
 _METRICS_THREAD_LOCK = threading.Lock()
 _METRICS_THREAD_STARTED = False
+_SECURITY_RATE_LOCK = threading.Lock()
+_SECURITY_RATE_BUCKETS: dict[str, list[float]] = {}
+_SECURITY_SERVER_LOCK = threading.Lock()
+_SECURITY_SERVER_LAST_CHECK_TS = 0.0
+_SECURITY_SERVER_LAST_EVENTS: dict[str, float] = {}
 
 
 @asynccontextmanager
@@ -67,6 +101,41 @@ app = FastAPI(
     openapi_url="/openapi.json",
     lifespan=app_lifespan,
 )
+
+
+@app.middleware("http")
+async def security_guard_middleware(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/docs") or path.startswith("/openapi.json"):
+        return await call_next(request)
+    ip = _client_ip(request)
+    if ip and ip != "unknown":
+        enforce_block = not _is_internal_ip(ip)
+        if enforce_block:
+            blocked = _security_block_check(ip)
+            if blocked.get("status") == "ok" and blocked.get("blocked") is True:
+                return JSONResponse(
+                    {
+                        "status": "blocked",
+                        "detail": "Request blocked by security guard",
+                        "reason": blocked.get("reason", ""),
+                        "blocked_until": blocked.get("blocked_until"),
+                    },
+                    status_code=403,
+                )
+        _security_track_http_rate(ip, path, enforce_block=enforce_block)
+    response = await call_next(request)
+    if ip and ip != "unknown" and _is_suspicious_probe_path(path):
+        _security_report_event(
+            ip=ip,
+            attack_type="exploit_probe",
+            direction="inbound->panel",
+            reason=f"suspicious path requested: {path}",
+            severity="high" if response.status_code in (401, 403, 404, 405) else "medium",
+            target="panel/api",
+            source="api-middleware",
+        )
+    return response
 
 
 def _now() -> datetime:
@@ -97,6 +166,211 @@ def _client_ip(request: Request) -> str:
     if xff:
         return xff.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+def _is_internal_ip(ip: str) -> bool:
+    try:
+        obj = ipaddress.ip_address(ip)
+        return bool(obj.is_private or obj.is_loopback or obj.is_link_local)
+    except Exception:
+        return False
+
+
+def _security_guard_call(method: str, path: str, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    url = f"{SECURITY_GUARD_URL}{path}"
+    data = None
+    headers = {"User-Agent": "proxy-vpn-api/1.0"}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(req, timeout=1.8) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        out = json.loads(raw) if raw else {}
+        if not isinstance(out, dict):
+            return {"status": "degraded", "reason": "security guard response is invalid"}
+        return out
+    except Exception as e:
+        return {"status": "degraded", "reason": f"security guard unavailable: {e}"}
+
+
+def _security_report_event(
+    ip: str,
+    attack_type: str,
+    direction: str,
+    reason: str,
+    *,
+    target: str = "panel/api",
+    severity: str = "medium",
+    action: str = "observed",
+    block_seconds: int = 0,
+    source: str = "api",
+    count: int = 1,
+) -> dict[str, Any]:
+    return _security_guard_call(
+        "POST",
+        "/event",
+        {
+            "ip": ip,
+            "attack_type": attack_type,
+            "direction": direction,
+            "target": target,
+            "severity": severity,
+            "reason": reason,
+            "action": action,
+            "block_seconds": max(0, int(block_seconds)),
+            "source": source,
+            "count": max(1, int(count)),
+        },
+    )
+
+
+def _security_block_check(ip: str) -> dict[str, Any]:
+    query = urllib.parse.urlencode({"ip": ip})
+    return _security_guard_call("GET", f"/blocked/check?{query}")
+
+
+def _is_suspicious_probe_path(path: str) -> bool:
+    p = path.lower()
+    tokens = [
+        ".env",
+        "wp-admin",
+        "wp-login",
+        "phpmyadmin",
+        "cgi-bin",
+        "xmlrpc.php",
+        "boaform",
+        "actuator",
+        ".git/config",
+        "/vendor/phpunit",
+    ]
+    return any(tok in p for tok in tokens)
+
+
+def _security_track_http_rate(ip: str, path: str, enforce_block: bool = True) -> Optional[int]:
+    now = time.time()
+    with _SECURITY_RATE_LOCK:
+        items = _SECURITY_RATE_BUCKETS.get(ip, [])
+        min_ts = now - float(max(1, SECURITY_HTTP_WINDOW_SECONDS))
+        items = [t for t in items if t >= min_ts]
+        items.append(now)
+        _SECURITY_RATE_BUCKETS[ip] = items
+        req_count = len(items)
+    if req_count >= max(10, SECURITY_HTTP_MAX_REQUESTS):
+        _security_report_event(
+            ip=ip,
+            attack_type="ddos_http_flood",
+            direction="inbound->server",
+            reason=f"high request rate in {SECURITY_HTTP_WINDOW_SECONDS}s window (possible edge flood)",
+            severity="critical" if enforce_block else "high",
+            action="blocked" if enforce_block else "observed",
+            block_seconds=SECURITY_BLOCK_SECONDS_DDOS if enforce_block else 0,
+            source="api-http-rate",
+            count=req_count,
+        )
+        return req_count
+    if _is_suspicious_probe_path(path) and req_count >= max(4, SECURITY_PROBE_PATH_THRESHOLD):
+        _security_report_event(
+            ip=ip,
+            attack_type="exploit_probe_scan",
+            direction="inbound->server",
+            reason="multiple suspicious probe paths",
+            severity="high",
+            action="blocked" if enforce_block else "observed",
+            block_seconds=max(300, SECURITY_BLOCK_SECONDS_DDOS // 2) if enforce_block else 0,
+            source="api-path-scan",
+            count=req_count,
+        )
+    return None
+
+
+def _security_should_emit(key: str, cooldown_seconds: int) -> bool:
+    now = time.time()
+    with _SECURITY_SERVER_LOCK:
+        last = float(_SECURITY_SERVER_LAST_EVENTS.get(key, 0.0))
+        if now - last < float(max(1, cooldown_seconds)):
+            return False
+        _SECURITY_SERVER_LAST_EVENTS[key] = now
+        return True
+
+
+def _security_track_server_state(snapshot: dict[str, Any]) -> None:
+    now = time.time()
+    with _SECURITY_SERVER_LOCK:
+        global _SECURITY_SERVER_LAST_CHECK_TS
+        if now - float(_SECURITY_SERVER_LAST_CHECK_TS) < float(max(10, SECURITY_SERVER_CHECK_INTERVAL_SECONDS)):
+            return
+        _SECURITY_SERVER_LAST_CHECK_TS = now
+
+    # Host resource exhaustion signals (can indicate active attack or abusive load).
+    cpu = float(snapshot.get("cpu_load_pct") or 0.0)
+    mem = float(snapshot.get("memory_used_pct") or 0.0)
+    disk = float(snapshot.get("disk_used_pct") or 0.0)
+    if cpu >= CAPACITY_CPU_CRIT_P95 and _security_should_emit("host-cpu-critical", SECURITY_SERVER_EVENT_COOLDOWN_SECONDS):
+        _security_report_event(
+            ip="127.0.0.1",
+            attack_type="server_resource_exhaustion",
+            direction="inbound->server",
+            reason=f"cpu_load_pct={cpu:.1f} crossed critical threshold {CAPACITY_CPU_CRIT_P95:.1f}",
+            target="host",
+            severity="critical",
+            action="mitigated",
+            source="server-metrics",
+        )
+    if mem >= CAPACITY_RAM_CRIT_P95 and _security_should_emit("host-mem-critical", SECURITY_SERVER_EVENT_COOLDOWN_SECONDS):
+        _security_report_event(
+            ip="127.0.0.1",
+            attack_type="server_resource_exhaustion",
+            direction="inbound->server",
+            reason=f"memory_used_pct={mem:.1f} crossed critical threshold {CAPACITY_RAM_CRIT_P95:.1f}",
+            target="host",
+            severity="critical",
+            action="mitigated",
+            source="server-metrics",
+        )
+    if disk >= CAPACITY_DISK_CRIT_P95 and _security_should_emit("host-disk-critical", SECURITY_SERVER_EVENT_COOLDOWN_SECONDS):
+        _security_report_event(
+            ip="127.0.0.1",
+            attack_type="server_resource_exhaustion",
+            direction="inbound->server",
+            reason=f"disk_used_pct={disk:.1f} crossed critical threshold {CAPACITY_DISK_CRIT_P95:.1f}",
+            target="host",
+            severity="high",
+            action="mitigated",
+            source="server-metrics",
+        )
+
+    services = _get_container_statuses()
+    if services.get("status") == "ok":
+        for item in services.get("items", []):
+            state = str(item.get("state") or "")
+            name = str(item.get("name") or "unknown")
+            if state in {"in_error", "stopped"}:
+                key = f"service-{name}-{state}"
+                if _security_should_emit(key, SECURITY_SERVER_EVENT_COOLDOWN_SECONDS):
+                    _security_report_event(
+                        ip="127.0.0.1",
+                        attack_type="service_disruption",
+                        direction="inbound->server",
+                        reason=f"{name} state={state}, raw={item.get('raw_status')}, health={item.get('health')}",
+                        target=name,
+                        severity="high",
+                        action="mitigated",
+                        source="server-containers",
+                    )
+    else:
+        if _security_should_emit("docker-status-degraded", SECURITY_SERVER_EVENT_COOLDOWN_SECONDS):
+            _security_report_event(
+                ip="127.0.0.1",
+                attack_type="server_observability_degraded",
+                direction="inbound->server",
+                reason=str(services.get("reason") or "docker status degraded"),
+                target="docker",
+                severity="medium",
+                action="observed",
+                source="server-containers",
+            )
 
 
 def _hash_password(password: str) -> str:
@@ -370,6 +644,203 @@ def _collect_system_snapshot() -> dict[str, Any]:
     }
 
 
+def _read_server_resource_capacity() -> dict[str, float]:
+    cpu = float(max(1, os.cpu_count() or 1))
+    ram_gb = 2.0
+    storage_gb = 40.0
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    ram_kb = float(line.split()[1])
+                    ram_gb = max(0.25, round(ram_kb / 1024.0 / 1024.0, 2))
+                    break
+    except Exception:
+        pass
+    try:
+        disk = os.statvfs("/")
+        total = disk.f_blocks * disk.f_frsize
+        storage_gb = max(1.0, round(total / (1024.0**3), 2))
+    except Exception:
+        pass
+    return {
+        "server_cpu_cores": cpu,
+        "server_ram_gb": ram_gb,
+        "server_storage_gb": storage_gb,
+    }
+
+
+def _to_pos_float(value: Any, default: float, min_value: float) -> float:
+    try:
+        v = float(value)
+    except Exception:
+        return default
+    return max(min_value, v)
+
+
+def _to_pos_int(value: Any, default: int, min_value: int) -> int:
+    try:
+        v = int(float(value))
+    except Exception:
+        return default
+    return max(min_value, v)
+
+
+def _recalculate_system_config(raw: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(raw)
+    cfg["server_cpu_cores"] = _to_pos_float(cfg.get("server_cpu_cores"), 1.0, 0.25)
+    cfg["server_ram_gb"] = _to_pos_float(cfg.get("server_ram_gb"), 2.0, 0.25)
+    cfg["server_storage_gb"] = _to_pos_float(cfg.get("server_storage_gb"), 40.0, 1.0)
+    cfg["traffic_limit_tb"] = _to_pos_float(cfg.get("traffic_limit_tb"), DEFAULT_TRAFFIC_LIMIT_TB, 0.1)
+    cfg["avg_user_monthly_traffic_gb"] = _to_pos_float(
+        cfg.get("avg_user_monthly_traffic_gb"), DEFAULT_AVG_USER_TRAFFIC_GB, 1.0
+    )
+    cfg["active_user_ratio_pct"] = _to_pos_float(cfg.get("active_user_ratio_pct"), DEFAULT_ACTIVE_USER_RATIO_PCT, 1.0)
+    cfg["cpu_warn_p95"] = _to_pos_float(cfg.get("cpu_warn_p95"), CAPACITY_CPU_WARN_P95, 1.0)
+    cfg["cpu_crit_p95"] = _to_pos_float(cfg.get("cpu_crit_p95"), CAPACITY_CPU_CRIT_P95, 1.0)
+    cfg["ram_warn_p95"] = _to_pos_float(cfg.get("ram_warn_p95"), CAPACITY_RAM_WARN_P95, 1.0)
+    cfg["ram_crit_p95"] = _to_pos_float(cfg.get("ram_crit_p95"), CAPACITY_RAM_CRIT_P95, 1.0)
+    cfg["disk_warn_p95"] = _to_pos_float(cfg.get("disk_warn_p95"), CAPACITY_DISK_WARN_P95, 1.0)
+    cfg["disk_crit_p95"] = _to_pos_float(cfg.get("disk_crit_p95"), CAPACITY_DISK_CRIT_P95, 1.0)
+    cfg["dashboard_refresh_seconds"] = _to_pos_int(
+        cfg.get("dashboard_refresh_seconds"), DEFAULT_DASHBOARD_REFRESH_SECONDS, 5
+    )
+    cfg["dashboard_refresh_seconds"] = min(300, cfg["dashboard_refresh_seconds"])
+
+    if cfg["cpu_warn_p95"] > cfg["cpu_crit_p95"]:
+        cfg["cpu_warn_p95"] = cfg["cpu_crit_p95"]
+    if cfg["ram_warn_p95"] > cfg["ram_crit_p95"]:
+        cfg["ram_warn_p95"] = cfg["ram_crit_p95"]
+    if cfg["disk_warn_p95"] > cfg["disk_crit_p95"]:
+        cfg["disk_warn_p95"] = cfg["disk_crit_p95"]
+
+    traffic_based_limit = int((cfg["traffic_limit_tb"] * 1024.0) / max(1.0, cfg["avg_user_monthly_traffic_gb"]))
+    cpu_based_limit = int(cfg["server_cpu_cores"] * 60.0)
+    ram_based_limit = int(cfg["server_ram_gb"] * 90.0)
+    recommended_max_users = max(1, min(traffic_based_limit, cpu_based_limit, ram_based_limit))
+    requested_max_users = _to_pos_int(cfg.get("max_registered_users"), DEFAULT_MAX_REGISTERED_USERS, 0)
+    cfg["max_registered_users"] = requested_max_users if requested_max_users > 0 else recommended_max_users
+    cfg["recommended_max_users"] = recommended_max_users
+
+    recommended_active_by_ratio = int(cfg["max_registered_users"] * (cfg["active_user_ratio_pct"] / 100.0))
+    recommended_active_by_cpu = int(cfg["server_cpu_cores"] * 15.0)
+    recommended_active_by_ram = int(cfg["server_ram_gb"] * 10.0)
+    recommended_active_users = max(1, min(recommended_active_by_ratio, recommended_active_by_cpu, recommended_active_by_ram))
+    requested_target_active = _to_pos_int(cfg.get("target_active_users"), CAPACITY_TARGET_ACTIVE_USERS, 0)
+    if requested_target_active <= 0:
+        cfg["target_active_users"] = recommended_active_users
+    else:
+        cfg["target_active_users"] = min(requested_target_active, cfg["max_registered_users"])
+    cfg["recommended_active_users"] = recommended_active_users
+    cfg["per_user_traffic_budget_gb"] = round((cfg["traffic_limit_tb"] * 1024.0) / max(1, cfg["max_registered_users"]), 2)
+    cfg["updated_at"] = _now().isoformat()
+    return cfg
+
+
+def _default_system_config() -> dict[str, Any]:
+    detected = _read_server_resource_capacity()
+    return _recalculate_system_config(
+        {
+            **detected,
+            "traffic_limit_tb": DEFAULT_TRAFFIC_LIMIT_TB,
+            "avg_user_monthly_traffic_gb": DEFAULT_AVG_USER_TRAFFIC_GB,
+            "active_user_ratio_pct": DEFAULT_ACTIVE_USER_RATIO_PCT,
+            "max_registered_users": DEFAULT_MAX_REGISTERED_USERS,
+            "target_active_users": CAPACITY_TARGET_ACTIVE_USERS,
+            "cpu_warn_p95": CAPACITY_CPU_WARN_P95,
+            "cpu_crit_p95": CAPACITY_CPU_CRIT_P95,
+            "ram_warn_p95": CAPACITY_RAM_WARN_P95,
+            "ram_crit_p95": CAPACITY_RAM_CRIT_P95,
+            "disk_warn_p95": CAPACITY_DISK_WARN_P95,
+            "disk_crit_p95": CAPACITY_DISK_CRIT_P95,
+            "dashboard_refresh_seconds": DEFAULT_DASHBOARD_REFRESH_SECONDS,
+        }
+    )
+
+
+def _load_system_config() -> dict[str, Any]:
+    with _db_connect() as con:
+        row = con.execute(
+            """
+            SELECT
+              server_cpu_cores, server_ram_gb, server_storage_gb, traffic_limit_tb,
+              avg_user_monthly_traffic_gb, active_user_ratio_pct,
+              max_registered_users, target_active_users,
+              cpu_warn_p95, cpu_crit_p95, ram_warn_p95, ram_crit_p95, disk_warn_p95, disk_crit_p95,
+              dashboard_refresh_seconds,
+              recommended_max_users, recommended_active_users, per_user_traffic_budget_gb, updated_at
+            FROM system_config
+            WHERE id = 1
+            """
+        ).fetchone()
+    if not row:
+        return _default_system_config()
+    cfg = dict(row)
+    return _recalculate_system_config(cfg)
+
+
+def _persist_system_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    calculated = _recalculate_system_config(cfg)
+    with _db_connect() as con:
+        con.execute(
+            """
+            INSERT INTO system_config (
+              id, server_cpu_cores, server_ram_gb, server_storage_gb, traffic_limit_tb,
+              avg_user_monthly_traffic_gb, active_user_ratio_pct,
+              max_registered_users, target_active_users,
+              cpu_warn_p95, cpu_crit_p95, ram_warn_p95, ram_crit_p95, disk_warn_p95, disk_crit_p95,
+              dashboard_refresh_seconds,
+              recommended_max_users, recommended_active_users, per_user_traffic_budget_gb, updated_at
+            ) VALUES (
+              1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            ON CONFLICT(id) DO UPDATE SET
+              server_cpu_cores=excluded.server_cpu_cores,
+              server_ram_gb=excluded.server_ram_gb,
+              server_storage_gb=excluded.server_storage_gb,
+              traffic_limit_tb=excluded.traffic_limit_tb,
+              avg_user_monthly_traffic_gb=excluded.avg_user_monthly_traffic_gb,
+              active_user_ratio_pct=excluded.active_user_ratio_pct,
+              max_registered_users=excluded.max_registered_users,
+              target_active_users=excluded.target_active_users,
+              cpu_warn_p95=excluded.cpu_warn_p95,
+              cpu_crit_p95=excluded.cpu_crit_p95,
+              ram_warn_p95=excluded.ram_warn_p95,
+              ram_crit_p95=excluded.ram_crit_p95,
+              disk_warn_p95=excluded.disk_warn_p95,
+              disk_crit_p95=excluded.disk_crit_p95,
+              dashboard_refresh_seconds=excluded.dashboard_refresh_seconds,
+              recommended_max_users=excluded.recommended_max_users,
+              recommended_active_users=excluded.recommended_active_users,
+              per_user_traffic_budget_gb=excluded.per_user_traffic_budget_gb,
+              updated_at=excluded.updated_at
+            """,
+            (
+                calculated["server_cpu_cores"],
+                calculated["server_ram_gb"],
+                calculated["server_storage_gb"],
+                calculated["traffic_limit_tb"],
+                calculated["avg_user_monthly_traffic_gb"],
+                calculated["active_user_ratio_pct"],
+                calculated["max_registered_users"],
+                calculated["target_active_users"],
+                calculated["cpu_warn_p95"],
+                calculated["cpu_crit_p95"],
+                calculated["ram_warn_p95"],
+                calculated["ram_crit_p95"],
+                calculated["disk_warn_p95"],
+                calculated["disk_crit_p95"],
+                calculated["dashboard_refresh_seconds"],
+                calculated["recommended_max_users"],
+                calculated["recommended_active_users"],
+                calculated["per_user_traffic_budget_gb"],
+                calculated["updated_at"],
+            ),
+        )
+        con.commit()
+    return calculated
+
+
 def _service_state(raw_status: str, health: str, exit_code: Optional[int]) -> str:
     if raw_status == "running":
         if health == "unhealthy":
@@ -506,6 +977,291 @@ def _read_deploy_history(limit: int = 20) -> dict[str, Any]:
             item[k.strip()] = v.strip()
         items.append(item)
     return {"status": "ok", "path": str(path), "items": items}
+
+
+def _default_release_state() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "state": {
+            "current": {
+                "version": "unknown",
+                "sha": "na",
+                "notes": "No release metadata yet.",
+                "deployed_at": _now().isoformat(),
+            },
+            "available": None,
+            "update": {"status": "idle", "message": "No update metadata yet."},
+        },
+    }
+
+
+def _read_release_state() -> dict[str, Any]:
+    path = Path(APP_RELEASE_STATE_PATH)
+    if not path.exists():
+        return _default_release_state()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"status": "degraded", "reason": f"release state read error: {e}", "state": _default_release_state()["state"]}
+    if not isinstance(raw, dict):
+        return _default_release_state()
+    state = raw if "current" in raw else raw.get("state", {})
+    if not isinstance(state, dict):
+        state = {}
+    current = state.get("current") if isinstance(state.get("current"), dict) else {}
+    available = state.get("available")
+    update = state.get("update") if isinstance(state.get("update"), dict) else {}
+    merged = _default_release_state()["state"]
+    merged["current"].update(current)
+    merged["available"] = available if isinstance(available, dict) else None
+    merged["update"].update(update)
+    return {"status": "ok", "state": merged}
+
+
+def _write_update_request(path_str: str, request: dict[str, Any]) -> dict[str, Any]:
+    path = Path(path_str)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(request)
+    payload["requested_at"] = _now().isoformat()
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    return {"status": "ok", "path": str(path), "request": payload}
+
+
+def _default_backup_state() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "backup_status": "unknown",
+        "updated_at": None,
+        "last_success_at": None,
+        "message": "No backup status yet.",
+        "integrity": {"status": "unknown", "reason": "No integrity data yet."},
+        "archive_path": "",
+        "path": str(Path(BACKUP_STATUS_PATH)),
+    }
+
+
+def _read_backup_state() -> dict[str, Any]:
+    path = Path(BACKUP_STATUS_PATH)
+    base = _default_backup_state()
+    base["path"] = str(path)
+    if not path.exists():
+        base["reason"] = "backup status file not found yet"
+        return base
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        base["status"] = "degraded"
+        base["reason"] = f"backup status read error: {e}"
+        return base
+    if not isinstance(raw, dict):
+        base["status"] = "degraded"
+        base["reason"] = "backup status payload is not an object"
+        return base
+    merged = dict(base)
+    merged.update(
+        {
+            "status": str(raw.get("status", base["status"])),
+            "backup_status": str(raw.get("backup_status", base["backup_status"])),
+            "updated_at": raw.get("updated_at"),
+            "last_success_at": raw.get("last_success_at"),
+            "message": str(raw.get("message", base["message"])),
+            "archive_path": str(raw.get("archive_path", "")),
+        }
+    )
+    integ = raw.get("integrity")
+    if isinstance(integ, dict):
+        merged["integrity"] = {
+            "status": str(integ.get("status", "unknown")),
+            "reason": str(integ.get("reason", "")),
+        }
+    return merged
+
+
+def _read_security_events(limit: int = 150) -> dict[str, Any]:
+    limit = max(1, min(500, int(limit)))
+    data = _security_guard_call("GET", f"/events?limit={limit}")
+    if data.get("status") != "ok":
+        return {"status": "degraded", "items": [], "reason": data.get("reason", SECURITY_GUARD_UNAVAILABLE_REASON)}
+    items = data.get("items")
+    if not isinstance(items, list):
+        items = []
+    return {"status": "ok", "items": items}
+
+
+def _read_security_blocked(limit: int = 150) -> dict[str, Any]:
+    limit = max(1, min(500, int(limit)))
+    data = _security_guard_call("GET", f"/blocked?limit={limit}")
+    if data.get("status") != "ok":
+        return {"status": "degraded", "items": [], "reason": data.get("reason", SECURITY_GUARD_UNAVAILABLE_REASON)}
+    items = data.get("items")
+    if not isinstance(items, list):
+        items = []
+    return {"status": "ok", "items": items}
+
+
+def _security_manual_block(ip: str, reason: str, block_seconds: int) -> dict[str, Any]:
+    payload = {
+        "ip": ip.strip(),
+        "reason": reason.strip() or "manual block",
+        "block_seconds": max(60, int(block_seconds)),
+    }
+    data = _security_guard_call("POST", "/block", payload)
+    if data.get("status") != "ok":
+        return {"status": "degraded", "reason": data.get("reason", SECURITY_GUARD_UNAVAILABLE_REASON)}
+    return {"status": "ok", "result": data}
+
+
+def _security_manual_unblock(ip: str, reason: str) -> dict[str, Any]:
+    payload = {"ip": ip.strip(), "reason": reason.strip() or "manual unblock"}
+    data = _security_guard_call("POST", "/unblock", payload)
+    if data.get("status") != "ok":
+        return {"status": "degraded", "reason": data.get("reason", SECURITY_GUARD_UNAVAILABLE_REASON)}
+    return {"status": "ok", "result": data}
+
+
+def _percentile(values: list[float], p: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = max(0, min(len(ordered) - 1, int((len(ordered) - 1) * p)))
+    return float(ordered[idx])
+
+
+def _signal_by_threshold(value: float, warn: float, crit: float) -> str:
+    if value >= crit:
+        return "critical"
+    if value >= warn:
+        return "warn"
+    return "ok"
+
+
+def _read_capacity_status(window_minutes: int = 60) -> dict[str, Any]:
+    window_minutes = max(10, min(24 * 60, int(window_minutes)))
+    threshold = (_now() - timedelta(minutes=window_minutes)).isoformat()
+    month_threshold = (_now() - timedelta(days=30)).isoformat()
+    cfg = _load_system_config()
+    with _db_connect() as con:
+        rows = con.execute(
+            """
+            SELECT cpu_load_pct, memory_used_pct, disk_used_pct, net_rx_bytes, net_tx_bytes
+            FROM metric_samples
+            WHERE ts >= ?
+            ORDER BY ts ASC
+            """,
+            (threshold,),
+        ).fetchall()
+        month_rows = con.execute(
+            """
+            SELECT net_rx_bytes, net_tx_bytes
+            FROM metric_samples
+            WHERE ts >= ?
+            ORDER BY ts ASC
+            """,
+            (month_threshold,),
+        ).fetchall()
+        active_sessions_row = con.execute(
+            "SELECT COUNT(*) c FROM sessions WHERE revoked = 0 AND expires_at > ?",
+            (_now().isoformat(),),
+        ).fetchone()
+    if not rows:
+        return {
+            "status": "degraded",
+            "reason": "no metric samples in selected window",
+            "window_minutes": window_minutes,
+        }
+
+    cpu = [float(r["cpu_load_pct"] or 0.0) for r in rows]
+    mem = [float(r["memory_used_pct"] or 0.0) for r in rows]
+    disk = [float(r["disk_used_pct"] or 0.0) for r in rows]
+    rx0 = int(rows[0]["net_rx_bytes"] or 0)
+    tx0 = int(rows[0]["net_tx_bytes"] or 0)
+    rx1 = int(rows[-1]["net_rx_bytes"] or 0)
+    tx1 = int(rows[-1]["net_tx_bytes"] or 0)
+
+    cpu_p95 = round(_percentile(cpu, 0.95), 2)
+    mem_p95 = round(_percentile(mem, 0.95), 2)
+    disk_p95 = round(_percentile(disk, 0.95), 2)
+    cpu_avg = round(sum(cpu) / len(cpu), 2)
+    mem_avg = round(sum(mem) / len(mem), 2)
+    disk_avg = round(sum(disk) / len(disk), 2)
+    cpu_current_pct = float(rows[-1]["cpu_load_pct"] or 0.0)
+    mem_current_pct = float(rows[-1]["memory_used_pct"] or 0.0)
+    disk_current_pct = float(rows[-1]["disk_used_pct"] or 0.0)
+    active_sessions = int(active_sessions_row["c"] or 0) if active_sessions_row else 0
+    detected = _read_server_resource_capacity()
+    month_rx_used = 0
+    month_tx_used = 0
+    if month_rows:
+        month_rx_used = max(0, int(month_rows[-1]["net_rx_bytes"] or 0) - int(month_rows[0]["net_rx_bytes"] or 0))
+        month_tx_used = max(0, int(month_rows[-1]["net_tx_bytes"] or 0) - int(month_rows[0]["net_tx_bytes"] or 0))
+    traffic_month_used_bytes = month_rx_used + month_tx_used
+    traffic_limit_bytes = int(float(cfg["traffic_limit_tb"]) * (1024.0**4))
+    traffic_left_bytes = max(0, traffic_limit_bytes - traffic_month_used_bytes)
+    traffic_left_pct = round((traffic_left_bytes / traffic_limit_bytes) * 100.0, 2) if traffic_limit_bytes > 0 else 0.0
+    traffic_window_total_bytes = max(0, rx1 - rx0) + max(0, tx1 - tx0)
+    signals = {
+        "cpu": _signal_by_threshold(cpu_p95, float(cfg["cpu_warn_p95"]), float(cfg["cpu_crit_p95"])),
+        "memory": _signal_by_threshold(mem_p95, float(cfg["ram_warn_p95"]), float(cfg["ram_crit_p95"])),
+        "disk": _signal_by_threshold(disk_p95, float(cfg["disk_warn_p95"]), float(cfg["disk_crit_p95"])),
+        "concurrency": "warn" if active_sessions > int(cfg["target_active_users"]) else "ok",
+    }
+    overall = "ok"
+    if "critical" in signals.values():
+        overall = "critical"
+    elif "warn" in signals.values():
+        overall = "warn"
+
+    return {
+        "status": "ok",
+        "window_minutes": window_minutes,
+        "target_active_users": int(cfg["target_active_users"]),
+        "samples": len(rows),
+        "overall": overall,
+        "signals": signals,
+        "active_sessions": active_sessions,
+        "avg": {"cpu_pct": cpu_avg, "mem_pct": mem_avg, "disk_pct": disk_avg},
+        "p95": {"cpu_pct": cpu_p95, "mem_pct": mem_p95, "disk_pct": disk_p95},
+        "traffic_window_bytes": {"rx": max(0, rx1 - rx0), "tx": max(0, tx1 - tx0)},
+        "runtime": {
+            "detected": {
+                "cpu_cores": float(detected["server_cpu_cores"]),
+                "ram_gb": float(detected["server_ram_gb"]),
+                "storage_gb": float(detected["server_storage_gb"]),
+            },
+            "usage": {
+                "cpu_current_pct": round(cpu_current_pct, 2),
+                "cpu_used_cores": round((cpu_current_pct / 100.0) * float(detected["server_cpu_cores"]), 2),
+                "ram_current_pct": round(mem_current_pct, 2),
+                "ram_used_gb": round((mem_current_pct / 100.0) * float(detected["server_ram_gb"]), 2),
+                "disk_current_pct": round(disk_current_pct, 2),
+                "disk_used_gb": round((disk_current_pct / 100.0) * float(detected["server_storage_gb"]), 2),
+                "traffic_month_used_bytes": int(traffic_month_used_bytes),
+                "traffic_month_left_bytes": int(traffic_left_bytes),
+                "traffic_left_pct": float(traffic_left_pct),
+                "traffic_increment_window_bytes": int(traffic_window_total_bytes),
+            },
+        },
+        "thresholds": {
+            "cpu_warn_p95": float(cfg["cpu_warn_p95"]),
+            "cpu_crit_p95": float(cfg["cpu_crit_p95"]),
+            "ram_warn_p95": float(cfg["ram_warn_p95"]),
+            "ram_crit_p95": float(cfg["ram_crit_p95"]),
+            "disk_warn_p95": float(cfg["disk_warn_p95"]),
+            "disk_crit_p95": float(cfg["disk_crit_p95"]),
+        },
+        "config": {
+            "server_cpu_cores": float(cfg["server_cpu_cores"]),
+            "server_ram_gb": float(cfg["server_ram_gb"]),
+            "server_storage_gb": float(cfg["server_storage_gb"]),
+            "traffic_limit_tb": float(cfg["traffic_limit_tb"]),
+            "max_registered_users": int(cfg["max_registered_users"]),
+            "dashboard_refresh_seconds": int(cfg["dashboard_refresh_seconds"]),
+            "recommended_max_users": int(cfg["recommended_max_users"]),
+            "recommended_active_users": int(cfg["recommended_active_users"]),
+            "per_user_traffic_budget_gb": float(cfg["per_user_traffic_budget_gb"]),
+        },
+        "upgrade_trigger": "Scale when overall=critical or warnings persist >15 min.",
+    }
 
 
 def _online_user_ids(con: sqlite3.Connection) -> list[int]:
@@ -873,6 +1629,7 @@ def _metrics_sampler_loop() -> None:
                 """
             )
             con.commit()
+        _security_track_server_state(snapshot)
         time.sleep(METRICS_SAMPLE_INTERVAL_SECONDS)
 
 
@@ -891,6 +1648,7 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
         ("/login", "login", "Login"),
         ("/cabinet", "cabinet", "User cabinet"),
         ("/admin", "admin", "Admin panel"),
+        ("/about", "about", "About"),
         ("/docs", "docs", "API docs"),
     ]
     if user is None:
@@ -932,7 +1690,40 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       --text: #1f2937;
       --muted: #64748b;
       --blue: #2563eb;
+      --link: #1d4ed8;
+      --input-bg: rgba(255,255,255,0.76);
+      --soft-bg: rgba(255,255,255,0.55);
+      --hover-bg: rgba(255,255,255,0.6);
+      --code-bg: rgba(248,250,252,0.9);
+      --code-text: #0f172a;
+      --ghost-bg: rgba(15,23,42,0.06);
+      --ghost-text: #0f172a;
+      --banner-bg: rgba(37,99,235,0.08);
+      --banner-stroke: rgba(37,99,235,0.25);
+      --banner-text: #1e3a8a;
       --shadow: 0 20px 40px rgba(15, 23, 42, 0.16);
+    }}
+    body[data-theme="dark"] {{
+      --bg-1: #0b1220;
+      --bg-2: #111827;
+      --panel: rgba(15, 23, 42, 0.74);
+      --panel-strong: rgba(17, 24, 39, 0.9);
+      --stroke: rgba(148, 163, 184, 0.22);
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --blue: #3b82f6;
+      --link: #93c5fd;
+      --input-bg: rgba(15, 23, 42, 0.74);
+      --soft-bg: rgba(15, 23, 42, 0.6);
+      --hover-bg: rgba(59,130,246,0.14);
+      --code-bg: rgba(2, 6, 23, 0.75);
+      --code-text: #e2e8f0;
+      --ghost-bg: rgba(148,163,184,0.2);
+      --ghost-text: #e2e8f0;
+      --banner-bg: rgba(59,130,246,0.14);
+      --banner-stroke: rgba(147,197,253,0.35);
+      --banner-text: #dbeafe;
+      --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
     }}
     body {{
       margin: 0;
@@ -940,6 +1731,10 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       background: radial-gradient(1200px 600px at 10% -20%, #bfd4ff 0%, var(--bg-2) 40%, var(--bg-1) 100%);
       color: var(--text);
       min-height: 100vh;
+      color-scheme: light;
+    }}
+    body[data-theme="dark"] {{
+      color-scheme: dark;
     }}
     .app {{
       max-width: 1200px;
@@ -995,7 +1790,7 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       font-size: 14px;
     }}
     .nav-item:hover {{
-      background: rgba(255,255,255,0.6);
+      background: var(--hover-bg);
       border-color: var(--stroke);
     }}
     .nav-item.active {{
@@ -1009,7 +1804,7 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       padding: 10px;
       border-radius: 10px;
       border: 1px solid var(--stroke);
-      background: rgba(255,255,255,0.55);
+      background: var(--soft-bg);
     }}
     .content {{
       min-width: 0;
@@ -1030,6 +1825,17 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
     .wrap {{
       padding: 0;
     }}
+    .app-footer {{
+      margin-top: 8px;
+      font-size: 13px;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 4px 2px;
+    }}
     .card {{
       background: var(--panel-strong);
       border: 1px solid var(--stroke);
@@ -1037,9 +1843,10 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       padding: 16px;
       margin-bottom: 16px;
       box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+      overflow-x: auto;
     }}
     a {{
-      color: #1d4ed8;
+      color: var(--link);
       text-decoration: none;
     }}
     a:hover {{
@@ -1056,7 +1863,7 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       padding: 10px;
       border-radius: 8px;
       border: 1px solid var(--stroke);
-      background: rgba(255,255,255,0.76);
+      background: var(--input-bg);
       color: var(--text);
     }}
     button {{
@@ -1069,14 +1876,15 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
     }}
     pre {{
       white-space: pre-wrap;
-      background: rgba(248,250,252,0.9);
+      background: var(--code-bg);
       padding: 12px;
       border-radius: 8px;
       border: 1px solid var(--stroke);
-      color: #0f172a;
+      color: var(--code-text);
     }}
     table {{
       font-size: 14px;
+      min-width: 560px;
     }}
     th, td {{
       padding: 8px 6px;
@@ -1096,8 +1904,8 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
     .status-in_error {{ background: rgba(239,68,68,0.18); color: #991b1b; }}
     .status-unknown {{ background: rgba(148,163,184,0.2); color: #334155; }}
     .btn-ghost {{
-      background: rgba(15,23,42,0.06);
-      color: #0f172a;
+      background: var(--ghost-bg);
+      color: var(--ghost-text);
       border: 1px solid rgba(50,65,90,0.2);
       padding: 7px 10px;
       border-radius: 7px;
@@ -1177,13 +1985,71 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       padding: 12px;
       box-shadow: 0 24px 60px rgba(2, 6, 23, 0.35);
     }}
+    #update-banner {{
+      display: none;
+      margin: 0 0 10px 0;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--banner-stroke);
+      background: var(--banner-bg);
+      color: var(--banner-text);
+    }}
+    .theme-toggle {{
+      padding: 7px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--stroke);
+      background: var(--soft-bg);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 13px;
+    }}
     @media (max-width: 900px) {{
       .app {{
         grid-template-columns: 1fr;
+        margin: 10px auto;
+        padding: 0 10px 10px;
       }}
       .sidebar {{
         height: auto;
         position: static;
+        gap: 10px;
+      }}
+      .nav {{
+        flex-direction: row;
+        flex-wrap: wrap;
+      }}
+      .nav-item {{
+        flex: 1 1 140px;
+      }}
+      .topbar {{
+        align-items: flex-start;
+        flex-wrap: wrap;
+      }}
+      .user-meta-row {{
+        grid-template-columns: 1fr;
+        gap: 2px;
+      }}
+      .app-footer {{
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+      }}
+    }}
+    @media (max-width: 900px) and (orientation: landscape) {{
+      .app {{
+        grid-template-columns: 220px 1fr;
+      }}
+      .sidebar {{
+        position: sticky;
+        top: 10px;
+        max-height: calc(100vh - 20px);
+        overflow: auto;
+      }}
+      .nav {{
+        flex-direction: column;
+      }}
+      .nav-item {{
+        flex: 0 0 auto;
       }}
     }}
   </style>
@@ -1202,8 +2068,17 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
     <main class="content">
       <div class="topbar">
         <div><strong>{title}</strong></div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <button id="theme-toggle-btn" class="theme-toggle" onclick="toggleTheme()">Night mode</button>
+          <span id="app-version-badge" class="status-pill status-stopped">version: -</span>
+        </div>
       </div>
+      <div id="update-banner"></div>
       <div class="wrap">{body}</div>
+      <div class="app-footer">
+        <div>Author: Dmitry Solodovnikov · Telegram: <a href="https://t.me/Dmitry_as_Solod" target="_blank" rel="noopener noreferrer">@Dmitry_as_Solod</a></div>
+        <div>License: <a href="/license">MIT</a></div>
+      </div>
     </main>
   </div>
 </body>
@@ -1216,6 +2091,52 @@ async function sidebarLogout() {{
   await fetch('/api/v1/auth/logout', {{method:'POST', headers:{{'X-CSRF-Token': sidebarCsrfToken()}}}});
   window.location.href = '/';
 }}
+function applyTheme(theme) {{
+  const t = theme === 'dark' ? 'dark' : 'light';
+  document.body.setAttribute('data-theme', t);
+  localStorage.setItem('proxy_vpn_theme', t);
+  const btn = document.getElementById('theme-toggle-btn');
+  if (btn) btn.textContent = t === 'dark' ? 'Light mode' : 'Night mode';
+}}
+function detectPreferredTheme() {{
+  const saved = localStorage.getItem('proxy_vpn_theme');
+  if (saved === 'dark' || saved === 'light') return saved;
+  return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}}
+function toggleTheme() {{
+  const current = document.body.getAttribute('data-theme') || detectPreferredTheme();
+  applyTheme(current === 'dark' ? 'light' : 'dark');
+}}
+async function refreshGlobalReleaseState() {{
+  const versionEl = document.getElementById('app-version-badge');
+  const banner = document.getElementById('update-banner');
+  if (!versionEl || !banner) return;
+  try {{
+    const r = await fetch('/api/v1/app/about');
+    if (!r.ok) return;
+    const j = await r.json();
+    const state = j.state || {{}};
+    const current = state.current || {{}};
+    const available = state.available || null;
+    const update = state.update || {{}};
+    const currentVersion = String(current.version || 'unknown');
+    versionEl.textContent = 'version: ' + currentVersion;
+    if (available && available.version && available.version !== currentVersion) {{
+      banner.style.display = 'block';
+      const msg = update.message || 'Update available.';
+      banner.innerHTML = `Update available: <b>${{available.version}}</b>. ${{msg}}` +
+        ` <a href="/about">Open About</a>`;
+    }} else {{
+      banner.style.display = 'none';
+      banner.textContent = '';
+    }}
+  }} catch (e) {{
+    // keep UI stable if release endpoint is unavailable
+  }}
+}}
+applyTheme(detectPreferredTheme());
+refreshGlobalReleaseState();
+setInterval(refreshGlobalReleaseState, 30000);
 </script>
 </html>"""
     return HTMLResponse(content=html, status_code=200)
@@ -1255,6 +2176,35 @@ class UserProfileUpdateRequest(BaseModel):
     username: str
     email: str
     password: str = ""
+
+
+class AdminConfiguratorUpdateRequest(BaseModel):
+    server_cpu_cores: float
+    server_ram_gb: float
+    server_storage_gb: float
+    traffic_limit_tb: float
+    avg_user_monthly_traffic_gb: float
+    active_user_ratio_pct: float
+    max_registered_users: int
+    target_active_users: int
+    cpu_warn_p95: float
+    cpu_crit_p95: float
+    ram_warn_p95: float
+    ram_crit_p95: float
+    disk_warn_p95: float
+    disk_crit_p95: float
+    dashboard_refresh_seconds: int
+
+
+class AdminSecurityBlockRequest(BaseModel):
+    ip: str
+    reason: Optional[str] = None
+    block_seconds: int = 900
+
+
+class AdminSecurityUnblockRequest(BaseModel):
+    ip: str
+    reason: Optional[str] = None
 
 
 def startup() -> None:
@@ -1433,6 +2383,38 @@ def startup() -> None:
             )
             """
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS system_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                server_cpu_cores REAL NOT NULL,
+                server_ram_gb REAL NOT NULL,
+                server_storage_gb REAL NOT NULL,
+                traffic_limit_tb REAL NOT NULL,
+                avg_user_monthly_traffic_gb REAL NOT NULL,
+                active_user_ratio_pct REAL NOT NULL,
+                max_registered_users INTEGER NOT NULL,
+                target_active_users INTEGER NOT NULL,
+                cpu_warn_p95 REAL NOT NULL,
+                cpu_crit_p95 REAL NOT NULL,
+                ram_warn_p95 REAL NOT NULL,
+                ram_crit_p95 REAL NOT NULL,
+                disk_warn_p95 REAL NOT NULL,
+                disk_crit_p95 REAL NOT NULL,
+                dashboard_refresh_seconds INTEGER NOT NULL DEFAULT 30,
+                recommended_max_users INTEGER NOT NULL,
+                recommended_active_users INTEGER NOT NULL,
+                per_user_traffic_budget_gb REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        _ensure_column(
+            con,
+            "system_config",
+            "dashboard_refresh_seconds",
+            f"dashboard_refresh_seconds INTEGER NOT NULL DEFAULT {DEFAULT_DASHBOARD_REFRESH_SECONDS}",
+        )
         row = con.execute("SELECT id FROM users WHERE username = ?", (settings.admin_username,)).fetchone()
         if not row:
             con.execute(
@@ -1445,6 +2427,44 @@ def startup() -> None:
                     settings.admin_email,
                     _hash_password(settings.admin_password),
                     _now().isoformat(),
+                ),
+            )
+        cfg_row = con.execute("SELECT id FROM system_config WHERE id = 1").fetchone()
+        if not cfg_row:
+            defaults = _default_system_config()
+            con.execute(
+                """
+                INSERT INTO system_config (
+                  id, server_cpu_cores, server_ram_gb, server_storage_gb, traffic_limit_tb,
+                  avg_user_monthly_traffic_gb, active_user_ratio_pct,
+                  max_registered_users, target_active_users,
+                  cpu_warn_p95, cpu_crit_p95, ram_warn_p95, ram_crit_p95, disk_warn_p95, disk_crit_p95,
+                  dashboard_refresh_seconds,
+                  recommended_max_users, recommended_active_users, per_user_traffic_budget_gb, updated_at
+                ) VALUES (
+                  1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    defaults["server_cpu_cores"],
+                    defaults["server_ram_gb"],
+                    defaults["server_storage_gb"],
+                    defaults["traffic_limit_tb"],
+                    defaults["avg_user_monthly_traffic_gb"],
+                    defaults["active_user_ratio_pct"],
+                    defaults["max_registered_users"],
+                    defaults["target_active_users"],
+                    defaults["cpu_warn_p95"],
+                    defaults["cpu_crit_p95"],
+                    defaults["ram_warn_p95"],
+                    defaults["ram_crit_p95"],
+                    defaults["disk_warn_p95"],
+                    defaults["disk_crit_p95"],
+                    defaults["dashboard_refresh_seconds"],
+                    defaults["recommended_max_users"],
+                    defaults["recommended_active_users"],
+                    defaults["per_user_traffic_budget_gb"],
+                    defaults["updated_at"],
                 ),
             )
         con.commit()
@@ -1475,6 +2495,131 @@ def landing(request: Request) -> HTMLResponse:
 </div>
 """,
         active="dashboard",
+        user=user,
+    )
+
+
+@app.get("/about", response_class=HTMLResponse)
+def about_page(request: Request) -> HTMLResponse:
+    user = _read_current_user(request)
+    is_admin = bool(user and user.get("role") == "admin")
+    admin_controls = (
+        """
+  <div style="display:flex;gap:8px;align-items:center;">
+    <button onclick="requestUpdateCheck()">Check updates</button>
+    <button onclick="requestUpdateApply()">Update now</button>
+  </div>
+"""
+        if is_admin
+        else '<p class="muted">Only admin can run update checks and apply updates.</p>'
+    )
+    return _page(
+        "About application",
+        f"""
+<div class="card">
+  <h2>About proxy-vpn</h2>
+  <p class="muted">Version and update channel info from server release metadata.</p>
+  <div class="user-meta-row"><div class="label-muted">Current version</div><div id="about-current-version">-</div></div>
+  <div class="user-meta-row"><div class="label-muted">Current build</div><div id="about-current-sha">-</div></div>
+  <div class="user-meta-row"><div class="label-muted">Deployed at</div><div id="about-current-at">-</div></div>
+  <div class="user-meta-row"><div class="label-muted">Available update</div><div id="about-available-version">-</div></div>
+  <div class="user-meta-row"><div class="label-muted">Update status</div><div id="about-update-status">-</div></div>
+  <h3 style="margin-top:12px;">Release notes</h3>
+  <pre id="about-release-notes">Loading...</pre>
+  <h3 style="margin-top:12px;">Authorship, rights and license</h3>
+  <div class="user-meta-row"><div class="label-muted">Author</div><div>Dmitry Solodovnikov</div></div>
+  <div class="user-meta-row"><div class="label-muted">Contacts</div><div><a href="https://t.me/Dmitry_as_Solod" target="_blank" rel="noopener noreferrer">@Dmitry_as_Solod</a></div></div>
+  <div class="user-meta-row"><div class="label-muted">Copyright</div><div>Copyright (c) 2026 Dmitry Solodovnikov</div></div>
+  <div class="user-meta-row"><div class="label-muted">License</div><div><a href="/license">MIT License</a> · <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">opensource.org</a></div></div>
+  {admin_controls}
+  <pre id="about-out">Ready.</pre>
+</div>
+<script>
+const aboutCsrfToken = {repr(user["csrf_token"] if user else "")};
+function aboutHeaderToken() {{
+  const m = document.cookie.match(/(?:^|; )proxy_vpn_csrf=([^;]+)/);
+  if (m && m[1]) return decodeURIComponent(m[1]);
+  return aboutCsrfToken;
+}}
+async function loadAboutState() {{
+  const r = await fetch('/api/v1/app/about');
+  const txt = await r.text();
+  if (!r.ok) {{
+    const out = document.getElementById('about-out');
+    if (out) out.textContent = txt;
+    return;
+  }}
+  let j = null;
+  try {{ j = JSON.parse(txt); }} catch (e) {{ j = null; }}
+  if (!j) return;
+  const s = j.state || {{}};
+  const cur = s.current || {{}};
+  const av = s.available || null;
+  const up = s.update || {{}};
+  const notes = av && av.notes ? av.notes : (cur.notes || '-');
+  const vCur = String(cur.version || 'unknown');
+  document.getElementById('about-current-version').textContent = vCur;
+  document.getElementById('about-current-sha').textContent = String(cur.sha || '-');
+  document.getElementById('about-current-at').textContent = String(cur.deployed_at || '-');
+  document.getElementById('about-available-version').textContent = av && av.version ? String(av.version) : 'no update';
+  document.getElementById('about-update-status').textContent = String(up.status || 'idle') + ' - ' + String(up.message || '-');
+  document.getElementById('about-release-notes').textContent = String(notes || '-');
+  if (window.__aboutLastVersion && window.__aboutLastVersion !== vCur) {{
+    const out = document.getElementById('about-out');
+    if (out) out.textContent = 'Application updated to version ' + vCur + '. Reloading page...';
+    setTimeout(() => window.location.reload(), 1200);
+  }}
+  window.__aboutLastVersion = vCur;
+}}
+async function requestUpdateCheck() {{
+  const out = document.getElementById('about-out');
+  if (out) out.textContent = 'Sending update check request...';
+  const r = await fetch('/api/v1/admin/update/check', {{
+    method: 'POST',
+    headers: {{'X-CSRF-Token': aboutHeaderToken()}}
+  }});
+  const t = await r.text();
+  if (out) out.textContent = t;
+}}
+async function requestUpdateApply() {{
+  const out = document.getElementById('about-out');
+  if (out) out.textContent = 'Sending update apply request...';
+  const r = await fetch('/api/v1/admin/update/apply', {{
+    method: 'POST',
+    headers: {{'X-CSRF-Token': aboutHeaderToken()}}
+  }});
+  const t = await r.text();
+  if (out) out.textContent = t;
+}}
+loadAboutState();
+setInterval(loadAboutState, 15000);
+</script>
+""",
+        active="about",
+        user=user,
+    )
+
+
+@app.get("/license", response_class=HTMLResponse)
+def license_page(request: Request) -> HTMLResponse:
+    user = _read_current_user(request)
+    text = "License file is not available."
+    path = Path(__file__).resolve().parents[2] / "LICENSE"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        pass
+    safe = escape(text)
+    return _page(
+        "MIT license",
+        f"""
+<div class="card">
+  <h2>MIT License</h2>
+  <p class="muted">This project is distributed under MIT license terms.</p>
+  <pre>{safe}</pre>
+</div>
+""",
+        active="about",
         user=user,
     )
 
@@ -1641,8 +2786,42 @@ function renderDeviceCard(card) {{
   const lines = (card.instructions || []).map((s, i) => `<li>${{i + 1}}. ${{escHtml(s)}}</li>`).join('');
   const primary = card.primary_client || {{}};
   const installUrl = escHtml(primary.install_url || '#');
+  const fallbackUrl = escHtml(primary.fallback_url || '');
+  const fallbackLabel = escHtml(primary.fallback_label || 'mirror');
   const source = escHtml(primary.source || 'source');
   const clientName = escHtml(primary.name || card.client_app || 'Client');
+  const fields = card.config_fields || {{}};
+  const fieldRows = [
+    ['Address', fields.server],
+    ['Port', fields.port],
+    ['UUID', fields.uuid],
+    ['SNI', fields.sni],
+    ['Public Key', fields.public_key],
+    ['Short ID', fields.short_id],
+    ['Flow', fields.flow],
+    ['Network', 'tcp'],
+    ['Security', 'reality'],
+    ['Encryption', 'none'],
+  ]
+    .filter(([, value]) => String(value ?? '').trim() !== '')
+    .map(([name, value]) => {{
+      const safeName = escHtml(name);
+      const rawValue = String(value ?? '');
+      const safeValue = escHtml(rawValue);
+      return `
+        <tr>
+          <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);white-space:nowrap;"><b>${{safeName}}</b></td>
+          <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);word-break:break-all;"><code>${{safeValue}}</code></td>
+          <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);text-align:right;">
+            <button class="btn-ghost" onclick='navigator.clipboard.writeText(${{JSON.stringify(rawValue)}})'>Copy</button>
+          </td>
+        </tr>
+      `;
+    }})
+    .join('');
+  const fallbackHtml = fallbackUrl
+    ? `<div class="muted" style="margin-top:6px;">If install page is unavailable, use <a href="${{fallbackUrl}}" target="_blank" rel="noopener noreferrer">${{fallbackLabel}}</a>.</div>`
+    : '';
   out.innerHTML = `
     <div class="card" style="margin-bottom:0;">
       <h3 style="margin-top:0;">${{escHtml(card.title || 'Configuration')}}</h3>
@@ -1652,10 +2831,24 @@ function renderDeviceCard(card) {{
       <div style="margin-top:8px;">
         <button class="btn-ghost" onclick="copyConfigUri()">Copy URI</button>
       </div>
+      <h4 style="margin:12px 0 6px;">Manual fields (client menu)</h4>
+      <div style="overflow:auto;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);">
+        <table style="width:100%;border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th style="text-align:left;padding:8px;">Field</th>
+              <th style="text-align:left;padding:8px;">Value</th>
+              <th style="text-align:right;padding:8px;">Action</th>
+            </tr>
+          </thead>
+          <tbody>${{fieldRows || '<tr><td colspan="3" style="padding:8px;" class="muted">No manual fields.</td></tr>'}}</tbody>
+        </table>
+      </div>
       <div style="margin-top:8px;">
         <a href="${{installUrl}}" target="_blank" rel="noopener noreferrer"><button>Install ${{clientName}}</button></a>
         <span class="status-pill status-stopped" style="margin-left:8px;">${{source}}</span>
       </div>
+      ${{fallbackHtml}}
       <h4 style="margin:12px 0 6px;">Instructions</h4>
       <ul style="margin:0 0 4px 14px;padding:0;">${{lines}}</ul>
     </div>
@@ -1879,14 +3072,17 @@ def admin(request: Request) -> HTMLResponse:
 <div class="card">
   <div class="tab-strip" id="admin-tabs">
     <button class="tab-btn" data-tab="overview" onclick="showSection('overview')">Overview</button>
+    <button class="tab-btn" data-tab="security" onclick="showSection('security')">Security</button>
+    <button class="tab-btn" data-tab="configurator" onclick="showSection('configurator')">Configurator</button>
     <button class="tab-btn" data-tab="approvals" onclick="showSection('approvals')">Approvals</button>
     <button class="tab-btn" data-tab="users" onclick="showSection('users')">Users</button>
     <button class="tab-btn" data-tab="traffic" onclick="showSection('traffic')">Traffic</button>
     <button class="tab-btn" data-tab="logs" onclick="showSection('logs')">Logs</button>
   </div>
+  <div class="tab-strip" id="admin-subtabs" style="margin-top:8px;display:none;"></div>
 </div>
 
-<div class="card admin-section" data-section="overview">
+<div class="card admin-section" data-section="overview" data-subsection="realtime">
   <h2>Realtime system overview</h2>
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;">
     <div><div class="muted">Online users</div><div id="m-online" style="font-size:24px;font-weight:700;">-</div></div>
@@ -1898,12 +3094,65 @@ def admin(request: Request) -> HTMLResponse:
   <p class="muted" id="m-avg">avg: -</p>
 </div>
 
-<div class="card admin-section" data-section="overview">
+<div class="card admin-section" data-section="overview" data-subsection="capacity">
+  <h2>Capacity guardrails</h2>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;">
+    <div><div class="muted">Overall</div><div id="cap-overall" style="font-size:24px;font-weight:700;">-</div></div>
+    <div><div class="muted">Target active users</div><div id="cap-target" style="font-size:24px;font-weight:700;">-</div></div>
+    <div><div class="muted">CPU p95</div><div id="cap-cpu-p95" style="font-size:24px;font-weight:700;">-</div></div>
+    <div><div class="muted">RAM p95</div><div id="cap-mem-p95" style="font-size:24px;font-weight:700;">-</div></div>
+    <div><div class="muted">Disk p95</div><div id="cap-disk-p95" style="font-size:24px;font-weight:700;">-</div></div>
+  </div>
+  <p class="muted" id="cap-summary">capacity status: -</p>
+</div>
+
+<div class="card admin-section" data-section="configurator" data-subsection="settings">
+  <h2>Server capacity configurator</h2>
+  <p class="muted">Set server profile and limits. After Apply, dependent limits are recalculated and capacity metrics are updated.</p>
+  <h3 style="margin-top:0;">System resource dashboard (actual usage)</h3>
+  <table style="width:100%; border-collapse:collapse; margin-bottom:10px;">
+    <thead>
+      <tr><th align="left">Parameter</th><th align="left">Capacity (detected/config)</th><th align="left">Used</th><th align="left">Left</th><th align="left">Extra</th></tr>
+    </thead>
+    <tbody id="cfg-runtime-body"><tr><td colspan="5" class="muted">Loading...</td></tr></tbody>
+  </table>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;">
+    <input id="cfg-server-cpu-cores" placeholder="CPU cores" type="number" step="0.25" min="0.25" />
+    <input id="cfg-server-ram-gb" placeholder="RAM (GB)" type="number" step="0.25" min="0.25" />
+    <input id="cfg-server-storage-gb" placeholder="Storage (GB)" type="number" step="1" min="1" />
+    <input id="cfg-traffic-limit-tb" placeholder="Traffic limit (TB/month)" type="number" step="0.1" min="0.1" />
+    <input id="cfg-avg-user-traffic-gb" placeholder="Avg user traffic (GB/month)" type="number" step="1" min="1" />
+    <input id="cfg-active-user-ratio-pct" placeholder="Active user ratio (%)" type="number" step="1" min="1" max="100" />
+    <input id="cfg-max-registered-users" placeholder="Max registered users (0=auto)" type="number" step="1" min="0" />
+    <input id="cfg-target-active-users" placeholder="Target active users (0=auto)" type="number" step="1" min="0" />
+  </div>
+  <h3 style="margin-top:12px;">Thresholds (p95)</h3>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;">
+    <input id="cfg-cpu-warn-p95" placeholder="CPU warn %" type="number" step="1" min="1" max="100" />
+    <input id="cfg-cpu-crit-p95" placeholder="CPU critical %" type="number" step="1" min="1" max="100" />
+    <input id="cfg-ram-warn-p95" placeholder="RAM warn %" type="number" step="1" min="1" max="100" />
+    <input id="cfg-ram-crit-p95" placeholder="RAM critical %" type="number" step="1" min="1" max="100" />
+    <input id="cfg-disk-warn-p95" placeholder="Disk warn %" type="number" step="1" min="1" max="100" />
+    <input id="cfg-disk-crit-p95" placeholder="Disk critical %" type="number" step="1" min="1" max="100" />
+  </div>
+  <h3 style="margin-top:12px;">Dashboard refresh</h3>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;">
+    <input id="cfg-dashboard-refresh-seconds" placeholder="Refresh interval (sec)" type="number" step="1" min="5" max="300" />
+  </div>
+  <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
+    <button onclick="applyConfigurator()">Apply configuration</button>
+    <button class="btn-ghost" onclick="loadConfigurator()">Reload</button>
+  </div>
+  <p class="muted" id="cfg-derived">derived: -</p>
+  <pre id="cfg-out">Ready.</pre>
+</div>
+
+<div class="card admin-section" data-section="overview" data-subsection="trend">
   <h2>CPU / Memory trend (last 60 min)</h2>
   <canvas id="metrics-canvas" width="900" height="220" style="width:100%;max-width:100%;border:1px solid rgba(100,116,139,0.2);border-radius:10px;background:rgba(255,255,255,0.6);"></canvas>
 </div>
 
-<div class="card admin-section" data-section="overview">
+<div class="card admin-section" data-section="overview" data-subsection="online">
   <h2>Users online now</h2>
   <table style="width:100%; border-collapse:collapse;">
     <thead>
@@ -1913,7 +3162,7 @@ def admin(request: Request) -> HTMLResponse:
   </table>
 </div>
 
-<div class="card admin-section" data-section="overview">
+<div class="card admin-section" data-section="overview" data-subsection="services">
   <h2>Service health dashboard</h2>
   <p class="muted">Container states are read from Docker runtime. Click "Logs" for pending/error containers.</p>
   <p id="xray-collector-state" class="muted">xray exact collector: -</p>
@@ -1926,7 +3175,7 @@ def admin(request: Request) -> HTMLResponse:
   <p class="muted" id="services-meta"></p>
 </div>
 
-<div class="card admin-section" data-section="overview">
+<div class="card admin-section" data-section="overview" data-subsection="deploy">
   <h2>Last deploy events</h2>
   <p class="muted">Recent deploy/rollback events from deploy history log.</p>
   <table style="width:100%; border-collapse:collapse;">
@@ -1938,7 +3187,71 @@ def admin(request: Request) -> HTMLResponse:
   <p class="muted" id="deploy-events-meta"></p>
 </div>
 
-<div class="card admin-section" data-section="approvals">
+<div class="card admin-section" data-section="overview" data-subsection="backup">
+  <h2>Backup integrity status</h2>
+  <p class="muted">Scheduled backups run only after runtime integrity checks pass.</p>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;">
+    <div><div class="muted">Backup result</div><div id="backup-overall" style="font-size:24px;font-weight:700;">-</div></div>
+    <div><div class="muted">Integrity gate</div><div id="backup-integrity" style="font-size:24px;font-weight:700;">-</div></div>
+    <div><div class="muted">Last check/update</div><div id="backup-updated" style="font-size:14px;font-weight:700;">-</div></div>
+    <div><div class="muted">Last successful backup</div><div id="backup-last-success" style="font-size:14px;font-weight:700;">-</div></div>
+  </div>
+  <p class="muted" id="backup-archive">archive: -</p>
+  <pre id="backup-message">No backup status yet.</pre>
+</div>
+
+<div class="card admin-section" data-section="security" data-subsection="incidents">
+  <h2>Security incidents</h2>
+  <p class="muted">Telemetry from dedicated security-guard container: DDoS, brute-force, scan/probe and mitigation actions.</p>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-bottom:10px;">
+    <input id="sec-filter-ip" placeholder="Filter IP" />
+    <input id="sec-filter-attack" placeholder="Filter attack type" />
+    <input id="sec-filter-direction" placeholder="Filter direction" />
+    <select id="sec-filter-severity" style="padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);">
+      <option value="">Severity: any</option>
+      <option value="critical">critical</option>
+      <option value="high">high</option>
+      <option value="medium">medium</option>
+      <option value="low">low</option>
+    </select>
+    <label class="muted" style="display:flex;align-items:center;gap:6px;">
+      <input id="sec-aggregate" type="checkbox" style="width:auto;margin:0;" checked />
+      Aggregate similar events
+    </label>
+  </div>
+  <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <button class="btn-ghost" onclick="applySecurityFilters()">Apply filters</button>
+    <button class="btn-ghost" onclick="resetSecurityFilters()">Reset filters</button>
+  </div>
+  <table style="width:100%; border-collapse:collapse;">
+    <thead>
+      <tr><th align="left">Time (UTC)</th><th align="left">Count</th><th align="left">IP</th><th align="left">Geo</th><th align="left">Attack type</th><th align="left">Direction</th><th align="left">Target</th><th align="left">Action</th><th align="left">Severity</th><th align="left">Reason</th></tr>
+    </thead>
+    <tbody id="security-events-body"><tr><td colspan="10" class="muted">Loading...</td></tr></tbody>
+  </table>
+  <p class="muted" id="security-events-meta"></p>
+</div>
+
+<div class="card admin-section" data-section="security" data-subsection="blocked">
+  <h2>Blocked sources</h2>
+  <div style="display:grid;grid-template-columns:2fr 2fr 1fr auto auto;gap:8px;align-items:center;margin-bottom:10px;">
+    <input id="sec-manual-ip" placeholder="IP for manual block/unblock" />
+    <input id="sec-manual-reason" placeholder="Reason (optional)" />
+    <input id="sec-manual-seconds" placeholder="Block seconds" type="number" min="60" step="60" value="900" />
+    <button onclick="manualBlockIp()">Block IP</button>
+    <button class="btn-ghost" onclick="manualUnblockIp()">Unblock IP</button>
+  </div>
+  <table style="width:100%; border-collapse:collapse;">
+    <thead>
+      <tr><th align="left">IP</th><th align="left">Blocked until</th><th align="left">Reason</th><th align="left">Created</th><th align="left">Updated</th><th align="left">Action</th></tr>
+    </thead>
+    <tbody id="security-blocked-body"><tr><td colspan="6" class="muted">Loading...</td></tr></tbody>
+  </table>
+  <p class="muted" id="security-blocked-meta"></p>
+  <pre id="security-admin-out">Ready.</pre>
+</div>
+
+<div class="card admin-section" data-section="approvals" data-subsection="requests">
   <h2>Pending registration approvals</h2>
   <table style="width:100%; border-collapse:collapse;">
     <thead>
@@ -1948,13 +3261,13 @@ def admin(request: Request) -> HTMLResponse:
   </table>
 </div>
 
-<div class="card admin-section" data-section="users">
+<div class="card admin-section" data-section="users" data-subsection="management">
   <h2>User management</h2>
   <p class="muted">Create user/admin account from modal form.</p>
   <button onclick="openCreateUserModal()">Create user/admin</button>
 </div>
 
-<div class="card admin-section" data-section="users">
+<div class="card admin-section" data-section="users" data-subsection="recent">
   <h2>Recent users</h2>
   <table style="width:100%; border-collapse:collapse;">
     <thead>
@@ -1964,7 +3277,7 @@ def admin(request: Request) -> HTMLResponse:
   </table>
 </div>
 
-<div class="card admin-section" data-section="traffic">
+<div class="card admin-section" data-section="traffic" data-subsection="wg-bindings">
   <h2>WireGuard peer bindings (exact accounting source)</h2>
   <p class="muted">Bind each WireGuard public key to an app user. Then traffic is calculated from real WG counters.</p>
   <div style="display:grid;grid-template-columns:2fr 3fr 2fr auto;gap:8px;align-items:center;">
@@ -1981,7 +3294,7 @@ def admin(request: Request) -> HTMLResponse:
   </table>
 </div>
 
-<div class="card admin-section" data-section="traffic">
+<div class="card admin-section" data-section="traffic" data-subsection="xray-bindings">
   <h2>Xray client bindings (exact accounting source)</h2>
   <p class="muted">Bind each Xray client email (from Xray config) to an app user. Data comes from Xray StatsService counters.</p>
   <div style="display:grid;grid-template-columns:2fr 3fr 2fr auto;gap:8px;align-items:center;">
@@ -1998,7 +3311,7 @@ def admin(request: Request) -> HTMLResponse:
   </table>
 </div>
 
-<div class="card admin-section" data-section="traffic">
+<div class="card admin-section" data-section="traffic" data-subsection="per-user">
   <h2>Per-user traffic (WG + Xray exact)</h2>
   <p class="muted">Data is based on WireGuard/Xray counters and binding tables above.</p>
   <p class="muted" id="traffic-source">source: -</p>
@@ -2010,7 +3323,7 @@ def admin(request: Request) -> HTMLResponse:
   </table>
 </div>
 
-<div class="card admin-section" data-section="logs">
+<div class="card admin-section" data-section="logs" data-subsection="admin-log">
   <h2>Admin actions log</h2>
   <pre id="admin-out">Ready.</pre>
 </div>
@@ -2053,20 +3366,77 @@ def admin(request: Request) -> HTMLResponse:
 const csrfToken = {repr(user["csrf_token"])};
 let currentServiceLogContainer = '';
 let serviceLogsIntervalId = null;
+let adminRefreshIntervalId = null;
+let securityEventsCache = [];
+let currentAdminSection = 'overview';
+const currentAdminSubsection = {{}};
+const sectionSubsections = {{
+  overview: [
+    ['realtime', 'Realtime'],
+    ['capacity', 'Capacity'],
+    ['trend', 'Trends'],
+    ['online', 'Online users'],
+    ['services', 'Services'],
+    ['deploy', 'Deploy'],
+    ['backup', 'Backup'],
+  ],
+  security: [
+    ['incidents', 'Incidents'],
+    ['blocked', 'Blocked IPs'],
+  ],
+  configurator: [['settings', 'Settings']],
+  approvals: [['requests', 'Requests']],
+  users: [['management', 'Management'], ['recent', 'Recent users']],
+  traffic: [['wg-bindings', 'WG bindings'], ['xray-bindings', 'Xray bindings'], ['per-user', 'Per-user']],
+  logs: [['admin-log', 'Admin log']],
+}};
 const escHtml = (s) => String(s ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
 function getCsrfToken() {{
   const m = document.cookie.match(/(?:^|; )proxy_vpn_csrf=([^;]+)/);
   if (m && m[1]) return decodeURIComponent(m[1]);
   return csrfToken;
 }}
-function showSection(section) {{
+function showSubsection(section, subsection) {{
   document.querySelectorAll('.admin-section').forEach(el => {{
-    el.style.display = (el.dataset.section === section) ? 'block' : 'none';
+    if (el.dataset.section !== section) {{
+      el.style.display = 'none';
+      return;
+    }}
+    const cardSub = String(el.dataset.subsection || '');
+    if (!subsection || !cardSub) {{
+      el.style.display = 'block';
+      return;
+    }}
+    el.style.display = (cardSub === subsection) ? 'block' : 'none';
   }});
+}}
+function renderSubtabs(section) {{
+  const root = document.getElementById('admin-subtabs');
+  if (!root) return;
+  const subs = sectionSubsections[section] || [];
+  if (!subs.length || subs.length === 1) {{
+    root.style.display = 'none';
+    root.innerHTML = '';
+    return;
+  }}
+  root.style.display = 'flex';
+  root.innerHTML = subs.map(([key, label]) => {{
+    const active = currentAdminSubsection[section] === key ? 'active' : '';
+    return `<button class="tab-btn ${{active}}" onclick="showSection('${{section}}','${{key}}')">${{escHtml(label)}}</button>`;
+  }}).join('');
+}}
+function showSection(section, preferredSubsection = '') {{
+  currentAdminSection = section;
   document.querySelectorAll('#admin-tabs .tab-btn').forEach(btn => {{
     const isActive = btn.dataset.tab === section;
     btn.classList.toggle('active', isActive);
   }});
+  const subs = sectionSubsections[section] || [];
+  const fallback = subs.length ? subs[0][0] : '';
+  const selected = preferredSubsection || currentAdminSubsection[section] || fallback;
+  currentAdminSubsection[section] = selected;
+  renderSubtabs(section);
+  showSubsection(section, selected);
 }}
 const fmtBytes = (n) => {{
   if (!Number.isFinite(n)) return '-';
@@ -2140,6 +3510,176 @@ function renderDeployEvents(items, path, reason) {{
     <td>${{escHtml(i.details || i.raw || '-')}}</td>
   </tr>`).join('');
   if (meta) meta.textContent = 'Source file: ' + (path || '-') + ' | showing latest ' + items.length + ' events';
+}}
+function securitySeverityBadge(level) {{
+  const l = String(level || 'unknown').toLowerCase();
+  if (l === 'critical' || l === 'high') return `<span class="status-pill status-in_error">${{escHtml(l)}}</span>`;
+  if (l === 'medium' || l === 'warn') return `<span class="status-pill status-pending">${{escHtml(l)}}</span>`;
+  return `<span class="status-pill status-running">${{escHtml(l)}}</span>`;
+}}
+function securityActionBadge(action) {{
+  const a = String(action || 'observed').toLowerCase();
+  if (a === 'blocked') return `<span class="status-pill status-in_error">${{escHtml(a)}}</span>`;
+  if (a === 'mitigated' || a === 'throttled') return `<span class="status-pill status-pending">${{escHtml(a)}}</span>`;
+  return `<span class="status-pill status-running">${{escHtml(a)}}</span>`;
+}}
+function aggregateSecurityEvents(items) {{
+  const groups = new Map();
+  (items || []).forEach((i) => {{
+    const key = [
+      String(i.ip || ''),
+      String(i.attack_type || ''),
+      String(i.direction || ''),
+      String(i.target || ''),
+      String(i.action || ''),
+      String(i.severity || ''),
+      String(i.reason || ''),
+    ].join('|');
+    if (!groups.has(key)) {{
+      groups.set(key, {{
+        ...i,
+        count: Number(i.count || 1),
+      }});
+      return;
+    }}
+    const cur = groups.get(key);
+    cur.count = Number(cur.count || 0) + Number(i.count || 1);
+    if (String(i.ts || '') > String(cur.ts || '')) cur.ts = i.ts;
+  }});
+  return Array.from(groups.values()).sort((a, b) => String(b.ts || '').localeCompare(String(a.ts || '')));
+}}
+function applySecurityFilters() {{
+  const ipQ = String(document.getElementById('sec-filter-ip')?.value || '').trim().toLowerCase();
+  const attackQ = String(document.getElementById('sec-filter-attack')?.value || '').trim().toLowerCase();
+  const directionQ = String(document.getElementById('sec-filter-direction')?.value || '').trim().toLowerCase();
+  const severityQ = String(document.getElementById('sec-filter-severity')?.value || '').trim().toLowerCase();
+  const aggregate = !!document.getElementById('sec-aggregate')?.checked;
+  let items = (securityEventsCache || []).filter((i) => {{
+    if (ipQ && !String(i.ip || '').toLowerCase().includes(ipQ)) return false;
+    if (attackQ && !String(i.attack_type || '').toLowerCase().includes(attackQ)) return false;
+    if (directionQ && !String(i.direction || '').toLowerCase().includes(directionQ)) return false;
+    if (severityQ && String(i.severity || '').toLowerCase() !== severityQ) return false;
+    return true;
+  }});
+  if (aggregate) items = aggregateSecurityEvents(items);
+  renderSecurityEvents(items, '');
+}}
+function resetSecurityFilters() {{
+  const ids = ['sec-filter-ip', 'sec-filter-attack', 'sec-filter-direction'];
+  ids.forEach((id) => {{
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  }});
+  const sev = document.getElementById('sec-filter-severity');
+  if (sev) sev.value = '';
+  const ag = document.getElementById('sec-aggregate');
+  if (ag) ag.checked = true;
+  applySecurityFilters();
+}}
+async function manualBlockIp() {{
+  const out = document.getElementById('security-admin-out');
+  const ip = String(document.getElementById('sec-manual-ip')?.value || '').trim();
+  const reason = String(document.getElementById('sec-manual-reason')?.value || '').trim();
+  const blockSeconds = Number(document.getElementById('sec-manual-seconds')?.value || 900);
+  if (!ip) {{
+    if (out) out.textContent = 'IP is required.';
+    return;
+  }}
+  if (out) out.textContent = 'Blocking...';
+  const r = await fetch('/api/v1/admin/security/block', {{
+    method: 'POST',
+    headers: {{'Content-Type':'application/json', 'X-CSRF-Token': getCsrfToken()}},
+    body: JSON.stringify({{ip, reason, block_seconds: Math.max(60, Math.trunc(blockSeconds || 900))}})
+  }});
+  const txt = await r.text();
+  if (out) out.textContent = txt;
+  await refreshAdminLive();
+}}
+async function manualUnblockIp(ipArg = null) {{
+  const out = document.getElementById('security-admin-out');
+  const ip = String(ipArg || document.getElementById('sec-manual-ip')?.value || '').trim();
+  const reason = String(document.getElementById('sec-manual-reason')?.value || '').trim();
+  if (!ip) {{
+    if (out) out.textContent = 'IP is required.';
+    return;
+  }}
+  if (out) out.textContent = 'Unblocking...';
+  const r = await fetch('/api/v1/admin/security/unblock', {{
+    method: 'POST',
+    headers: {{'Content-Type':'application/json', 'X-CSRF-Token': getCsrfToken()}},
+    body: JSON.stringify({{ip, reason}})
+  }});
+  const txt = await r.text();
+  if (out) out.textContent = txt;
+  await refreshAdminLive();
+}}
+function renderSecurityEvents(items, reason) {{
+  const body = document.getElementById('security-events-body');
+  const meta = document.getElementById('security-events-meta');
+  if (!body) return;
+  if (!items || items.length === 0) {{
+    body.innerHTML = '<tr><td colspan="10" class="muted">No security incidents yet.</td></tr>';
+    if (meta) meta.textContent = reason || 'No attack telemetry yet.';
+    return;
+  }}
+  body.innerHTML = items.map(i => `<tr>
+    <td>${{escHtml(i.ts || '-')}}</td>
+    <td>${{Number(i.count || 1)}}</td>
+    <td><code>${{escHtml(i.ip || '-')}}</code></td>
+    <td>${{escHtml((i.country || 'Unknown') + ' / ' + (i.city || '-'))}}<br><span class="muted">${{escHtml(i.asn || '-')}}</span></td>
+    <td>${{escHtml(i.attack_type || '-')}}</td>
+    <td>${{escHtml(i.direction || '-')}}</td>
+    <td>${{escHtml(i.target || '-')}}</td>
+    <td>${{securityActionBadge(i.action || 'observed')}}</td>
+    <td>${{securitySeverityBadge(i.severity || '-')}}</td>
+    <td>${{escHtml(i.reason || '-')}}</td>
+  </tr>`).join('');
+  if (meta) meta.textContent = 'Last incidents: ' + items.length;
+}}
+function renderSecurityBlocked(items, reason) {{
+  const body = document.getElementById('security-blocked-body');
+  const meta = document.getElementById('security-blocked-meta');
+  if (!body) return;
+  if (!items || items.length === 0) {{
+    body.innerHTML = '<tr><td colspan="6" class="muted">No blocked IPs.</td></tr>';
+    if (meta) meta.textContent = reason || 'Blocklist is empty.';
+    return;
+  }}
+  body.innerHTML = items.map(i => `<tr>
+    <td><code>${{escHtml(i.ip || '-')}}</code></td>
+    <td>${{escHtml(i.blocked_until || '-')}}</td>
+    <td>${{escHtml(i.reason || '-')}}</td>
+    <td>${{escHtml(i.created_at || '-')}}</td>
+    <td>${{escHtml(i.updated_at || '-')}}</td>
+    <td><button class="btn-ghost" onclick="manualUnblockIp('${{escHtml(i.ip || '')}}')">Unblock</button></td>
+  </tr>`).join('');
+  if (meta) meta.textContent = 'Currently blocked: ' + items.length;
+}}
+function backupBadge(state) {{
+  const s = String(state || 'unknown');
+  if (['success', 'ok', 'passed'].includes(s)) return '<span class="status-pill status-running">' + escHtml(s) + '</span>';
+  if (['warn', 'warning', 'skipped', 'unknown'].includes(s)) return '<span class="status-pill status-pending">' + escHtml(s) + '</span>';
+  return '<span class="status-pill status-in_error">' + escHtml(s) + '</span>';
+}}
+function renderBackupStatus(data) {{
+  const overallEl = document.getElementById('backup-overall');
+  const integrityEl = document.getElementById('backup-integrity');
+  const updatedEl = document.getElementById('backup-updated');
+  const successEl = document.getElementById('backup-last-success');
+  const archiveEl = document.getElementById('backup-archive');
+  const msgEl = document.getElementById('backup-message');
+  if (!overallEl || !integrityEl || !updatedEl || !successEl || !archiveEl || !msgEl) return;
+  const backupState = data && data.backup_status ? data.backup_status : 'unknown';
+  const integrityState = data && data.integrity && data.integrity.status ? data.integrity.status : 'unknown';
+  overallEl.innerHTML = backupBadge(backupState);
+  integrityEl.innerHTML = backupBadge(integrityState);
+  updatedEl.textContent = String((data && data.updated_at) || '-');
+  successEl.textContent = String((data && data.last_success_at) || '-');
+  const path = (data && data.archive_path) ? data.archive_path : '-';
+  archiveEl.textContent = 'archive: ' + String(path);
+  const msg = (data && data.message) ? data.message : 'No backup status yet.';
+  const reason = (data && data.integrity && data.integrity.reason) ? data.integrity.reason : '';
+  msgEl.textContent = reason ? (String(msg) + '\n' + String(reason)) : String(msg);
 }}
 async function openServiceLogs(containerName) {{
   currentServiceLogContainer = containerName;
@@ -2236,14 +3776,212 @@ function drawMetrics(points) {{
   ctx.fillStyle = '#16a34a';
   ctx.fillText('MEM %', pad + 60, pad + 12);
 }}
+function renderCapacityStatus(c) {{
+  if (!c || c.status !== 'ok') return;
+  const overallEl = document.getElementById('cap-overall');
+  const targetEl = document.getElementById('cap-target');
+  const cpuEl = document.getElementById('cap-cpu-p95');
+  const memEl = document.getElementById('cap-mem-p95');
+  const diskEl = document.getElementById('cap-disk-p95');
+  const summaryEl = document.getElementById('cap-summary');
+  if (overallEl) {{
+    const badge = c.overall === 'critical'
+      ? '<span class="status-pill status-error">critical</span>'
+      : (c.overall === 'warn'
+        ? '<span class="status-pill status-pending">warn</span>'
+        : '<span class="status-pill status-running">ok</span>');
+    overallEl.innerHTML = badge;
+  }}
+  if (targetEl) targetEl.textContent = `${{Number(c.active_sessions || 0)}} / ${{Number(c.target_active_users || 15)}}`;
+  if (cpuEl) cpuEl.textContent = `${{Number(c.p95?.cpu_pct || 0).toFixed(1)}}%`;
+  if (memEl) memEl.textContent = `${{Number(c.p95?.mem_pct || 0).toFixed(1)}}%`;
+  if (diskEl) diskEl.textContent = `${{Number(c.p95?.disk_pct || 0).toFixed(1)}}%`;
+  if (summaryEl) {{
+    summaryEl.textContent = `window: ${{Number(c.window_minutes || 0)}} min, samples: ${{Number(c.samples || 0)}}. ` +
+      `signals -> cpu:${{c.signals?.cpu || '-'}}, mem:${{c.signals?.memory || '-'}}, disk:${{c.signals?.disk || '-'}}, concurrency:${{c.signals?.concurrency || '-'}}.`;
+  }}
+  renderConfigRuntime(c);
+}}
+function renderConfigRuntime(c) {{
+  const body = document.getElementById('cfg-runtime-body');
+  if (!body) return;
+  if (!c || c.status !== 'ok') {{
+    body.innerHTML = '<tr><td colspan="5" class="muted">No runtime data.</td></tr>';
+    return;
+  }}
+  const runtime = c.runtime || {{}};
+  const detected = runtime.detected || {{}};
+  const usage = runtime.usage || {{}};
+  const cfg = c.config || {{}};
+  const cpuTotal = Number(detected.cpu_cores || cfg.server_cpu_cores || 0);
+  const cpuUsed = Number(usage.cpu_used_cores || 0);
+  const cpuLeft = Math.max(0, cpuTotal - cpuUsed);
+  const ramTotal = Number(detected.ram_gb || cfg.server_ram_gb || 0);
+  const ramUsed = Number(usage.ram_used_gb || 0);
+  const ramLeft = Math.max(0, ramTotal - ramUsed);
+  const diskTotal = Number(detected.storage_gb || cfg.server_storage_gb || 0);
+  const diskUsed = Number(usage.disk_used_gb || 0);
+  const diskLeft = Math.max(0, diskTotal - diskUsed);
+  const trafficLimitBytes = Number(cfg.traffic_limit_tb || 0) * 1024 * 1024 * 1024 * 1024;
+  const trafficUsedBytes = Number(usage.traffic_month_used_bytes || 0);
+  const trafficLeftBytes = Number(usage.traffic_month_left_bytes || 0);
+  const trafficIncrementBytes = Number(usage.traffic_increment_window_bytes || 0);
+  const trafficLeftPct = Number(usage.traffic_left_pct || 0);
+  const thresholds = c.thresholds || {{}};
+  const signalClass = (state) => state === 'critical' ? 'in_error' : (state === 'warn' ? 'pending' : 'running');
+  const signalBadge = (state) => `<span class="status-pill status-${{signalClass(state)}}">${{escHtml(state || 'ok')}}</span>`;
+  const metricState = (value, warn, crit) => {{
+    const v = Number(value || 0);
+    const w = Number(warn || 0);
+    const cr = Number(crit || 0);
+    if (v >= cr) return 'critical';
+    if (v >= w) return 'warn';
+    return 'ok';
+  }};
+  const cpuState = metricState(usage.cpu_current_pct, thresholds.cpu_warn_p95, thresholds.cpu_crit_p95);
+  const ramState = metricState(usage.ram_current_pct, thresholds.ram_warn_p95, thresholds.ram_crit_p95);
+  const diskState = metricState(usage.disk_current_pct, thresholds.disk_warn_p95, thresholds.disk_crit_p95);
+  const trafficState = trafficLeftPct <= 10 ? 'critical' : (trafficLeftPct <= 25 ? 'warn' : 'ok');
+  body.innerHTML = `
+    <tr>
+      <td><b>CPU</b></td>
+      <td>${{cpuTotal.toFixed(2)}} cores</td>
+      <td>${{cpuUsed.toFixed(2)}} cores (${{Number(usage.cpu_current_pct || 0).toFixed(1)}}%)</td>
+      <td>${{cpuLeft.toFixed(2)}} cores</td>
+      <td>${{signalBadge(cpuState)}} · target active: ${{Number(c.target_active_users || 0)}}</td>
+    </tr>
+    <tr>
+      <td><b>RAM</b></td>
+      <td>${{ramTotal.toFixed(2)}} GB</td>
+      <td>${{ramUsed.toFixed(2)}} GB (${{Number(usage.ram_current_pct || 0).toFixed(1)}}%)</td>
+      <td>${{ramLeft.toFixed(2)}} GB</td>
+      <td>${{signalBadge(ramState)}} · p95: ${{Number(c.p95?.mem_pct || 0).toFixed(1)}}%</td>
+    </tr>
+    <tr>
+      <td><b>Storage</b></td>
+      <td>${{diskTotal.toFixed(2)}} GB</td>
+      <td>${{diskUsed.toFixed(2)}} GB (${{Number(usage.disk_current_pct || 0).toFixed(1)}}%)</td>
+      <td>${{diskLeft.toFixed(2)}} GB</td>
+      <td>${{signalBadge(diskState)}} · p95: ${{Number(c.p95?.disk_pct || 0).toFixed(1)}}%</td>
+    </tr>
+    <tr>
+      <td><b>Traffic (month)</b></td>
+      <td>${{fmtBytes(trafficLimitBytes)}}</td>
+      <td>${{fmtBytes(trafficUsedBytes)}}</td>
+      <td>${{fmtBytes(trafficLeftBytes)}} (${{trafficLeftPct.toFixed(2)}}%)</td>
+      <td>${{signalBadge(trafficState)}} · increment ${{Number(c.window_minutes || 0)}}m: +${{fmtBytes(trafficIncrementBytes)}}</td>
+    </tr>
+  `;
+}}
+function setConfigField(id, value) {{
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.value = String(value ?? '');
+}}
+function scheduleAdminRefresh(seconds) {{
+  const sec = Math.max(5, Math.min(300, Number(seconds || 30)));
+  if (adminRefreshIntervalId) clearInterval(adminRefreshIntervalId);
+  adminRefreshIntervalId = setInterval(refreshAdminLive, sec * 1000);
+}}
+function readConfigNumber(id) {{
+  const el = document.getElementById(id);
+  if (!el) return 0;
+  return Number(el.value || 0);
+}}
+function renderConfigurator(config) {{
+  if (!config) return;
+  setConfigField('cfg-server-cpu-cores', config.server_cpu_cores);
+  setConfigField('cfg-server-ram-gb', config.server_ram_gb);
+  setConfigField('cfg-server-storage-gb', config.server_storage_gb);
+  setConfigField('cfg-traffic-limit-tb', config.traffic_limit_tb);
+  setConfigField('cfg-avg-user-traffic-gb', config.avg_user_monthly_traffic_gb);
+  setConfigField('cfg-active-user-ratio-pct', config.active_user_ratio_pct);
+  setConfigField('cfg-max-registered-users', config.max_registered_users);
+  setConfigField('cfg-target-active-users', config.target_active_users);
+  setConfigField('cfg-cpu-warn-p95', config.cpu_warn_p95);
+  setConfigField('cfg-cpu-crit-p95', config.cpu_crit_p95);
+  setConfigField('cfg-ram-warn-p95', config.ram_warn_p95);
+  setConfigField('cfg-ram-crit-p95', config.ram_crit_p95);
+  setConfigField('cfg-disk-warn-p95', config.disk_warn_p95);
+  setConfigField('cfg-disk-crit-p95', config.disk_crit_p95);
+  setConfigField('cfg-dashboard-refresh-seconds', config.dashboard_refresh_seconds || 30);
+  const derived = document.getElementById('cfg-derived');
+  if (derived) {{
+    derived.textContent =
+      `derived: recommended_max_users=${{Number(config.recommended_max_users || 0)}} · ` +
+      `recommended_active_users=${{Number(config.recommended_active_users || 0)}} · ` +
+      `traffic_budget_per_user=${{Number(config.per_user_traffic_budget_gb || 0).toFixed(2)}} GB/month · ` +
+      `refresh=${{Number(config.dashboard_refresh_seconds || 30)}}s`;
+  }}
+  scheduleAdminRefresh(config.dashboard_refresh_seconds || 30);
+}}
+async function loadConfigurator() {{
+  const out = document.getElementById('cfg-out');
+  if (out) out.textContent = 'Loading...';
+  const r = await fetch('/api/v1/admin/configurator');
+  const txt = await r.text();
+  if (!r.ok) {{
+    if (out) out.textContent = txt;
+    return;
+  }}
+  let j = null;
+  try {{ j = JSON.parse(txt); }} catch (e) {{ j = null; }}
+  if (!j || !j.config) {{
+    if (out) out.textContent = txt;
+    return;
+  }}
+  renderConfigurator(j.config);
+  if (out) out.textContent = 'Configuration loaded.';
+}}
+async function applyConfigurator() {{
+  const out = document.getElementById('cfg-out');
+  const payload = {{
+    server_cpu_cores: readConfigNumber('cfg-server-cpu-cores'),
+    server_ram_gb: readConfigNumber('cfg-server-ram-gb'),
+    server_storage_gb: readConfigNumber('cfg-server-storage-gb'),
+    traffic_limit_tb: readConfigNumber('cfg-traffic-limit-tb'),
+    avg_user_monthly_traffic_gb: readConfigNumber('cfg-avg-user-traffic-gb'),
+    active_user_ratio_pct: readConfigNumber('cfg-active-user-ratio-pct'),
+    max_registered_users: Math.trunc(readConfigNumber('cfg-max-registered-users')),
+    target_active_users: Math.trunc(readConfigNumber('cfg-target-active-users')),
+    cpu_warn_p95: readConfigNumber('cfg-cpu-warn-p95'),
+    cpu_crit_p95: readConfigNumber('cfg-cpu-crit-p95'),
+    ram_warn_p95: readConfigNumber('cfg-ram-warn-p95'),
+    ram_crit_p95: readConfigNumber('cfg-ram-crit-p95'),
+    disk_warn_p95: readConfigNumber('cfg-disk-warn-p95'),
+    disk_crit_p95: readConfigNumber('cfg-disk-crit-p95'),
+    dashboard_refresh_seconds: Math.trunc(readConfigNumber('cfg-dashboard-refresh-seconds')),
+  }};
+  if (out) out.textContent = 'Applying...';
+  const r = await fetch('/api/v1/admin/configurator', {{
+    method: 'POST',
+    headers: {{'Content-Type':'application/json', 'X-CSRF-Token': getCsrfToken()}},
+    body: JSON.stringify(payload)
+  }});
+  const txt = await r.text();
+  if (!r.ok) {{
+    if (out) out.textContent = txt;
+    return;
+  }}
+  let j = null;
+  try {{ j = JSON.parse(txt); }} catch (e) {{ j = null; }}
+  if (j && j.config) renderConfigurator(j.config);
+  if (j && j.capacity) renderCapacityStatus(j.capacity);
+  if (out) out.textContent = (j && j.message) ? j.message : txt;
+  await refreshAdminLive();
+}}
 async function refreshAdminLive() {{
-  const [statsR, onlineR, tsR, trafficR, servicesR, deployEventsR] = await Promise.all([
+  const [statsR, onlineR, tsR, trafficR, servicesR, deployEventsR, capacityR, backupStatusR, securityEventsR, securityBlockedR] = await Promise.all([
     fetch('/api/v1/admin/stats'),
     fetch('/api/v1/admin/online-users'),
     fetch('/api/v1/admin/system-metrics/timeseries?minutes=60'),
     fetch('/api/v1/admin/user-traffic/summary?hours=24'),
     fetch('/api/v1/admin/services/status'),
-    fetch('/api/v1/admin/deploy-events?limit=12')
+    fetch('/api/v1/admin/deploy-events?limit=12'),
+    fetch('/api/v1/admin/capacity-status?window_minutes=60'),
+    fetch('/api/v1/admin/backup-status'),
+    fetch('/api/v1/admin/security/events?limit=120'),
+    fetch('/api/v1/admin/security/blocked?limit=120')
   ]);
   if (statsR.ok) {{
     const s = (await statsR.json()).stats || {{}};
@@ -2284,6 +4022,25 @@ async function refreshAdminLive() {{
   if (deployEventsR.ok) {{
     const d = await deployEventsR.json();
     renderDeployEvents(d.items || [], d.path || '', d.reason || '');
+  }}
+  if (capacityR.ok) {{
+    const c = await capacityR.json();
+    renderCapacityStatus(c);
+  }}
+  if (backupStatusR.ok) {{
+    const b = await backupStatusR.json();
+    renderBackupStatus(b);
+  }}
+  if (securityEventsR.ok) {{
+    const s = await securityEventsR.json();
+    securityEventsCache = Array.isArray(s.items) ? s.items : [];
+    applySecurityFilters();
+    const meta = document.getElementById('security-events-meta');
+    if (meta && s.reason) meta.textContent = s.reason;
+  }}
+  if (securityBlockedR.ok) {{
+    const s = await securityBlockedR.json();
+    renderSecurityBlocked(s.items || [], s.reason || '');
   }}
 }}
 async function bindWgPeer() {{
@@ -2388,8 +4145,9 @@ async function deleteUser(userId, username) {{
   if (r.ok) window.location.reload();
 }}
 refreshAdminLive();
+loadConfigurator();
 showSection('overview');
-setInterval(refreshAdminLive, 10000);
+scheduleAdminRefresh(30);
 </script>
 """,
         active="admin",
@@ -2403,6 +4161,45 @@ def csrf_token() -> JSONResponse:
     resp = JSONResponse({"status": "ok", "csrf_token": token})
     _set_csrf_cookie(resp, token)
     return resp
+
+
+@app.get("/api/v1/app/about")
+def app_about() -> JSONResponse:
+    return JSONResponse(_read_release_state())
+
+
+@app.post("/api/v1/admin/update/check")
+def admin_update_check(request: Request) -> JSONResponse:
+    user = _require_admin(request)
+    _ensure_csrf(request)
+    info = _write_update_request(
+        UPDATE_CHECK_REQUEST_PATH,
+        {"requested_by": user["username"], "kind": "check_updates"},
+    )
+    return JSONResponse(
+        {
+            "status": "ok",
+            "message": "Update check request accepted. It will be processed by auto-update service.",
+            "request": info,
+        }
+    )
+
+
+@app.post("/api/v1/admin/update/apply")
+def admin_update_apply(request: Request) -> JSONResponse:
+    user = _require_admin(request)
+    _ensure_csrf(request)
+    info = _write_update_request(
+        UPDATE_APPLY_REQUEST_PATH,
+        {"requested_by": user["username"], "kind": "apply_update"},
+    )
+    return JSONResponse(
+        {
+            "status": "ok",
+            "message": "Update apply request accepted. Rebuild will start on next auto-update cycle.",
+            "request": info,
+        }
+    )
 
 
 @app.post("/api/v1/auth/register")
@@ -2452,8 +4249,19 @@ def login(request: Request, payload: LoginRequest) -> JSONResponse:
     _ensure_csrf(request)
     username = payload.username.strip().lower()
     ip = _client_ip(request)
+    enforce_block = not _is_internal_ip(ip)
     locked, wait_seconds = _is_login_locked(username, ip)
     if locked:
+        _security_report_event(
+            ip=ip,
+            attack_type="bruteforce_login",
+            direction="inbound->auth",
+            reason=f"login locked for {wait_seconds}s",
+            severity="high",
+            action="blocked" if enforce_block else "observed",
+            block_seconds=max(wait_seconds, SECURITY_BLOCK_SECONDS_BRUTE) if enforce_block else 0,
+            source="auth-login",
+        )
         raise HTTPException(status_code=429, detail=f"Too many attempts. Retry in {wait_seconds}s")
     with _db_connect() as con:
         row = con.execute(
@@ -2462,6 +4270,17 @@ def login(request: Request, payload: LoginRequest) -> JSONResponse:
         ).fetchone()
     if not row or row["is_active"] != 1 or not _verify_password(payload.password, row["password_hash"]):
         _register_failed_login(username, ip)
+        lock_now, wait_now = _is_login_locked(username, ip)
+        _security_report_event(
+            ip=ip,
+            attack_type="bruteforce_login",
+            direction="inbound->auth",
+            reason=f"invalid credentials for user={username}",
+            severity="high" if lock_now else "medium",
+            action="blocked" if (lock_now and enforce_block) else "observed",
+            block_seconds=max(wait_now, SECURITY_BLOCK_SECONDS_BRUTE) if (lock_now and enforce_block) else 0,
+            source="auth-login",
+        )
         raise HTTPException(status_code=401, detail="Invalid credentials")
     _reset_failed_login(username, ip)
     _revoke_session(request)
@@ -2578,81 +4397,115 @@ def user_device_config(
         f"?encryption=none&flow={flow}&security=reality&sni={sni}&fp=chrome&pbk={pbk}&sid={sid}&type=tcp"
         f"#proxy-vpn-{user['username']}-{platform}"
     )
+    manual_fields_hint = (
+        f"Manual fields from this card: Address={host}, Port={port}, UUID={profile['xray_uuid']}, "
+        f"Network=tcp, TLS/Reality SNI={sni}, Public Key={pbk}, Short ID={sid}, Flow={flow}, Encryption=none."
+    )
 
     instructions: list[str] = []
     app_name = ""
     primary_client: dict[str, str] = {}
+    client_candidates: list[dict[str, str]] = []
     client_about = "Free client for importing VLESS URI and connecting in VPN/proxy mode."
     if device_type == "mobile" and platform == "apple":
         app_name = "Hiddify Next / Karing (free)"
-        primary_client = {
+        client_candidates = [
+            {
             "name": "Karing",
             "install_url": "https://apps.apple.com/us/app/karing/id6472431552",
             "source": "store",
         }
+        ]
         client_about = "Karing is a free Apple client for VLESS/Xray profiles with simple URI import."
         instructions = [
             "Install Karing from App Store using the button below.",
-            "Open app -> Add profile/node -> Import from Clipboard/URI.",
-            "Paste VLESS URI from this card and save profile.",
-            "Enable tunnel/proxy mode and verify access to blocked resource.",
+            "Karing menu: Profiles -> + -> Add profile -> VLESS/Reality.",
+            manual_fields_hint,
+            "Alternative quick path: Profiles -> + -> Import from Clipboard, then paste Config URI from this card.",
+            "Tap Save -> Connect/Start tunnel -> open blocked site and verify traffic.",
         ]
     elif device_type == "mobile" and platform == "android":
         app_name = "v2rayNG / Hiddify Next (free)"
-        primary_client = {
-            "name": "v2rayNG",
-            "install_url": "https://play.google.com/store/apps/details?id=com.v2ray.ang",
-            "source": "store",
-        }
-        client_about = "v2rayNG is a free Android client with stable support for Xray/VLESS links."
+        client_candidates = [
+            {
+                "name": "Hiddify Next",
+                "install_url": "https://play.google.com/store/apps/details?id=app.hiddify.com",
+                "source": "store",
+            },
+            {
+                "name": "v2rayNG",
+                "install_url": "https://github.com/2dust/v2rayNG/releases",
+                "source": "github",
+            },
+        ]
+        client_about = "Hiddify Next and v2rayNG are free Android clients with stable support for Xray/VLESS links."
         instructions = [
-            "Install v2rayNG from Google Play using the button below.",
-            "Add profile -> Import from Clipboard or manual VLESS URI.",
-            "Paste URI from this card and save.",
-            "Start connection (VPN mode in app) and test route.",
+            "Install client using the button below (store variant is prioritized).",
+            "Hiddify Next menu: Profiles -> + -> Add profile -> VLESS/Reality.",
+            manual_fields_hint,
+            "If profile form is unavailable, use Import from Clipboard and paste Config URI from this card.",
+            "Tap Connect (Android VPN permission prompt -> Allow) and verify blocked resource access.",
         ]
     elif device_type == "desktop" and platform == "windows":
         app_name = "v2rayN"
-        primary_client = {
+        client_candidates = [
+            {
             "name": "v2rayN",
             "install_url": "https://github.com/2dust/v2rayN/releases",
             "source": "github",
         }
+        ]
         client_about = "v2rayN is a free Windows GUI client for Xray/VLESS with easy clipboard import."
         instructions = [
             "Download latest v2rayN from releases page.",
-            "Servers -> Import from clipboard (or Ctrl+V).",
-            "Set imported node as active.",
-            "Enable system proxy and validate connection.",
+            "v2rayN menu: Servers -> Add [VLESS] (or Servers -> Import bulk URL from clipboard).",
+            manual_fields_hint,
+            "Set created node as active -> System Proxy -> Set system proxy.",
+            "Start service (if needed) and verify traffic in v2rayN logs + blocked resource test.",
         ]
     elif device_type == "desktop" and platform == "apple":
         app_name = "Nekoray / V2rayU (free)"
-        primary_client = {
+        client_candidates = [
+            {
             "name": "V2rayU",
             "install_url": "https://github.com/yanue/V2rayU/releases",
             "source": "github",
         }
+        ]
         client_about = "V2rayU is a free macOS client that supports VLESS URI import and system proxy modes."
         instructions = [
             "Download and install V2rayU from releases page.",
-            "Import VLESS URI from clipboard.",
-            "Select profile as active and enable proxy mode.",
-            "Verify traffic through the tunnel.",
+            "V2rayU menu: Server -> Add [VLESS] (or Import vmess/vless URL from clipboard).",
+            manual_fields_hint,
+            "Select server as active -> V2rayU -> Turn On V2rayU -> Set System Proxy (Auto/PAC).",
+            "Open blocked resource and verify traffic through tunnel.",
         ]
     elif device_type == "desktop" and platform == "linux":
         app_name = "Nekoray / sing-box GUI"
-        primary_client = {
+        client_candidates = [
+            {
             "name": "Karing",
             "install_url": "https://github.com/KaringX/karing/releases",
             "source": "github",
         }
+        ]
         client_about = "Karing provides free Linux builds (AppImage/DEB/RPM) and supports VLESS URI import."
         instructions = [
             "Download Karing (AppImage/DEB/RPM) from releases page.",
-            "Create new profile and import VLESS URI.",
-            "Enable tun/system proxy according to your desktop setup.",
-            "Check connectivity to blocked endpoint.",
+            "Karing menu: Profiles -> + -> Add profile -> VLESS/Reality (or Import from Clipboard).",
+            manual_fields_hint,
+            "Enable Tun or System Proxy mode (according to distro/network manager setup).",
+            "Connect and validate access to blocked endpoint.",
         ]
+
+    if client_candidates:
+        store_client = next((c for c in client_candidates if c.get("source") == "store"), None)
+        primary_client = dict(store_client or client_candidates[0])
+        fallback = next((c for c in client_candidates if c.get("install_url") != primary_client.get("install_url")), None)
+        if fallback and fallback.get("install_url"):
+            primary_client["fallback_url"] = str(fallback["install_url"])
+            primary_client["fallback_label"] = f"{fallback.get('name', 'Mirror')} ({fallback.get('source', 'mirror')})"
+
     if not primary_client:
         primary_client = {"name": "Client", "install_url": "", "source": "unknown"}
 
@@ -2738,6 +4591,80 @@ def admin_stats(request: Request) -> JSONResponse:
                 "avg_mem_1h_pct": round(float(one_hour["avg_mem"] or 0.0), 2) if one_hour else 0.0,
                 "avg_disk_1h_pct": round(float(one_hour["avg_disk"] or 0.0), 2) if one_hour else 0.0,
             },
+        }
+    )
+
+
+@app.get("/api/v1/admin/capacity-status")
+def admin_capacity_status(request: Request, window_minutes: int = 60) -> JSONResponse:
+    _require_admin(request)
+    return JSONResponse(_read_capacity_status(window_minutes=window_minutes))
+
+
+@app.get("/api/v1/admin/backup-status")
+def admin_backup_status(request: Request) -> JSONResponse:
+    _require_admin(request)
+    return JSONResponse(_read_backup_state())
+
+
+@app.get("/api/v1/admin/security/events")
+def admin_security_events(request: Request, limit: int = 150) -> JSONResponse:
+    _require_admin(request)
+    return JSONResponse(_read_security_events(limit=limit))
+
+
+@app.get("/api/v1/admin/security/blocked")
+def admin_security_blocked(request: Request, limit: int = 150) -> JSONResponse:
+    _require_admin(request)
+    return JSONResponse(_read_security_blocked(limit=limit))
+
+
+@app.post("/api/v1/admin/security/block")
+def admin_security_block(request: Request, payload: AdminSecurityBlockRequest) -> JSONResponse:
+    _require_admin(request)
+    _ensure_csrf(request)
+    res = _security_manual_block(
+        ip=payload.ip,
+        reason=(payload.reason or "manual block"),
+        block_seconds=max(60, int(payload.block_seconds or 900)),
+    )
+    if res.get("status") != "ok":
+        raise HTTPException(status_code=503, detail=str(res.get("reason") or "security guard unavailable"))
+    return JSONResponse({"status": "ok", "message": "IP blocked", "result": res.get("result", {})})
+
+
+@app.post("/api/v1/admin/security/unblock")
+def admin_security_unblock(request: Request, payload: AdminSecurityUnblockRequest) -> JSONResponse:
+    _require_admin(request)
+    _ensure_csrf(request)
+    res = _security_manual_unblock(
+        ip=payload.ip,
+        reason=(payload.reason or "manual unblock"),
+    )
+    if res.get("status") != "ok":
+        raise HTTPException(status_code=503, detail=str(res.get("reason") or "security guard unavailable"))
+    return JSONResponse({"status": "ok", "message": "IP unblocked", "result": res.get("result", {})})
+
+
+@app.get("/api/v1/admin/configurator")
+def admin_configurator(request: Request) -> JSONResponse:
+    _require_admin(request)
+    cfg = _load_system_config()
+    return JSONResponse({"status": "ok", "config": cfg})
+
+
+@app.post("/api/v1/admin/configurator")
+def admin_configurator_apply(request: Request, payload: AdminConfiguratorUpdateRequest) -> JSONResponse:
+    _require_admin(request)
+    _ensure_csrf(request)
+    cfg = _persist_system_config(payload.model_dump())
+    capacity = _read_capacity_status(window_minutes=60)
+    return JSONResponse(
+        {
+            "status": "ok",
+            "message": "Configuration applied. Dependent capacity limits recalculated.",
+            "config": cfg,
+            "capacity": capacity,
         }
     )
 

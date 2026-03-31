@@ -28,6 +28,7 @@ services:
       - .env
     environment:
       DATABASE_URL: sqlite:////data/app.db
+      SECURITY_GUARD_URL: http://security-guard:9100
     volumes:
       - api-data:/data
       - ./xray:/xray-config:rw
@@ -36,8 +37,28 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - proxy-vpn
+    depends_on:
+      - security-guard
     expose:
       - "8000"
+
+  security-guard:
+    build:
+      context: ./security_guard
+      dockerfile: Dockerfile
+    container_name: proxy-vpn-security-guard
+    restart: unless-stopped
+    environment:
+      SECURITY_DB_PATH: /data/security.db
+      SECURITY_GEOIP_ENABLED: ${SECURITY_GEOIP_ENABLED:-1}
+      SECURITY_GEOIP_TIMEOUT_SECONDS: ${SECURITY_GEOIP_TIMEOUT_SECONDS:-1.5}
+      SECURITY_DEFAULT_BLOCK_SECONDS: ${SECURITY_DEFAULT_BLOCK_SECONDS:-900}
+    volumes:
+      - security-data:/data
+    networks:
+      - proxy-vpn
+    expose:
+      - "9100"
 
   xray:
     image: ghcr.io/xtls/xray-core:latest
@@ -81,3 +102,5 @@ volumes:
     name: proxy-vpn_caddy_config
   api-data:
     name: proxy-vpn_api_data
+  security-data:
+    name: proxy-vpn_security_data

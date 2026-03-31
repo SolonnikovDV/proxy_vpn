@@ -8,6 +8,9 @@ services:
   api:
     restart: always
 
+  security-guard:
+    restart: always
+
   xray:
     restart: always
     ports:

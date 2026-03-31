@@ -1,0 +1,35 @@
+name: CI Checks
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Audit sensitive data
+        run: |
+          set -euo pipefail
+          bash ./scripts/audit-sensitive.sh
+
+      - name: Integrity contract checks
+        run: |
+          set -euo pipefail
+          INTEGRITY_SCOPE=ci bash ./scripts/integrity-check.sh
+
+      - name: Run smoke tests
+        run: |
+          set -euo pipefail
+          bash ./scripts/test-smoke.sh

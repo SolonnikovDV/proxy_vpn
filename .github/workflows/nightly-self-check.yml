@@ -15,8 +15,9 @@ jobs:
       cancel-in-progress: true
 
     env:
-      SSH_HOST: ${{ vars.SSH_HOST }}
-      SSH_USER: ${{ vars.SSH_USER }}
+      SSH_HOST: ${{ secrets.SSH_HOST != '' && secrets.SSH_HOST || vars.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER != '' && secrets.SSH_USER || vars.SSH_USER }}
+      SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
       DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
       VPN_PANEL_DOMAIN: ${{ vars.VPN_PANEL_DOMAIN }}
       DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -26,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=()
-          for name in SSH_HOST SSH_USER DEPLOY_PATH VPN_PANEL_DOMAIN DEPLOY_SSH_KEY; do
+          for name in SSH_HOST SSH_USER DEPLOY_PATH; do
             if [ -z "${!name:-}" ]; then
               missing+=("${name}")
             fi
@@ -36,17 +37,32 @@ jobs:
             exit 1
           fi
 
+      - name: Skip remote self-check when no deploy SSH key
+        if: ${{ env.DEPLOY_SSH_KEY == '' && env.SSH_PASSWORD == '' }}
+        run: |
+          echo "Neither DEPLOY_SSH_KEY nor SSH_PASSWORD is configured in GitHub."
+          echo "Remote nightly self-check is skipped by design."
+
       - name: Setup SSH key
+        if: ${{ env.DEPLOY_SSH_KEY != '' }}
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
 
+      - name: Install sshpass for password auth
+        if: ${{ env.DEPLOY_SSH_KEY == '' && env.SSH_PASSWORD != '' }}
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y sshpass
+
       - name: Add host to known_hosts
+        if: ${{ env.DEPLOY_SSH_KEY != '' || env.SSH_PASSWORD != '' }}
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -H "${SSH_HOST}" >> ~/.ssh/known_hosts
 
-      - name: Check stack on target host
+      - name: Check stack on target host (SSH key)
+        if: ${{ env.DEPLOY_SSH_KEY != '' }}
         run: |
           ssh "${SSH_USER}@${SSH_HOST}" "
             set -euo pipefail
@@ -62,9 +78,33 @@ jobs:
             fi
           "
 
+      - name: Check stack on target host (SSH password)
+        if: ${{ env.DEPLOY_SSH_KEY == '' && env.SSH_PASSWORD != '' }}
+        env:
+          SSHPASS: ${{ env.SSH_PASSWORD }}
+        run: |
+          sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${SSH_USER}@${SSH_HOST}" "
+            set -euo pipefail
+            cd '${DEPLOY_PATH}'
+            MODE=prod HEALTH_TIMEOUT=120 bash ./scripts/healthcheck-stack.sh
+            if docker compose version >/dev/null 2>&1; then
+              docker compose -f compose.yaml -f compose.prod.yaml ps
+            elif command -v docker-compose >/dev/null 2>&1; then
+              docker-compose -f compose.yaml -f compose.prod.yaml ps
+            else
+              echo 'Docker Compose not found on target host'
+              exit 1
+            fi
+          "
+
       - name: External HTTPS health check
+        if: ${{ env.DEPLOY_SSH_KEY != '' || env.SSH_PASSWORD != '' }}
         run: |
           set -euo pipefail
+          if [ -z "${VPN_PANEL_DOMAIN:-}" ]; then
+            echo "VPN_PANEL_DOMAIN is not set, skip external HTTPS health check"
+            exit 0
+          fi
           for i in 1 2 3 4 5; do
             if curl -fsS --max-time 10 "https://${VPN_PANEL_DOMAIN}/health" >/dev/null; then
               echo "External health check passed"

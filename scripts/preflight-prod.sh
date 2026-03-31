@@ -23,6 +23,24 @@ is_valid_port() {
   [ "${p}" -ge 1 ] && [ "${p}" -le 65535 ]
 }
 
+read_secret_value() {
+  local raw="${1:-}"
+  local file_path="${2:-}"
+  if [ -n "${raw}" ]; then
+    printf '%s' "${raw}"
+    return 0
+  fi
+  if [ -n "${file_path}" ]; then
+    [ -f "${file_path}" ] || die "Secret file not found: ${file_path}"
+    local v
+    v="$(tr -d '\r' < "${file_path}")"
+    v="${v%$'\n'}"
+    printf '%s' "${v}"
+    return 0
+  fi
+  printf ''
+}
+
 if ! docker info >/dev/null 2>&1; then
   die "Docker daemon is not running or not accessible."
 fi
@@ -43,17 +61,21 @@ export XRAY_PORT="${XRAY_PORT:-8443}"
 export WG_PORT="${WG_PORT:-51820}"
 export APP_SECRET_KEY="${APP_SECRET_KEY:-}"
 export ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
+export APP_SECRET_KEY_FILE="${APP_SECRET_KEY_FILE:-}"
+export ADMIN_PASSWORD_FILE="${ADMIN_PASSWORD_FILE:-}"
 
 [ "${CADDYFILE_PATH}" = "Caddyfile.prod" ] || die "CADDYFILE_PATH must be Caddyfile.prod for production."
 [ -n "${VPN_PANEL_DOMAIN:-}" ] || die "VPN_PANEL_DOMAIN is empty."
 [ "${VPN_PANEL_DOMAIN}" != "panel.example.com" ] || die "Set a real VPN_PANEL_DOMAIN (not panel.example.com)."
 [ "${VPN_PANEL_DOMAIN}" != "localhost" ] || die "VPN_PANEL_DOMAIN must be a real public domain."
-[ -n "${APP_SECRET_KEY}" ] || die "APP_SECRET_KEY is empty."
-[ "${APP_SECRET_KEY}" != "replace-with-long-random-secret" ] || die "Set real APP_SECRET_KEY in .env."
-[ "${#APP_SECRET_KEY}" -ge 24 ] || die "APP_SECRET_KEY must be at least 24 characters."
-[ -n "${ADMIN_PASSWORD}" ] || die "ADMIN_PASSWORD is empty."
-[ "${ADMIN_PASSWORD}" != "replace-with-strong-admin-password" ] || die "Set real ADMIN_PASSWORD in .env."
-[ "${#ADMIN_PASSWORD}" -ge 10 ] || die "ADMIN_PASSWORD must be at least 10 characters."
+APP_SECRET_VALUE="$(read_secret_value "${APP_SECRET_KEY}" "${APP_SECRET_KEY_FILE}")"
+ADMIN_PASSWORD_VALUE="$(read_secret_value "${ADMIN_PASSWORD}" "${ADMIN_PASSWORD_FILE}")"
+[ -n "${APP_SECRET_VALUE}" ] || die "APP_SECRET_KEY/APP_SECRET_KEY_FILE is empty."
+[ "${APP_SECRET_VALUE}" != "replace-with-long-random-secret" ] || die "Set real APP_SECRET_KEY (or APP_SECRET_KEY_FILE)."
+[ "${#APP_SECRET_VALUE}" -ge 24 ] || die "APP_SECRET_KEY must be at least 24 characters."
+[ -n "${ADMIN_PASSWORD_VALUE}" ] || die "ADMIN_PASSWORD/ADMIN_PASSWORD_FILE is empty."
+[ "${ADMIN_PASSWORD_VALUE}" != "replace-with-strong-admin-password" ] || die "Set real ADMIN_PASSWORD (or ADMIN_PASSWORD_FILE)."
+[ "${#ADMIN_PASSWORD_VALUE}" -ge 10 ] || die "ADMIN_PASSWORD must be at least 10 characters."
 
 is_valid_port "${CADDY_HTTP_PORT}" || die "Invalid CADDY_HTTP_PORT=${CADDY_HTTP_PORT}"
 is_valid_port "${CADDY_HTTPS_PORT}" || die "Invalid CADDY_HTTPS_PORT=${CADDY_HTTPS_PORT}"

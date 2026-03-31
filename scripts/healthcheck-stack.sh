@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Check API health via Caddy and print useful logs on failure.
+# Check stack health via Caddy + security-guard and print useful logs on failure.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -38,6 +38,20 @@ wait_for_http() {
   return 1
 }
 
+wait_for_running_container() {
+  local container_name=$1
+  local max=${2:-90}
+  local i=0
+  while [ "${i}" -lt "${max}" ]; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "${container_name}" 2>/dev/null || true)" = "true" ]; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  return 1
+}
+
 compose_args=("-f" "compose.yaml")
 if [ "${MODE}" = "prod" ]; then
   export CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
@@ -47,17 +61,30 @@ else
 fi
 
 health_url="http://127.0.0.1:${CADDY_HTTP_PORT}/health"
+security_guard_container="proxy-vpn-security-guard"
 log "--- health check via ${health_url} ---"
 if wait_for_http "${health_url}" "${HEALTH_TIMEOUT}"; then
   log "OK: API reachable through Caddy"
   curl -sfS "${health_url}" || true
   echo
+else
+  log "FAIL: API not reachable through Caddy"
+  log "--- docker compose ps ---"
+  dc "${compose_args[@]}" ps || true
+  log "--- logs (caddy, api, security-guard, xray, wireguard) ---"
+  dc "${compose_args[@]}" logs --tail 120 caddy api security-guard xray wireguard 2>&1 || true
+  exit 1
+fi
+
+log "--- security guard container check (${security_guard_container}) ---"
+if wait_for_running_container "${security_guard_container}" "${HEALTH_TIMEOUT}"; then
+  log "OK: security-guard container is running"
   exit 0
 fi
 
-log "FAIL: API not reachable through Caddy"
+log "FAIL: security-guard container is not running"
 log "--- docker compose ps ---"
 dc "${compose_args[@]}" ps || true
-log "--- logs (caddy, api, xray, wireguard) ---"
-dc "${compose_args[@]}" logs --tail 120 caddy api xray wireguard 2>&1 || true
+log "--- logs (caddy, api, security-guard, xray, wireguard) ---"
+dc "${compose_args[@]}" logs --tail 120 caddy api security-guard xray wireguard 2>&1 || true
 exit 1

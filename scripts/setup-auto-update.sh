@@ -14,6 +14,7 @@ RUN_USER="${RUN_USER:-root}"
 BRANCH="${BRANCH:-main}"
 MODE="${MODE:-prod}"
 ON_CALENDAR="${ON_CALENDAR:-*:0/15}"
+UPDATE_APPROVAL_REQUIRED="${UPDATE_APPROVAL_REQUIRED:-1}"
 
 [ -d "${DEPLOY_PATH}" ] || die "DEPLOY_PATH does not exist: ${DEPLOY_PATH}"
 id "${RUN_USER}" >/dev/null 2>&1 || die "RUN_USER does not exist: ${RUN_USER}"
@@ -34,6 +35,7 @@ User=${RUN_USER}
 WorkingDirectory=${DEPLOY_PATH}
 Environment=BRANCH=${BRANCH}
 Environment=MODE=${MODE}
+Environment=UPDATE_APPROVAL_REQUIRED=${UPDATE_APPROVAL_REQUIRED}
 ExecStart=/usr/bin/env bash ${DEPLOY_PATH}/scripts/auto-update.sh
 EOF
 
