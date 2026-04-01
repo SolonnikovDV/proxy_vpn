@@ -204,6 +204,23 @@ Workflow:
 - `.github/workflows/nightly-self-check.yml`
 - runs preflight-only or preflight+deploy on the target host over SSH
 
+CI/CD integrity contract:
+- `ci-checks`, `deploy-prod`, `preflight-prod`, `nightly-self-check` run `INTEGRITY_SCOPE=ci bash ./scripts/integrity-check.sh`
+- this contract validates bootstrap/env setup rules in `scripts/bootstrap-ubuntu.sh`:
+  - part of variables must keep default values in script (non-interactive safe reruns)
+  - critical values must be requested interactively (for example `VPN_PANEL_DOMAIN`, `SERVER_PUBLIC_IP`, admin credentials/token prompts)
+- if this contract is broken, workflow fails as repository/config regression
+- missing deploy-access inputs (`DEPLOY_SSH_KEY`, `SSH_HOST`, `SSH_USER`, `DEPLOY_PATH`) do **not** fail stability checks; remote SSH steps are logged and skipped as non-blocking
+
+Fail vs Non-blocking matrix:
+
+| Condition | CI result | Behavior |
+|---|---|---|
+| `INTEGRITY_SCOPE=ci` contract broken (repo/bootstrap regression) | **FAIL** | Workflow stops, regression must be fixed in repository/scripts |
+| Runtime integrity broken in backup (`INTEGRITY_SCOPE=runtime`) | **FAIL** | Backup is not created, integrity reason is written to backup status |
+| Missing deploy remote inputs (`DEPLOY_SSH_KEY`, `SSH_HOST`, `SSH_USER`, `DEPLOY_PATH`) | **NON-BLOCKING** | CI stability checks remain valid; remote SSH steps are skipped with explicit logs |
+| Missing optional render inputs when `RENDER_ENV_FROM_CI=1` | **NON-BLOCKING** | Remote preflight/deploy is skipped; workflows report which env inputs are missing |
+
 Create GitHub **Secrets**:
 - required for GitHub-initiated remote deploy/preflight over SSH: `DEPLOY_SSH_KEY`
 - bootstrap can configure this from server interactively (`CONFIGURE_GITHUB_ACTIONS_FROM_SERVER=1`)
@@ -447,6 +464,7 @@ Result:
 - symlink `backups/latest-backup.tar.gz`
 - retention by count (`RETENTION_COUNT`, default `14`)
 - backup is created only after integrity gate passes (`scripts/integrity-check.sh`, scope `runtime`)
+- runtime gate includes repository/bootstrap contract checks + runtime checks (db/config/secrets)
 - includes Caddy runtime volumes (`caddy-data`, `caddy-config`) in addition to app/security DB and repository runtime files
 
 Restore from snapshot:

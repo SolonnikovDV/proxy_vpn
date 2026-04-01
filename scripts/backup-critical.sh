@@ -119,7 +119,7 @@ git_sha="$(git rev-parse HEAD 2>/dev/null || echo na)"
 git_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo na)"
 
 if [ "${CHECK_INTEGRITY}" = "1" ]; then
-  log "Running integrity gate before backup..."
+  log "Running integrity gate before backup (repo/bootstrap contract + runtime state)..."
   integrity_output=""
   if ! integrity_output="$(INTEGRITY_SCOPE=runtime bash ./scripts/integrity-check.sh 2>&1)"; then
     integrity_reason="$(printf '%s' "${integrity_output}" | awk 'NF{line=$0} END{print line}')"

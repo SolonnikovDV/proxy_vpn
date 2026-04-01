@@ -63,7 +63,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate required CI vars
+      - name: Integrity contract checks (repo/bootstrap env)
+        run: |
+          set -euo pipefail
+          INTEGRITY_SCOPE=ci bash ./scripts/integrity-check.sh
+
+      - name: Evaluate optional deploy inputs
         run: |
           set -euo pipefail
           missing=()
@@ -72,46 +77,70 @@ jobs:
               missing+=("${name}")
             fi
           done
+          render_missing=()
           if [ "${RENDER_ENV_FROM_CI:-0}" = "1" ]; then
-            [ -n "${VPN_PANEL_DOMAIN:-}" ] || missing+=("VPN_PANEL_DOMAIN")
+            [ -n "${VPN_PANEL_DOMAIN:-}" ] || render_missing+=("VPN_PANEL_DOMAIN")
             if [ -z "${APP_SECRET_KEY:-}" ] && [ -z "${APP_SECRET_KEY_FILE:-}" ]; then
-              missing+=("APP_SECRET_KEY_OR_APP_SECRET_KEY_FILE")
+              render_missing+=("APP_SECRET_KEY_OR_APP_SECRET_KEY_FILE")
             fi
             if [ -z "${ADMIN_PASSWORD:-}" ] && [ -z "${ADMIN_PASSWORD_FILE:-}" ]; then
-              missing+=("ADMIN_PASSWORD_OR_ADMIN_PASSWORD_FILE")
+              render_missing+=("ADMIN_PASSWORD_OR_ADMIN_PASSWORD_FILE")
             fi
           fi
+
+          remote_ready=1
+          if [ -z "${DEPLOY_SSH_KEY:-}" ]; then
+            remote_ready=0
+          fi
           if [ "${#missing[@]}" -gt 0 ]; then
-            echo "Missing required GitHub vars/secrets: ${missing[*]}"
-            exit 1
+            remote_ready=0
+          fi
+          if [ "${#render_missing[@]}" -gt 0 ]; then
+            remote_ready=0
           fi
 
-      - name: Deploy key status (non-blocking)
-        if: ${{ env.DEPLOY_SSH_KEY == '' }}
+          if [ "${remote_ready}" = "1" ]; then
+            echo "REMOTE_EXECUTION_READY=1" >> "$GITHUB_ENV"
+            echo "Remote deploy inputs are present."
+          else
+            echo "REMOTE_EXECUTION_READY=0" >> "$GITHUB_ENV"
+            echo "Remote deploy is optional and will be skipped."
+            if [ "${#missing[@]}" -gt 0 ]; then
+              echo "Missing connection inputs: ${missing[*]}"
+            fi
+            if [ "${#render_missing[@]}" -gt 0 ]; then
+              echo "Missing RENDER_ENV_FROM_CI=1 inputs: ${render_missing[*]}"
+            fi
+            if [ -z "${DEPLOY_SSH_KEY:-}" ]; then
+              echo "Missing secret: DEPLOY_SSH_KEY"
+            fi
+          fi
+
+      - name: Remote deploy status (non-blocking)
+        if: ${{ env.REMOTE_EXECUTION_READY != '1' }}
         run: |
-          echo "DEPLOY_SSH_KEY is not configured in GitHub."
           echo "CI stability checks remain valid; this is a deploy-access warning only."
-          echo "Blocked in this workflow without DEPLOY_SSH_KEY:"
+          echo "Blocked in this workflow while remote inputs are incomplete:"
           echo "  - Setup SSH key (webfactory/ssh-agent)"
           echo "  - Add host to known_hosts"
           echo "  - Sync project files to server (rsync over SSH)"
           echo "  - Render env and deploy on server (SSH)"
-          echo "To enable remote deploy from this workflow, configure DEPLOY_SSH_KEY secret."
+          echo "To enable remote deploy, configure required vars/secrets."
 
       - name: Setup SSH key
-        if: ${{ env.DEPLOY_SSH_KEY != '' }}
+        if: ${{ env.REMOTE_EXECUTION_READY == '1' }}
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
 
       - name: Add host to known_hosts
-        if: ${{ env.DEPLOY_SSH_KEY != '' }}
+        if: ${{ env.REMOTE_EXECUTION_READY == '1' }}
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -H "${SSH_HOST}" >> ~/.ssh/known_hosts
 
       - name: Sync project files to server (SSH key)
-        if: ${{ env.DEPLOY_SSH_KEY != '' }}
+        if: ${{ env.REMOTE_EXECUTION_READY == '1' }}
         run: |
           rsync -az --delete \
             --exclude ".git" \
@@ -121,7 +150,7 @@ jobs:
             ./ "${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/"
 
       - name: Render env and deploy on server (SSH key)
-        if: ${{ env.DEPLOY_SSH_KEY != '' }}
+        if: ${{ env.REMOTE_EXECUTION_READY == '1' }}
         run: |
           ssh "${SSH_USER}@${SSH_HOST}" "
             set -euo pipefail

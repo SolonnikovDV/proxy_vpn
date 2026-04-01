@@ -23,6 +23,7 @@ check_repo_contract() {
   require_file_nonempty "scripts/backup-critical.sh"
   require_file_nonempty "scripts/restore-critical.sh"
   require_file_nonempty "scripts/setup-backup.sh"
+  require_file_nonempty "scripts/bootstrap-ubuntu.sh"
   require_file_nonempty "security_guard/app.py"
 
   grep -Eq "name:[[:space:]]*proxy-vpn" compose.yaml || die "compose.yaml missing project name proxy-vpn"
@@ -39,6 +40,20 @@ check_repo_contract() {
 
   # Ensure backups are guarded by integrity checks before snapshot creation.
   grep -Eq "integrity-check\\.sh" scripts/backup-critical.sh || die "backup-critical.sh is not gated by integrity checks"
+
+  # Bootstrap contract: some vars have defaults, some are interactive-required.
+  for k in TARGET_USER DEPLOY_PATH CLONE_REPO AUTO_PULL_REPO CONFIGURE_GITHUB_REPO_ACCESS AUTO_GENERATE_VPN_CONFIGS CONFIGURE_GITHUB_ACTIONS_FROM_SERVER APP_SECRET_KEY_FILE ADMIN_PASSWORD_FILE; do
+    grep -Eq "^${k}=\\\"\\$\\{${k}:-.*\\}\\\"" scripts/bootstrap-ubuntu.sh || die "bootstrap-ubuntu.sh missing default assignment for ${k}"
+  done
+
+  # Interactive-required values (no silent defaults in interactive mode).
+  grep -Eq 'VPN_PANEL_DOMAIN=""' scripts/bootstrap-ubuntu.sh || die "bootstrap-ubuntu.sh must force manual VPN_PANEL_DOMAIN input in interactive mode"
+  grep -Eq 'SERVER_PUBLIC_IP=""' scripts/bootstrap-ubuntu.sh || die "bootstrap-ubuntu.sh must force manual SERVER_PUBLIC_IP input in interactive mode"
+  grep -Eq 'prompt_value VPN_PANEL_DOMAIN "Enter public panel domain \(VPN_PANEL_DOMAIN\)" ""' scripts/bootstrap-ubuntu.sh || die "bootstrap-ubuntu.sh missing VPN_PANEL_DOMAIN prompt"
+  grep -Eq 'prompt_value SERVER_PUBLIC_IP "Enter public server host/IP for VPN configs \(SERVER_PUBLIC_IP\)" ""' scripts/bootstrap-ubuntu.sh || die "bootstrap-ubuntu.sh missing SERVER_PUBLIC_IP prompt"
+  grep -Eq 'prompt_value ADMIN_EMAIL "Enter admin email \(ADMIN_EMAIL\)" "admin@\$\{VPN_PANEL_DOMAIN\}"' scripts/bootstrap-ubuntu.sh || die "bootstrap-ubuntu.sh missing ADMIN_EMAIL prompt"
+  grep -Eq 'prompt_value BOOTSTRAP_ADMIN_PASSWORD "Enter admin password \(leave empty to autogenerate\)" "" "1"' scripts/bootstrap-ubuntu.sh || die "bootstrap-ubuntu.sh missing admin password prompt"
+  grep -Eq 'prompt_value GITHUB_ACTIONS_TOKEN "GitHub token with repo/actions permissions" "" "1"' scripts/bootstrap-ubuntu.sh || die "bootstrap-ubuntu.sh missing GitHub token prompt"
 }
 
 check_runtime_state() {
