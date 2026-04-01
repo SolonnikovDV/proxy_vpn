@@ -296,6 +296,7 @@ configure_github_actions_from_server() {
 
   log "Configuring GitHub Actions variables/secrets in ${GITHUB_ACTIONS_REPO}..."
   REPO="${GITHUB_ACTIONS_REPO}" \
+  GH_TOKEN="${GITHUB_ACTIONS_TOKEN}" \
   SSH_HOST="${SERVER_PUBLIC_IP}" \
   SSH_USER="root" \
   SSH_PASSWORD="${SERVER_ROOT_PASSWORD_FOR_GITHUB}" \

@@ -8,11 +8,22 @@ die() { log "ERROR: $*"; exit 1; }
 
 command -v gh >/dev/null 2>&1 || die "gh CLI is required"
 
+# Prefer explicit token provided by bootstrap/server automation.
+if [ -n "${GH_TOKEN:-}" ]; then
+  export GH_TOKEN
+elif [ -n "${GITHUB_TOKEN:-}" ]; then
+  export GH_TOKEN="${GITHUB_TOKEN}"
+fi
+
 REPO="${REPO:-}"
 if [ -z "${REPO}" ]; then
   REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
 fi
 [ -n "${REPO}" ] || die "Cannot detect repository. Set REPO=owner/name"
+
+if ! gh api "repos/${REPO}" >/dev/null 2>&1; then
+  die "GitHub API cannot access repo ${REPO}. Check token permissions and repository access."
+fi
 
 MODE="${MODE:-set}" # set | delete
 
