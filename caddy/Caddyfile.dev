@@ -7,19 +7,19 @@
     handle / {
         reverse_proxy api:8000
     }
-    handle /admin {
+    handle /admin* {
         reverse_proxy api:8000
     }
-    handle /cabinet {
+    handle /cabinet* {
         reverse_proxy api:8000
     }
-    handle /login {
+    handle /login* {
         reverse_proxy api:8000
     }
-    handle /about {
+    handle /about* {
         reverse_proxy api:8000
     }
-    handle /license {
+    handle /license* {
         reverse_proxy api:8000
     }
     handle /health {
@@ -28,7 +28,7 @@
     handle /api/* {
         reverse_proxy api:8000
     }
-    handle /docs {
+    handle /docs* {
         reverse_proxy api:8000
     }
     handle /openapi.json {
@@ -45,19 +45,19 @@ localhost:443 {
     handle / {
         reverse_proxy api:8000
     }
-    handle /admin {
+    handle /admin* {
         reverse_proxy api:8000
     }
-    handle /cabinet {
+    handle /cabinet* {
         reverse_proxy api:8000
     }
-    handle /login {
+    handle /login* {
         reverse_proxy api:8000
     }
-    handle /about {
+    handle /about* {
         reverse_proxy api:8000
     }
-    handle /license {
+    handle /license* {
         reverse_proxy api:8000
     }
     handle /health {
@@ -66,7 +66,7 @@ localhost:443 {
     handle /api/* {
         reverse_proxy api:8000
     }
-    handle /docs {
+    handle /docs* {
         reverse_proxy api:8000
     }
     handle /openapi.json {

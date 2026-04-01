@@ -23,6 +23,13 @@ is_valid_port() {
   [ "${p}" -ge 1 ] && [ "${p}" -le 65535 ]
 }
 
+assert_caddy_route_present() {
+  local route="$1"
+  local file="$2"
+  rg -n "handle[[:space:]]+${route}(\\*|[[:space:]]|\\{)" "${file}" >/dev/null 2>&1 \
+    || die "${file} is missing required route matcher for ${route}"
+}
+
 read_secret_value() {
   local raw="${1:-}"
   local file_path="${2:-}"
@@ -105,6 +112,12 @@ is_valid_port "${WG_PORT}" || die "Invalid WG_PORT=${WG_PORT}"
 [ "${CADDY_HTTPS_PORT}" != "${XRAY_PORT}" ] || die "CADDY_HTTPS_PORT and XRAY_PORT cannot be equal on same host."
 [ -f wireguard/conf/wg0.conf ] || die "wireguard/conf/wg0.conf is missing."
 [ -f xray/config.json ] || die "xray/config.json is missing."
+[ -f "caddy/${CADDYFILE_PATH}" ] || die "Caddy file is missing: caddy/${CADDYFILE_PATH}"
+
+# Catch UI route regressions before deployment.
+assert_caddy_route_present "/admin" "caddy/${CADDYFILE_PATH}"
+assert_caddy_route_present "/about" "caddy/${CADDYFILE_PATH}"
+assert_caddy_route_present "/license" "caddy/${CADDYFILE_PATH}"
 
 if command -v getent >/dev/null 2>&1; then
   if ! getent ahostsv4 "${VPN_PANEL_DOMAIN}" >/dev/null 2>&1; then

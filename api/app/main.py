@@ -2635,7 +2635,13 @@ def about_page(request: Request) -> HTMLResponse:
   </div>
 """
         if is_admin
-        else '<p class="muted">Only admin can run update checks and apply updates.</p>'
+        else """
+  <div style="display:flex;gap:8px;align-items:center;">
+    <button disabled title="Only admin can run update checks">Check updates</button>
+    <button disabled title="Only admin can apply updates">Update now</button>
+  </div>
+  <p class="muted">Only admin can run update checks and apply updates.</p>
+"""
     )
     return _page(
         "About application",
@@ -2650,6 +2656,14 @@ def about_page(request: Request) -> HTMLResponse:
   <div class="user-meta-row"><div class="label-muted">Update status</div><div id="about-update-status">-</div></div>
   <h3 style="margin-top:12px;">Release notes</h3>
   <pre id="about-release-notes">Loading...</pre>
+  <h3 style="margin-top:12px;">Updates history</h3>
+  <table style="width:100%; border-collapse:collapse;">
+    <thead>
+      <tr><th align="left">Time (UTC)</th><th align="left">Status</th><th align="left">From</th><th align="left">To</th><th align="left">Commit</th></tr>
+    </thead>
+    <tbody id="about-history-body"><tr><td colspan="5" class="muted">Loading...</td></tr></tbody>
+  </table>
+  <p class="muted" id="about-history-meta"></p>
   <h3 style="margin-top:12px;">Authorship, rights and license</h3>
   <div class="user-meta-row"><div class="label-muted">Author</div><div>Dmitry Solodovnikov</div></div>
   <div class="user-meta-row"><div class="label-muted">Contacts</div><div><a href="https://t.me/Dmitry_as_Solod" target="_blank" rel="noopener noreferrer">@Dmitry_as_Solod</a></div></div>
@@ -2660,10 +2674,35 @@ def about_page(request: Request) -> HTMLResponse:
 </div>
 <script>
 const aboutCsrfToken = {repr(user["csrf_token"] if user else "")};
+const aboutEscHtml = (s) => String((s === undefined || s === null) ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 function aboutHeaderToken() {{
   const m = document.cookie.match(/(?:^|; )proxy_vpn_csrf=([^;]+)/);
   if (m && m[1]) return decodeURIComponent(m[1]);
   return aboutCsrfToken;
+}}
+function aboutFirstCommitTitle(item) {{
+  const commits = Array.isArray(item && item.commits) ? item.commits : [];
+  if (!commits.length) return '-';
+  const first = commits[0] || {{}};
+  return String(first.title || first.sha || '-');
+}}
+function renderAboutHistory(items) {{
+  const body = document.getElementById('about-history-body');
+  const meta = document.getElementById('about-history-meta');
+  if (!body) return;
+  if (!items || items.length === 0) {{
+    body.innerHTML = '<tr><td colspan="5" class="muted">No updates history yet.</td></tr>';
+    if (meta) meta.textContent = 'No applied updates found.';
+    return;
+  }}
+  body.innerHTML = items.map(i => `<tr>
+    <td>${{aboutEscHtml(i.ts || '-')}}</td>
+    <td>${{aboutEscHtml(i.status || '-')}}</td>
+    <td><code>${{aboutEscHtml(i.from || '-')}}</code></td>
+    <td><code>${{aboutEscHtml(i.to || '-')}}</code></td>
+    <td>${{aboutEscHtml(aboutFirstCommitTitle(i))}}</td>
+  </tr>`).join('');
+  if (meta) meta.textContent = 'Records: ' + items.length;
 }}
 async function loadAboutState() {{
   const r = await fetch('/api/v1/app/about');
@@ -2688,6 +2727,8 @@ async function loadAboutState() {{
   document.getElementById('about-available-version').textContent = av && av.version ? String(av.version) : 'no update';
   document.getElementById('about-update-status').textContent = String(up.status || 'idle') + ' - ' + String(up.message || '-');
   document.getElementById('about-release-notes').textContent = String(notes || '-');
+  const history = (j.history && Array.isArray(j.history.items)) ? j.history.items : [];
+  renderAboutHistory(history);
   if (window.__aboutLastVersion && window.__aboutLastVersion !== vCur) {{
     const out = document.getElementById('about-out');
     if (out) out.textContent = 'Application updated to version ' + vCur + '. Reloading page...';
@@ -4544,7 +4585,9 @@ def csrf_token() -> JSONResponse:
 
 @app.get("/api/v1/app/about")
 def app_about() -> JSONResponse:
-    return JSONResponse(_read_release_state())
+    payload = _read_release_state()
+    payload["history"] = _read_update_audit(limit=20)
+    return JSONResponse(payload)
 
 
 @app.post("/api/v1/admin/update/check")
