@@ -1764,7 +1764,7 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
         profile_html = (
             f"<div><b>{escape(user['username'])}</b></div>"
             f"<div class='muted'>{escape(user['role'])}</div>"
-            f"<button class='btn-ghost' style='margin-top:8px;width:100%;' onclick='sidebarLogout()'>Logout</button>"
+            f"<button class='btn-ghost' style='margin-top:8px;width:100%;' data-action='sidebar-logout'>Logout</button>"
         )
 
     html = f"""<!doctype html>
@@ -2162,7 +2162,7 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       <div class="topbar">
         <div><strong>{title}</strong></div>
         <div style="display:flex;align-items:center;gap:8px;">
-          <button id="theme-toggle-btn" class="theme-toggle" onclick="toggleTheme()">Night mode</button>
+          <button id="theme-toggle-btn" class="theme-toggle" data-action="toggle-theme">Night mode</button>
           <span id="app-version-badge" class="status-pill status-stopped">version: -</span>
         </div>
       </div>
@@ -2230,6 +2230,15 @@ async function refreshGlobalReleaseState() {{
 applyTheme(detectPreferredTheme());
 refreshGlobalReleaseState();
 setInterval(refreshGlobalReleaseState, 30000);
+document.addEventListener('click', (event) => {{
+  const target = event.target;
+  if (!target || !target.closest) return;
+  const btn = target.closest('[data-action]');
+  if (!btn) return;
+  const action = String(btn.getAttribute('data-action') || '').trim();
+  if (action === 'sidebar-logout') return void sidebarLogout();
+  if (action === 'toggle-theme') return void toggleTheme();
+}});
 </script>
 </html>"""
     return HTMLResponse(content=html, status_code=200)
@@ -2621,8 +2630,8 @@ def about_page(request: Request) -> HTMLResponse:
     admin_controls = (
         """
   <div style="display:flex;gap:8px;align-items:center;">
-    <button onclick="requestUpdateCheck()">Check updates</button>
-    <button onclick="requestUpdateApply()">Update now</button>
+    <button data-action="about-check-updates">Check updates</button>
+    <button data-action="about-apply-update">Update now</button>
   </div>
 """
         if is_admin
@@ -2706,6 +2715,15 @@ async function requestUpdateApply() {{
   const t = await r.text();
   if (out) out.textContent = t;
 }}
+document.addEventListener('click', (event) => {{
+  const target = event.target;
+  if (!target || !target.closest) return;
+  const btn = target.closest('[data-action]');
+  if (!btn) return;
+  const action = String(btn.getAttribute('data-action') || '').trim();
+  if (action === 'about-check-updates') return void requestUpdateCheck();
+  if (action === 'about-apply-update') return void requestUpdateApply();
+}});
 loadAboutState();
 setInterval(loadAboutState, 15000);
 </script>
@@ -2749,7 +2767,7 @@ def login_page(request: Request) -> HTMLResponse:
   <h1>Login</h1>
   <input id="login-username" placeholder="username" />
   <input id="login-password" placeholder="password" type="password" />
-  <button onclick="login()">Sign in</button>
+  <button data-action="login-submit">Sign in</button>
   <p class="muted">Admin credentials are configured from environment/secret files.</p>
 </div>
 <div class="card">
@@ -2757,7 +2775,7 @@ def login_page(request: Request) -> HTMLResponse:
   <input id="reg-username" placeholder="username" />
   <input id="reg-email" placeholder="email" />
   <input id="reg-password" placeholder="password" type="password" />
-  <button onclick="registerUser()">Create account</button>
+  <button data-action="register-submit">Create account</button>
   <p class="muted">Registration goes to pending state and requires admin approval.</p>
 </div>
 <div class="card">
@@ -2795,6 +2813,15 @@ async function registerUser() {
   });
   document.getElementById('out').textContent = await r.text();
 }
+document.addEventListener('click', (event) => {
+  const target = event.target;
+  if (!target || !target.closest) return;
+  const btn = target.closest('[data-action]');
+  if (!btn) return;
+  const action = String(btn.getAttribute('data-action') || '').trim();
+  if (action === 'login-submit') return void login();
+  if (action === 'register-submit') return void registerUser();
+});
 </script>
 """,
         active="login",
@@ -2821,7 +2848,7 @@ def cabinet(request: Request) -> HTMLResponse:
       <div class="user-meta-row"><div class="label-muted">Email</div><div><b id="cab-current-email">{escape(user["email"])}</b></div></div>
       <div class="user-meta-row"><div class="label-muted">Role</div><div><span class="status-pill status-running">{escape(user["role"])}</span></div></div>
       <div style="margin-top:10px;">
-        <button onclick="openEditProfileModal()">Edit profile</button>
+        <button data-action="open-edit-profile-modal">Edit profile</button>
       </div>
     </div>
   </div>
@@ -2848,21 +2875,21 @@ def cabinet(request: Request) -> HTMLResponse:
         <option value="global">Global</option>
       </select>
     </div>
-    <button onclick="loadDeviceCard()">Load card</button>
+    <button data-action="load-device-card">Load card</button>
   </div>
   <div id="device-card-out" style="margin-top:12px;"></div>
 </div>
-<div id="edit-profile-modal" class="modal-backdrop" onclick="closeEditProfileModal(event)">
-  <div class="modal-card" onclick="event.stopPropagation()">
+<div id="edit-profile-modal" class="modal-backdrop">
+  <div class="modal-card">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
       <strong>Edit profile</strong>
-      <button class="btn-ghost" onclick="closeEditProfileModal()">Close</button>
+      <button class="btn-ghost" data-action="close-edit-profile-modal">Close</button>
     </div>
     <div style="margin-top:10px;">
       <input id="cab-username" placeholder="username" value="{escape(user["username"])}" />
       <input id="cab-email" placeholder="email" value="{escape(user["email"])}" />
       <input id="cab-password" placeholder="new password (optional)" type="password" />
-      <button onclick="saveProfile()">Save changes</button>
+      <button data-action="save-profile">Save changes</button>
       <pre id="cab-out">Ready.</pre>
     </div>
   </div>
@@ -2879,8 +2906,7 @@ function openEditProfileModal() {{
   const modal = document.getElementById('edit-profile-modal');
   if (modal) modal.style.display = 'flex';
 }}
-function closeEditProfileModal(event) {{
-  if (event && event.target && event.target.id !== 'edit-profile-modal') return;
+function closeEditProfileModal() {{
   const modal = document.getElementById('edit-profile-modal');
   if (modal) modal.style.display = 'none';
 }}
@@ -2928,7 +2954,7 @@ function renderDeviceCard(card) {{
           <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);white-space:nowrap;"><b>${{safeName}}</b></td>
           <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);word-break:break-all;"><code>${{safeValue}}</code></td>
           <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);text-align:right;">
-            <button class="btn-ghost" onclick='navigator.clipboard.writeText(${{JSON.stringify(rawValue)}})'>Copy</button>
+            <button class="btn-ghost" data-action="copy-value" data-copy-value="${{encodeURIComponent(rawValue)}}">Copy</button>
           </td>
         </tr>
       `;
@@ -2944,7 +2970,7 @@ function renderDeviceCard(card) {{
       <p class="muted" style="margin:6px 0 8px;">${{escHtml(card.client_about || 'Free client for importing VLESS URI and connecting in VPN/proxy mode.')}}</p>
       <div class="user-meta-row"><div class="label-muted">Config URI</div><div><code id="cfg-uri" style="word-break:break-all;">${{escHtml(card.config_uri || '')}}</code></div></div>
       <div style="margin-top:8px;">
-        <button class="btn-ghost" onclick="copyConfigUri()">Copy URI</button>
+        <button class="btn-ghost" data-action="copy-config-uri">Copy URI</button>
       </div>
       <h4 style="margin:12px 0 6px;">Manual fields (client menu)</h4>
       <div style="overflow:auto;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);">
@@ -3042,6 +3068,26 @@ document.getElementById('dev-type').addEventListener('change', () => {{
 document.getElementById('dev-region').addEventListener('change', () => {{
   loadDeviceCard();
 }});
+document.addEventListener('click', (event) => {{
+  const target = event.target;
+  if (!target || !target.closest) return;
+  if (target.id === 'edit-profile-modal') {{
+    closeEditProfileModal();
+    return;
+  }}
+  const btn = target.closest('[data-action]');
+  if (!btn) return;
+  const action = String(btn.getAttribute('data-action') || '').trim();
+  if (action === 'open-edit-profile-modal') return void openEditProfileModal();
+  if (action === 'close-edit-profile-modal') return void closeEditProfileModal();
+  if (action === 'save-profile') return void saveProfile();
+  if (action === 'load-device-card') return void loadDeviceCard();
+  if (action === 'copy-config-uri') return void copyConfigUri();
+  if (action === 'copy-value') {{
+    const encoded = String(btn.getAttribute('data-copy-value') || '');
+    return void navigator.clipboard.writeText(decodeURIComponent(encoded));
+  }}
+}});
 refreshPlatformOptions();
 initDeviceCard();
 </script>
@@ -3104,8 +3150,8 @@ def admin(request: Request) -> HTMLResponse:
             f"<td>{escape(row['email'])}</td>"
             f"<td>{escape(row['requested_at'])}</td>"
             f"<td>"
-            f"<button onclick=\"approveReq({row['id']})\">Approve</button> "
-            f"<button onclick=\"rejectReq({row['id']})\">Reject</button>"
+            f"<button data-action='approve-request' data-request-id='{int(row['id'])}'>Approve</button> "
+            f"<button data-action='reject-request' data-request-id='{int(row['id'])}'>Reject</button>"
             f"</td>"
             f"</tr>"
             for row in pending_rows
@@ -3127,15 +3173,15 @@ def admin(request: Request) -> HTMLResponse:
                 "<span class='muted'>self</span>"
                 if int(row["id"]) == int(user["id"])
                 else (
-                    f"<button class='btn-ghost' onclick='blockUser({int(row['id'])})'>Block</button> "
+                    f"<button class='btn-ghost' data-action='block-user' data-user-id='{int(row['id'])}'>Block</button> "
                     if int(row["is_active"]) == 1
-                    else f"<button class='btn-ghost' onclick='unblockUser({int(row['id'])})'>Unblock</button> "
+                    else f"<button class='btn-ghost' data-action='unblock-user' data-user-id='{int(row['id'])}'>Unblock</button> "
                 )
             )
             + (
                 ""
                 if int(row["id"]) == int(user["id"])
-                else f"<button class='btn-ghost' onclick='deleteUser({int(row['id'])}, \"{escape(row['username'])}\")'>Delete</button>"
+                else f"<button class='btn-ghost js-delete-user' data-user-id='{int(row['id'])}' data-username='{escape(str(row['username']))}'>Delete</button>"
             )
             + "</td>"
             f"</tr>"
@@ -3158,7 +3204,7 @@ def admin(request: Request) -> HTMLResponse:
             f"<td><code style='font-size:12px'>{escape(row['public_key'])}</code></td>"
             f"<td>{escape(row['label'] or '')}</td>"
             f"<td>RX {row['last_rx_bytes']} / TX {row['last_tx_bytes']}</td>"
-            f"<td><button onclick=\"removeWgBinding('{escape(row['public_key'])}')\">Unbind</button></td>"
+            f"<td><button data-action='remove-wg-binding' data-public-key='{escape(row['public_key'])}'>Unbind</button></td>"
             f"</tr>"
             for row in wg_bind_rows
         ]
@@ -3173,7 +3219,7 @@ def admin(request: Request) -> HTMLResponse:
             f"<td><code style='font-size:12px'>{escape(row['client_email'])}</code></td>"
             f"<td>{escape(row['label'] or '')}</td>"
             f"<td>RX {row['last_downlink_bytes']} / TX {row['last_uplink_bytes']}</td>"
-            f"<td><button onclick=\"removeXrayBinding('{escape(row['client_email'])}')\">Unbind</button></td>"
+            f"<td><button data-action='remove-xray-binding' data-client-email='{escape(row['client_email'])}'>Unbind</button></td>"
             f"</tr>"
             for row in xray_bind_rows
         ]
@@ -3186,13 +3232,13 @@ def admin(request: Request) -> HTMLResponse:
         f"""
 <div class="card">
   <div class="tab-strip" id="admin-tabs">
-    <button class="tab-btn" data-tab="overview" onclick="showSection('overview')">Overview</button>
-    <button class="tab-btn" data-tab="security" onclick="showSection('security')">Security</button>
-    <button class="tab-btn" data-tab="configurator" onclick="showSection('configurator')">Configurator</button>
-    <button class="tab-btn" data-tab="approvals" onclick="showSection('approvals')">Approvals</button>
-    <button class="tab-btn" data-tab="users" onclick="showSection('users')">Users</button>
-    <button class="tab-btn" data-tab="traffic" onclick="showSection('traffic')">Traffic</button>
-    <button class="tab-btn" data-tab="logs" onclick="showSection('logs')">Logs</button>
+    <button class="tab-btn" data-tab="overview" data-admin-section="overview">Overview</button>
+    <button class="tab-btn" data-tab="security" data-admin-section="security">Security</button>
+    <button class="tab-btn" data-tab="configurator" data-admin-section="configurator">Configurator</button>
+    <button class="tab-btn" data-tab="approvals" data-admin-section="approvals">Approvals</button>
+    <button class="tab-btn" data-tab="users" data-admin-section="users">Users</button>
+    <button class="tab-btn" data-tab="traffic" data-admin-section="traffic">Traffic</button>
+    <button class="tab-btn" data-tab="logs" data-admin-section="logs">Logs</button>
   </div>
   <div class="tab-strip" id="admin-subtabs" style="margin-top:8px;display:none;"></div>
 </div>
@@ -3255,8 +3301,8 @@ def admin(request: Request) -> HTMLResponse:
     <input id="cfg-dashboard-refresh-seconds" placeholder="Refresh interval (sec)" type="number" step="1" min="5" max="300" />
   </div>
   <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
-    <button onclick="applyConfigurator()">Apply configuration</button>
-    <button class="btn-ghost" onclick="loadConfigurator()">Reload</button>
+    <button data-action="apply-configurator">Apply configuration</button>
+    <button class="btn-ghost" data-action="reload-configurator">Reload</button>
   </div>
   <p class="muted" id="cfg-derived">derived: -</p>
   <pre id="cfg-out">Ready.</pre>
@@ -3322,8 +3368,8 @@ def admin(request: Request) -> HTMLResponse:
     <input id="upd-filter-date-to" placeholder="Date to (ISO UTC)" />
   </div>
   <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-    <button class="btn-ghost" onclick="applyUpdateAuditFilters()">Apply filters</button>
-    <button class="btn-ghost" onclick="resetUpdateAuditFilters()">Reset filters</button>
+    <button class="btn-ghost" data-action="apply-update-filters">Apply filters</button>
+    <button class="btn-ghost" data-action="reset-update-filters">Reset filters</button>
   </div>
   <table style="width:100%; border-collapse:collapse;">
     <thead>
@@ -3367,8 +3413,8 @@ def admin(request: Request) -> HTMLResponse:
     </label>
   </div>
   <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-    <button class="btn-ghost" onclick="applySecurityFilters()">Apply filters</button>
-    <button class="btn-ghost" onclick="resetSecurityFilters()">Reset filters</button>
+    <button class="btn-ghost" data-action="apply-security-filters">Apply filters</button>
+    <button class="btn-ghost" data-action="reset-security-filters">Reset filters</button>
   </div>
   <table style="width:100%; border-collapse:collapse;">
     <thead>
@@ -3385,8 +3431,8 @@ def admin(request: Request) -> HTMLResponse:
     <input id="sec-manual-ip" placeholder="IP for manual block/unblock" />
     <input id="sec-manual-reason" placeholder="Reason (optional)" />
     <input id="sec-manual-seconds" placeholder="Block seconds" type="number" min="60" step="60" value="900" />
-    <button onclick="manualBlockIp()">Block IP</button>
-    <button class="btn-ghost" onclick="manualUnblockIp()">Unblock IP</button>
+    <button data-action="manual-block-ip">Block IP</button>
+    <button class="btn-ghost" data-action="manual-unblock-ip">Unblock IP</button>
   </div>
   <table style="width:100%; border-collapse:collapse;">
     <thead>
@@ -3411,7 +3457,7 @@ def admin(request: Request) -> HTMLResponse:
 <div class="card admin-section" data-section="users" data-subsection="management">
   <h2>User management</h2>
   <p class="muted">Create user/admin account from modal form.</p>
-  <button onclick="openCreateUserModal()">Create user/admin</button>
+  <button data-action="open-create-user-modal">Create user/admin</button>
 </div>
 
 <div class="card admin-section" data-section="users" data-subsection="recent">
@@ -3431,7 +3477,7 @@ def admin(request: Request) -> HTMLResponse:
     <select id="wg-bind-user" style="padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);">{user_options_html}</select>
     <input id="wg-bind-key" placeholder="WireGuard peer public key" />
     <input id="wg-bind-label" placeholder="label (optional)" />
-    <button onclick="bindWgPeer()">Bind</button>
+    <button data-action="bind-wg-peer">Bind</button>
   </div>
   <table style="width:100%; border-collapse:collapse; margin-top:10px;">
     <thead>
@@ -3448,7 +3494,7 @@ def admin(request: Request) -> HTMLResponse:
     <select id="xray-bind-user" style="padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);">{user_options_html}</select>
     <input id="xray-bind-email" placeholder="Xray client email (e.g. user1@proxy-vpn)" />
     <input id="xray-bind-label" placeholder="label (optional)" />
-    <button onclick="bindXrayClient()">Bind</button>
+    <button data-action="bind-xray-client">Bind</button>
   </div>
   <table style="width:100%; border-collapse:collapse; margin-top:10px;">
     <thead>
@@ -3474,11 +3520,11 @@ def admin(request: Request) -> HTMLResponse:
   <h2>Admin actions log</h2>
   <pre id="admin-out">Ready.</pre>
 </div>
-<div id="create-user-modal" class="modal-backdrop" onclick="closeCreateUserModal(event)">
-  <div class="modal-card" onclick="event.stopPropagation()">
+<div id="create-user-modal" class="modal-backdrop">
+  <div class="modal-card">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
       <strong>Create user/admin</strong>
-      <button class="btn-ghost" onclick="closeCreateUserModal()">Close</button>
+      <button class="btn-ghost" data-action="close-create-user-modal">Close</button>
     </div>
     <div style="margin-top:10px;">
       <input id="new-username" placeholder="username" />
@@ -3488,22 +3534,22 @@ def admin(request: Request) -> HTMLResponse:
         <option value="user">user</option>
         <option value="admin">admin</option>
       </select>
-      <button onclick="createUser()">Create account</button>
+      <button data-action="create-user">Create account</button>
       <pre id="create-user-out" style="margin-top:8px;">Ready.</pre>
     </div>
   </div>
 </div>
-<div id="service-log-modal" class="modal-backdrop" onclick="closeServiceLogs(event)">
-  <div class="modal-card" onclick="event.stopPropagation()">
+<div id="service-log-modal" class="modal-backdrop">
+  <div class="modal-card">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
       <strong id="service-log-title">Container logs</strong>
       <div style="display:flex;align-items:center;gap:8px;">
         <label class="muted" style="display:flex;align-items:center;gap:6px;">
-          <input id="service-log-stderr-only" type="checkbox" style="width:auto;margin:0;" onchange="refreshServiceLogsNow()" />
+          <input id="service-log-stderr-only" type="checkbox" style="width:auto;margin:0;" />
           stderr only
         </label>
-        <button class="btn-ghost" onclick="refreshServiceLogsNow()">Refresh now</button>
-        <button class="btn-ghost" onclick="closeServiceLogs()">Close</button>
+        <button class="btn-ghost" data-action="refresh-service-logs">Refresh now</button>
+        <button class="btn-ghost" data-action="close-service-logs">Close</button>
       </div>
     </div>
     <pre id="service-log-content" style="margin-top:10px;max-height:65vh;overflow:auto;">Loading...</pre>
@@ -3570,7 +3616,7 @@ function renderSubtabs(section) {{
   root.style.display = 'flex';
   root.innerHTML = subs.map(([key, label]) => {{
     const active = currentAdminSubsection[section] === key ? 'active' : '';
-    return `<button class="tab-btn ${{active}}" onclick="showSection('${{section}}','${{key}}')">${{escHtml(label)}}</button>`;
+    return `<button class="tab-btn ${{active}}" data-admin-section="${{escHtml(section)}}" data-admin-subsection="${{escHtml(key)}}">${{escHtml(label)}}</button>`;
   }}).join('');
 }}
 function showSection(section, preferredSubsection = '') {{
@@ -3627,7 +3673,7 @@ function renderServices(items, xrayCollector) {{
   }}
   body.innerHTML = items.map(i => {{
     const action = (i.state === 'pending' || i.state === 'in_error')
-      ? `<button class="btn-ghost" onclick="openServiceLogs('${{escHtml(i.name)}}')">Logs</button>`
+      ? `<button class="btn-ghost" data-action="open-service-logs" data-container="${{escHtml(i.name)}}">Logs</button>`
       : '<span class="muted">-</span>';
     const runtime = `${{escHtml(i.raw_status || '-')}}${{i.exit_code !== null && i.exit_code !== undefined ? (' (code ' + i.exit_code + ')') : ''}}`;
     return `<tr>
@@ -3886,7 +3932,7 @@ function renderSecurityBlocked(items, reason) {{
     <td>${{escHtml(i.reason || '-')}}</td>
     <td>${{escHtml(i.created_at || '-')}}</td>
     <td>${{escHtml(i.updated_at || '-')}}</td>
-    <td><button class="btn-ghost" onclick="manualUnblockIp('${{escHtml(i.ip || '')}}')">Unblock</button></td>
+    <td><button class="btn-ghost" data-action="manual-unblock-ip-item" data-ip="${{escHtml(i.ip || '')}}">Unblock</button></td>
   </tr>`).join('');
   if (meta) meta.textContent = 'Currently blocked: ' + items.length;
 }}
@@ -4386,6 +4432,97 @@ async function deleteUser(userId, username) {{
   document.getElementById('admin-out').textContent = await r.text();
   if (r.ok) window.location.reload();
 }}
+document.addEventListener('change', (event) => {{
+  const target = event.target;
+  if (!target) return;
+  if (target.id === 'service-log-stderr-only') refreshServiceLogsNow();
+}});
+document.addEventListener('click', (event) => {{
+  const target = event.target;
+  if (!target || !target.closest) return;
+  if (target.id === 'create-user-modal') {{
+    closeCreateUserModal();
+    return;
+  }}
+  if (target.id === 'service-log-modal') {{
+    closeServiceLogs();
+    return;
+  }}
+  const tabBtn = target.closest('[data-admin-section]');
+  if (tabBtn) {{
+    const section = String(tabBtn.getAttribute('data-admin-section') || '').trim();
+    const subsection = String(tabBtn.getAttribute('data-admin-subsection') || '').trim();
+    if (section) {{
+      showSection(section, subsection);
+      return;
+    }}
+  }}
+  const actionBtn = target.closest('[data-action]');
+  if (actionBtn) {{
+    const action = String(actionBtn.getAttribute('data-action') || '').trim();
+    if (action === 'apply-configurator') return void applyConfigurator();
+    if (action === 'reload-configurator') return void loadConfigurator();
+    if (action === 'apply-update-filters') return void applyUpdateAuditFilters();
+    if (action === 'reset-update-filters') return void resetUpdateAuditFilters();
+    if (action === 'apply-security-filters') return void applySecurityFilters();
+    if (action === 'reset-security-filters') return void resetSecurityFilters();
+    if (action === 'manual-block-ip') return void manualBlockIp();
+    if (action === 'manual-unblock-ip') return void manualUnblockIp();
+    if (action === 'open-create-user-modal') return void openCreateUserModal();
+    if (action === 'close-create-user-modal') return void closeCreateUserModal();
+    if (action === 'create-user') return void createUser();
+    if (action === 'bind-wg-peer') return void bindWgPeer();
+    if (action === 'bind-xray-client') return void bindXrayClient();
+    if (action === 'refresh-service-logs') return void refreshServiceLogsNow();
+    if (action === 'close-service-logs') return void closeServiceLogs();
+    if (action === 'open-service-logs') {{
+      const containerName = String(actionBtn.getAttribute('data-container') || '').trim();
+      if (containerName) return void openServiceLogs(containerName);
+      return;
+    }}
+    if (action === 'remove-wg-binding') {{
+      const publicKey = String(actionBtn.getAttribute('data-public-key') || '').trim();
+      if (publicKey) return void removeWgBinding(publicKey);
+      return;
+    }}
+    if (action === 'remove-xray-binding') {{
+      const clientEmail = String(actionBtn.getAttribute('data-client-email') || '').trim();
+      if (clientEmail) return void removeXrayBinding(clientEmail);
+      return;
+    }}
+    if (action === 'approve-request') {{
+      const reqId = Number(actionBtn.getAttribute('data-request-id') || 0);
+      if (reqId) return void approveReq(reqId);
+      return;
+    }}
+    if (action === 'reject-request') {{
+      const reqId = Number(actionBtn.getAttribute('data-request-id') || 0);
+      if (reqId) return void rejectReq(reqId);
+      return;
+    }}
+    if (action === 'block-user') {{
+      const userId = Number(actionBtn.getAttribute('data-user-id') || 0);
+      if (userId) return void blockUser(userId);
+      return;
+    }}
+    if (action === 'unblock-user') {{
+      const userId = Number(actionBtn.getAttribute('data-user-id') || 0);
+      if (userId) return void unblockUser(userId);
+      return;
+    }}
+    if (action === 'manual-unblock-ip-item') {{
+      const ip = String(actionBtn.getAttribute('data-ip') || '').trim();
+      if (ip) return void manualUnblockIp(ip);
+      return;
+    }}
+  }}
+  const btn = target.closest('.js-delete-user');
+  if (!btn) return;
+  const userId = Number(btn.getAttribute('data-user-id') || 0);
+  const username = String(btn.getAttribute('data-username') || '');
+  if (!userId) return;
+  deleteUser(userId, username);
+}});
 refreshAdminLive();
 loadConfigurator();
 showSection('overview');
