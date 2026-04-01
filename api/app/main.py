@@ -2869,7 +2869,7 @@ def cabinet(request: Request) -> HTMLResponse:
 </div>
 <script>
 const csrfToken = {repr(user["csrf_token"])};
-const escHtml = (s) => String(s ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const escHtml = (s) => String((s === undefined || s === null) ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 function getCsrfToken() {{
   const m = document.cookie.match(/(?:^|; )proxy_vpn_csrf=([^;]+)/);
   if (m && m[1]) return decodeURIComponent(m[1]);
@@ -2918,10 +2918,10 @@ function renderDeviceCard(card) {{
     ['Security', 'reality'],
     ['Encryption', 'none'],
   ]
-    .filter(([, value]) => String(value ?? '').trim() !== '')
+    .filter(([, value]) => String((value === undefined || value === null) ? '' : value).trim() !== '')
     .map(([name, value]) => {{
       const safeName = escHtml(name);
-      const rawValue = String(value ?? '');
+      const rawValue = String((value === undefined || value === null) ? '' : value);
       const safeValue = escHtml(rawValue);
       return `
         <tr>
@@ -3538,7 +3538,7 @@ const sectionSubsections = {{
   traffic: [['wg-bindings', 'WG bindings'], ['xray-bindings', 'Xray bindings'], ['per-user', 'Per-user']],
   logs: [['admin-log', 'Admin log']],
 }};
-const escHtml = (s) => String(s ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const escHtml = (s) => String((s === undefined || s === null) ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 function getCsrfToken() {{
   const m = document.cookie.match(/(?:^|; )proxy_vpn_csrf=([^;]+)/);
   if (m && m[1]) return decodeURIComponent(m[1]);
@@ -4113,7 +4113,7 @@ function renderConfigRuntime(c) {{
 function setConfigField(id, value) {{
   const el = document.getElementById(id);
   if (!el) return;
-  el.value = String(value ?? '');
+  el.value = String((value === undefined || value === null) ? '' : value);
 }}
 function scheduleAdminRefresh(seconds) {{
   const sec = Math.max(5, Math.min(300, Number(seconds || 30)));
@@ -4223,7 +4223,7 @@ async function refreshAdminLive() {{
   ]);
   if (statsR.ok) {{
     const s = (await statsR.json()).stats || {{}};
-    document.getElementById('m-online').textContent = String(s.active_sessions ?? '-');
+    document.getElementById('m-online').textContent = String((s.active_sessions === undefined || s.active_sessions === null) ? '-' : s.active_sessions);
     document.getElementById('m-cpu').textContent = `${{Number(s.current_cpu_load_pct || 0).toFixed(1)}}%`;
     document.getElementById('m-mem').textContent = `${{Number(s.current_memory_used_pct || 0).toFixed(1)}}%`;
     document.getElementById('m-disk').textContent = `${{Number(s.current_disk_used_pct || 0).toFixed(1)}}%`;
