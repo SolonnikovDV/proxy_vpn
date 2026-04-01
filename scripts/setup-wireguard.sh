@@ -6,24 +6,37 @@ cd "$(dirname "$0")/.."
 log() { printf '%s\n' "$*"; }
 die() { log "ERROR: $*"; exit 1; }
 
-if docker compose version >/dev/null 2>&1; then
-  dc() { docker compose "$@"; }
-elif command -v docker-compose >/dev/null 2>&1; then
-  dc() { docker-compose "$@"; }
-else
-  die "Docker Compose not found (need 'docker compose' or 'docker-compose')."
-fi
-
-require_file() {
-  [ -f "$1" ] || die "Missing file: $1"
+DC_INITIALIZED=0
+init_dc() {
+  if [ "${DC_INITIALIZED}" = "1" ]; then
+    return 0
+  fi
+  if docker compose version >/dev/null 2>&1; then
+    dc() { docker compose "$@"; }
+  elif command -v docker-compose >/dev/null 2>&1; then
+    dc() { docker-compose "$@"; }
+  else
+    die "Neither host 'wg' nor Docker Compose is available for WireGuard key generation."
+  fi
+  DC_INITIALIZED=1
 }
 
 gen_wg_key() {
+  if command -v wg >/dev/null 2>&1; then
+    wg genkey | tr -d '\r\n'
+    return 0
+  fi
+  init_dc
   dc run --rm --no-deps -T --entrypoint sh wireguard -lc "wg genkey" | tr -d '\r\n'
 }
 
 pub_from_priv() {
   local key="$1"
+  if command -v wg >/dev/null 2>&1; then
+    printf '%s' "${key}" | wg pubkey | tr -d '\r\n'
+    return 0
+  fi
+  init_dc
   printf '%s' "${key}" | dc run --rm --no-deps -T --entrypoint sh wireguard -lc "wg pubkey" | tr -d '\r\n'
 }
 
@@ -45,7 +58,11 @@ if [ -f "${WG_SERVER_CONF}" ]; then
   die "${WG_SERVER_CONF} already exists. Remove it manually if you want to regenerate."
 fi
 
-log "Generating WireGuard keys using wireguard container..."
+if command -v wg >/dev/null 2>&1; then
+  log "Generating WireGuard keys using host wireguard-tools..."
+else
+  log "Generating WireGuard keys using wireguard container..."
+fi
 SERVER_PRIVATE_KEY="$(gen_wg_key)"
 SERVER_PUBLIC_KEY="$(pub_from_priv "${SERVER_PRIVATE_KEY}")"
 CLIENT_PRIVATE_KEY="$(gen_wg_key)"

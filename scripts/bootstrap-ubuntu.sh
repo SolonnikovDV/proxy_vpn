@@ -34,8 +34,10 @@ run_with_timeout() {
   local description="$2"
   shift 2
   if command -v timeout >/dev/null 2>&1; then
+    set +e
     timeout "${timeout_seconds}" "$@"
     local rc=$?
+    set -e
     if [ "${rc}" -ne 0 ]; then
       if [ "${rc}" -eq 124 ]; then
         die "${description} timed out after ${timeout_seconds}s. Check Docker/container health and rerun bootstrap."
@@ -403,7 +405,7 @@ apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin do
 ensure_docker_ready
 
 log "[3/12] Install Git + OpenSSH client/server..."
-apt-get install -y git openssh-client openssh-server
+apt-get install -y git openssh-client openssh-server wireguard-tools
 if ! systemctl enable --now ssh >/dev/null 2>&1 && ! systemctl enable --now sshd >/dev/null 2>&1; then
   die "OpenSSH service unit not found (ssh/sshd)."
 fi

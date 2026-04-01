@@ -6,13 +6,39 @@ cd "$(dirname "$0")/.."
 log() { printf '%s\n' "$*"; }
 die() { log "ERROR: $*"; exit 1; }
 
-if docker compose version >/dev/null 2>&1; then
-  dc() { docker compose "$@"; }
-elif command -v docker-compose >/dev/null 2>&1; then
-  dc() { docker-compose "$@"; }
-else
-  die "Docker Compose not found (need 'docker compose' or 'docker-compose')."
-fi
+DC_INITIALIZED=0
+init_dc() {
+  if [ "${DC_INITIALIZED}" = "1" ]; then
+    return 0
+  fi
+  if docker compose version >/dev/null 2>&1; then
+    dc() { docker compose "$@"; }
+  elif command -v docker-compose >/dev/null 2>&1; then
+    dc() { docker-compose "$@"; }
+  else
+    die "Neither host 'wg' nor Docker Compose is available for WireGuard key operations."
+  fi
+  DC_INITIALIZED=1
+}
+
+wg_pub_from_priv() {
+  local key="$1"
+  if command -v wg >/dev/null 2>&1; then
+    printf '%s' "${key}" | wg pubkey | tr -d '\r\n'
+    return 0
+  fi
+  init_dc
+  printf '%s' "${key}" | dc run --rm --no-deps -T --entrypoint sh wireguard -lc "wg pubkey" | tr -d '\r\n'
+}
+
+wg_genkey_value() {
+  if command -v wg >/dev/null 2>&1; then
+    wg genkey | tr -d '\r\n'
+    return 0
+  fi
+  init_dc
+  dc run --rm --no-deps -T --entrypoint sh wireguard -lc "wg genkey" | tr -d '\r\n'
+}
 
 CLIENT_NAMES="${CLIENT_NAMES:-}"
 SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-}"
@@ -32,7 +58,7 @@ mkdir -p wireguard/conf xray/clients
 
 SERVER_PRIVATE_KEY="$(awk -F'= ' '/^PrivateKey/{print $2; exit}' wireguard/conf/wg0.conf | tr -d '[:space:]')"
 [ -n "${SERVER_PRIVATE_KEY}" ] || die "Cannot read server PrivateKey from wireguard/conf/wg0.conf"
-SERVER_PUBLIC_KEY="$(printf '%s' "${SERVER_PRIVATE_KEY}" | dc run --rm --no-deps -T --entrypoint sh wireguard -lc "wg pubkey" | tr -d '\r\n')"
+SERVER_PUBLIC_KEY="$(wg_pub_from_priv "${SERVER_PRIVATE_KEY}")"
 [ -n "${SERVER_PUBLIC_KEY}" ] || die "Cannot derive WireGuard server public key."
 
 XRAY_SNI="$(awk -F': ' '/^SNI:/{print $2; exit}' xray/client-connection.txt | tr -d '\r\n')"
@@ -59,8 +85,8 @@ for name in "${CLIENT_LIST[@]}"; do
     die "Client files already exist for '${name}'. Remove or rename before rerun."
   fi
 
-  wg_priv="$(dc run --rm --no-deps -T --entrypoint sh wireguard -lc "wg genkey" | tr -d '\r\n')"
-  wg_pub="$(printf '%s' "${wg_priv}" | dc run --rm --no-deps -T --entrypoint sh wireguard -lc "wg pubkey" | tr -d '\r\n')"
+  wg_priv="$(wg_genkey_value)"
+  wg_pub="$(wg_pub_from_priv "${wg_priv}")"
   wg_ip="${WG_BASE_PREFIX}.${WG_INDEX}/32"
 
   cat >> wireguard/conf/wg0.conf <<EOF
