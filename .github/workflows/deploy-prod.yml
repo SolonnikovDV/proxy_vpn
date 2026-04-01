@@ -72,7 +72,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=()
-          for name in SSH_HOST SSH_USER DEPLOY_PATH; do
+          for name in SSH_HOST SSH_USER DEPLOY_PATH VPN_PANEL_DOMAIN; do
             if [ -z "${!name:-}" ]; then
               missing+=("${name}")
             fi
