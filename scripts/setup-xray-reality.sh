@@ -27,12 +27,30 @@ SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-}"
 mkdir -p xray
 
 log "Generating REALITY x25519 keypair using xray image..."
-KEYS_OUTPUT="$(docker run --rm ghcr.io/xtls/xray-core:latest x25519)"
-REALITY_PRIVATE_KEY="$(printf '%s\n' "${KEYS_OUTPUT}" | awk -F': ' '/Private key/{print $2}' | tr -d '\r\n')"
-REALITY_PUBLIC_KEY="$(printf '%s\n' "${KEYS_OUTPUT}" | awk -F': ' '/Public key/{print $2}' | tr -d '\r\n')"
+KEYS_OUTPUT="$(docker run --rm ghcr.io/xtls/xray-core:latest x25519 2>&1 || true)"
+REALITY_PRIVATE_KEY="$(python3 - "${KEYS_OUTPUT}" <<'PY'
+import re
+import sys
 
-[ -n "${REALITY_PRIVATE_KEY}" ] || die "Failed to generate REALITY private key."
-[ -n "${REALITY_PUBLIC_KEY}" ] || die "Failed to generate REALITY public key."
+text = sys.argv[1] if len(sys.argv) > 1 else ""
+m = re.search(r"private\s*key\s*:\s*([A-Za-z0-9+/_=-]{20,})", text, flags=re.IGNORECASE)
+if m:
+    print(m.group(1).strip())
+PY
+)"
+REALITY_PUBLIC_KEY="$(python3 - "${KEYS_OUTPUT}" <<'PY'
+import re
+import sys
+
+text = sys.argv[1] if len(sys.argv) > 1 else ""
+m = re.search(r"public\s*key\s*:\s*([A-Za-z0-9+/_=-]{20,})", text, flags=re.IGNORECASE)
+if m:
+    print(m.group(1).strip())
+PY
+)"
+
+[ -n "${REALITY_PRIVATE_KEY}" ] || die "Failed to generate REALITY private key. xray output: ${KEYS_OUTPUT}"
+[ -n "${REALITY_PUBLIC_KEY}" ] || die "Failed to generate REALITY public key. xray output: ${KEYS_OUTPUT}"
 
 CLIENT_UUID="$(python3 - <<'PY'
 import uuid
