@@ -20,6 +20,7 @@ esac
 python3 - "${TEMPLATE}" ".env" "${MODE}" <<'PY'
 import re
 import sys
+import os
 from pathlib import Path
 
 template_path = Path(sys.argv[1])
@@ -48,6 +49,15 @@ def parse_env(path: Path):
 
 template_keys, template_values = parse_env(template_path)
 env_keys, env_values = parse_env(env_path)
+runtime_values = {k: v for k, v in os.environ.items()}
+
+def is_placeholder(key: str, value: str) -> bool:
+    v = (value or "").strip()
+    if key == "VPN_PANEL_DOMAIN":
+        return v in {"", "panel.example.com", "localhost"}
+    if key in {"APP_SECRET_KEY", "ADMIN_PASSWORD"}:
+        return v.startswith("replace-with-") or v == ""
+    return v == ""
 
 out_lines = []
 out_lines.append(f"# Auto-synced from {template_path.name} (mode={mode})")
@@ -56,7 +66,12 @@ out_lines.append("")
 
 written = set()
 for key in template_keys:
-    value = env_values.get(key, template_values[key])
+    if key in env_values and not (mode == "prod" and is_placeholder(key, env_values[key]) and key in runtime_values and runtime_values[key].strip()):
+        value = env_values[key]
+    elif key in runtime_values and runtime_values[key].strip():
+        value = runtime_values[key].strip()
+    else:
+        value = template_values[key]
     out_lines.append(f"{key}={value}")
     written.add(key)
 
