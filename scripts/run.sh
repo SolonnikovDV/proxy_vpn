@@ -75,11 +75,41 @@ run_local() {
   esac
 }
 
+check_prod_route_not_fallback() {
+  local route="$1"
+  local url="https://${VPN_PANEL_DOMAIN}${route}"
+  local tmp_file=""
+  local code=""
+  local body=""
+  local attempt=1
+  while [ "${attempt}" -le 10 ]; do
+    tmp_file="$(mktemp)"
+    code="$(curl -ksS --max-time 10 -o "${tmp_file}" -w "%{http_code}" "${url}" || printf '000')"
+    body="$(tr -d '\r' < "${tmp_file}" || true)"
+    rm -f "${tmp_file}" || true
+    if [ "${code}" != "000" ] && [ "${code}" -lt 500 ] && [[ "${body}" != *"proxy-vpn panel"* ]]; then
+      log "Smoke route OK: ${route} (HTTP ${code})"
+      return 0
+    fi
+    sleep 2
+    attempt=$((attempt + 1))
+  done
+  die "Smoke route failed for ${route}: fallback/invalid response at ${url}"
+}
+
+run_prod_smoke_checks() {
+  log "Running production route smoke checks..."
+  check_prod_route_not_fallback "/about"
+  check_prod_route_not_fallback "/about/"
+  check_prod_route_not_fallback "/admin"
+}
+
 run_prod() {
   bash ./scripts/sync-env.sh prod
   set -a
   . ./.env
   set +a
+  export CADDYFILE_PATH="Caddyfile.prod"
   export VPN_PANEL_DOMAIN="${VPN_PANEL_DOMAIN:-}"
   export XRAY_PORT="${XRAY_PORT:-8443}"
   export WG_PORT="${WG_PORT:-51820}"
@@ -87,6 +117,8 @@ run_prod() {
     up)
       bash ./scripts/preflight-prod.sh
       dc -f compose.yaml -f compose.prod.yaml up -d --build
+      dc -f compose.yaml -f compose.prod.yaml up -d --force-recreate caddy
+      run_prod_smoke_checks
       dc -f compose.yaml -f compose.prod.yaml ps
       log "Production URLs:"
       log "  https://${VPN_PANEL_DOMAIN}/"
@@ -103,6 +135,8 @@ run_prod() {
       dc -f compose.yaml -f compose.prod.yaml down
       bash ./scripts/preflight-prod.sh
       dc -f compose.yaml -f compose.prod.yaml up -d --build
+      dc -f compose.yaml -f compose.prod.yaml up -d --force-recreate caddy
+      run_prod_smoke_checks
       dc -f compose.yaml -f compose.prod.yaml ps
       log "Production URLs:"
       log "  https://${VPN_PANEL_DOMAIN}/"
