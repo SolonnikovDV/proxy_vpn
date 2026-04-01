@@ -193,6 +193,9 @@ if ! assert_xray_reality_prod_config "xray/config.json" "xray/client-connection.
   assert_xray_reality_prod_config "xray/config.json" "xray/client-connection.txt"
 fi
 
+# Ensure xray runtime can read mounted config (container may run non-root).
+chmod 644 xray/config.json || die "Failed to set readable permissions on xray/config.json"
+
 if command -v getent >/dev/null 2>&1; then
   if ! getent ahostsv4 "${VPN_PANEL_DOMAIN}" >/dev/null 2>&1; then
     log "WARN: ${VPN_PANEL_DOMAIN} has no A record from this host view."

@@ -188,7 +188,9 @@ Example URI (for v2rayN/NekoBox/etc):
 vless://${CLIENT_UUID}@${SERVER_PUBLIC_IP}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${XRAY_REALITY_SERVER_NAME}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#proxy-vpn-client1
 EOF
 
-chmod 600 "${XRAY_CONFIG_PATH}" "${XRAY_CLIENT_INFO_PATH}"
+# Xray container may run as non-root user; config must be world-readable.
+chmod 644 "${XRAY_CONFIG_PATH}"
+chmod 600 "${XRAY_CLIENT_INFO_PATH}"
 
 log "Xray config generated:"
 log "  config: ${XRAY_CONFIG_PATH}"
