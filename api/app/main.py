@@ -52,6 +52,7 @@ DEFAULT_AVG_USER_TRAFFIC_GB = float(os.getenv("AVG_USER_TRAFFIC_GB", "50"))
 DEFAULT_ACTIVE_USER_RATIO_PCT = float(os.getenv("ACTIVE_USER_RATIO_PCT", "25"))
 DEFAULT_MAX_REGISTERED_USERS = int(os.getenv("MAX_REGISTERED_USERS", "0"))
 DEFAULT_DASHBOARD_REFRESH_SECONDS = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "30"))
+DEFAULT_PROXY_BYPASS_CUSTOM = os.getenv("DEFAULT_PROXY_BYPASS_CUSTOM", "")
 WG_DUMP_PATH = "/wireguard-config/wg_dump.txt"
 XRAY_STATS_PATH = "/xray-config/stats_raw.txt"
 XRAY_CONFIG_PATH = "/xray-config/config.json"
@@ -62,6 +63,7 @@ UPDATE_CHECK_REQUEST_PATH = os.getenv("UPDATE_CHECK_REQUEST_PATH", "/logs/update
 UPDATE_APPLY_REQUEST_PATH = os.getenv("UPDATE_APPLY_REQUEST_PATH", "/logs/update-apply-request.json")
 BACKUP_STATUS_PATH = os.getenv("BACKUP_STATUS_PATH", "/logs/backup-status.json")
 UPDATE_AUDIT_PATH = os.getenv("UPDATE_AUDIT_PATH", "/logs/update-audit.jsonl")
+PROXY_BYPASS_RULES_PATH = os.getenv("PROXY_BYPASS_RULES_PATH", "config/proxy-bypass-rules.txt")
 SECURITY_GUARD_URL = os.getenv("SECURITY_GUARD_URL", "http://security-guard:9100").rstrip("/")
 SECURITY_HTTP_WINDOW_SECONDS = int(os.getenv("SECURITY_HTTP_WINDOW_SECONDS", "10"))
 SECURITY_HTTP_MAX_REQUESTS = int(os.getenv("SECURITY_HTTP_MAX_REQUESTS", "120"))
@@ -687,6 +689,94 @@ def _to_pos_int(value: Any, default: int, min_value: int) -> int:
     return max(min_value, v)
 
 
+def _normalize_bypass_resources(raw: Any) -> str:
+    text = str(raw or "")
+    parts = re.split(r"[\n,; ]+", text)
+    seen: set[str] = set()
+    items: list[str] = []
+    for chunk in parts:
+        token = chunk.strip().lower()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        items.append(token[:255])
+        if len(items) >= 200:
+            break
+    return "\n".join(items)
+
+
+def _to_bool_flag(raw: str, default: bool = False) -> bool:
+    v = str(raw or "").strip().lower()
+    if not v:
+        return default
+    if v in {"1", "true", "yes", "on"}:
+        return True
+    if v in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _parse_proxy_bypass_rules_text(text: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in re.split(r"[,\t;]+", line) if p.strip()]
+        if not parts:
+            continue
+        resource = parts[0].lower()[:255]
+        if not resource or resource in seen:
+            continue
+        seen.add(resource)
+        # Convention: false => direct/bypass (VPN disabled for resource).
+        use_vpn = _to_bool_flag(parts[1], default=False) if len(parts) > 1 else False
+        items.append({"resource": resource, "use_vpn": bool(use_vpn)})
+        if len(items) >= 500:
+            break
+    return items
+
+
+def _serialize_proxy_bypass_rules_text(items: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for row in items:
+        if not isinstance(row, dict):
+            continue
+        resource = str(row.get("resource", "")).strip().lower()
+        if not resource:
+            continue
+        use_vpn = bool(row.get("use_vpn", False))
+        lines.append(f"{resource},{'true' if use_vpn else 'false'}")
+    return "\n".join(lines)
+
+
+def _read_proxy_bypass_rules_text(fallback_text: str = "") -> str:
+    path = Path(PROXY_BYPASS_RULES_PATH)
+    if path.exists():
+        try:
+            parsed = _parse_proxy_bypass_rules_text(path.read_text(encoding="utf-8"))
+            return _serialize_proxy_bypass_rules_text(parsed)
+        except Exception:
+            pass
+    parsed_fallback = _parse_proxy_bypass_rules_text(_normalize_bypass_resources(fallback_text))
+    return _serialize_proxy_bypass_rules_text(parsed_fallback)
+
+
+def _write_proxy_bypass_rules_text(raw_text: str) -> str:
+    parsed = _parse_proxy_bypass_rules_text(raw_text)
+    serialized = _serialize_proxy_bypass_rules_text(parsed)
+    path = Path(PROXY_BYPASS_RULES_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(serialized + ("\n" if serialized else ""), encoding="utf-8")
+    return serialized
+
+
+def _disabled_proxy_bypass_resources(raw_text: str) -> list[str]:
+    parsed = _parse_proxy_bypass_rules_text(raw_text)
+    return [str(r["resource"]) for r in parsed if not bool(r.get("use_vpn", False))]
+
+
 def _recalculate_system_config(raw: dict[str, Any]) -> dict[str, Any]:
     cfg = dict(raw)
     cfg["server_cpu_cores"] = _to_pos_float(cfg.get("server_cpu_cores"), 1.0, 0.25)
@@ -707,6 +797,9 @@ def _recalculate_system_config(raw: dict[str, Any]) -> dict[str, Any]:
         cfg.get("dashboard_refresh_seconds"), DEFAULT_DASHBOARD_REFRESH_SECONDS, 5
     )
     cfg["dashboard_refresh_seconds"] = min(300, cfg["dashboard_refresh_seconds"])
+    cfg["proxy_bypass_custom"] = _serialize_proxy_bypass_rules_text(
+        _parse_proxy_bypass_rules_text(str(cfg.get("proxy_bypass_custom", DEFAULT_PROXY_BYPASS_CUSTOM)))
+    )
 
     if cfg["cpu_warn_p95"] > cfg["cpu_crit_p95"]:
         cfg["cpu_warn_p95"] = cfg["cpu_crit_p95"]
@@ -755,6 +848,7 @@ def _default_system_config() -> dict[str, Any]:
             "disk_warn_p95": CAPACITY_DISK_WARN_P95,
             "disk_crit_p95": CAPACITY_DISK_CRIT_P95,
             "dashboard_refresh_seconds": DEFAULT_DASHBOARD_REFRESH_SECONDS,
+            "proxy_bypass_custom": DEFAULT_PROXY_BYPASS_CUSTOM,
         }
     )
 
@@ -768,7 +862,7 @@ def _load_system_config() -> dict[str, Any]:
               avg_user_monthly_traffic_gb, active_user_ratio_pct,
               max_registered_users, target_active_users,
               cpu_warn_p95, cpu_crit_p95, ram_warn_p95, ram_crit_p95, disk_warn_p95, disk_crit_p95,
-              dashboard_refresh_seconds,
+              dashboard_refresh_seconds, proxy_bypass_custom,
               recommended_max_users, recommended_active_users, per_user_traffic_budget_gb, updated_at
             FROM system_config
             WHERE id = 1
@@ -777,11 +871,13 @@ def _load_system_config() -> dict[str, Any]:
     if not row:
         return _default_system_config()
     cfg = dict(row)
+    cfg["proxy_bypass_custom"] = _read_proxy_bypass_rules_text(str(cfg.get("proxy_bypass_custom", "")))
     return _recalculate_system_config(cfg)
 
 
 def _persist_system_config(cfg: dict[str, Any]) -> dict[str, Any]:
     calculated = _recalculate_system_config(cfg)
+    calculated["proxy_bypass_custom"] = _write_proxy_bypass_rules_text(str(calculated.get("proxy_bypass_custom", "")))
     with _db_connect() as con:
         con.execute(
             """
@@ -790,10 +886,10 @@ def _persist_system_config(cfg: dict[str, Any]) -> dict[str, Any]:
               avg_user_monthly_traffic_gb, active_user_ratio_pct,
               max_registered_users, target_active_users,
               cpu_warn_p95, cpu_crit_p95, ram_warn_p95, ram_crit_p95, disk_warn_p95, disk_crit_p95,
-              dashboard_refresh_seconds,
+              dashboard_refresh_seconds, proxy_bypass_custom,
               recommended_max_users, recommended_active_users, per_user_traffic_budget_gb, updated_at
             ) VALUES (
-              1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(id) DO UPDATE SET
               server_cpu_cores=excluded.server_cpu_cores,
@@ -811,6 +907,7 @@ def _persist_system_config(cfg: dict[str, Any]) -> dict[str, Any]:
               disk_warn_p95=excluded.disk_warn_p95,
               disk_crit_p95=excluded.disk_crit_p95,
               dashboard_refresh_seconds=excluded.dashboard_refresh_seconds,
+              proxy_bypass_custom=excluded.proxy_bypass_custom,
               recommended_max_users=excluded.recommended_max_users,
               recommended_active_users=excluded.recommended_active_users,
               per_user_traffic_budget_gb=excluded.per_user_traffic_budget_gb,
@@ -832,6 +929,7 @@ def _persist_system_config(cfg: dict[str, Any]) -> dict[str, Any]:
                 calculated["disk_warn_p95"],
                 calculated["disk_crit_p95"],
                 calculated["dashboard_refresh_seconds"],
+                calculated["proxy_bypass_custom"],
                 calculated["recommended_max_users"],
                 calculated["recommended_active_users"],
                 calculated["per_user_traffic_budget_gb"],
@@ -2296,6 +2394,7 @@ class AdminConfiguratorUpdateRequest(BaseModel):
     disk_warn_p95: float
     disk_crit_p95: float
     dashboard_refresh_seconds: int
+    proxy_bypass_custom: str = ""
 
 
 class AdminSecurityBlockRequest(BaseModel):
@@ -2504,6 +2603,7 @@ def startup() -> None:
                 disk_warn_p95 REAL NOT NULL,
                 disk_crit_p95 REAL NOT NULL,
                 dashboard_refresh_seconds INTEGER NOT NULL DEFAULT 30,
+                proxy_bypass_custom TEXT NOT NULL DEFAULT '',
                 recommended_max_users INTEGER NOT NULL,
                 recommended_active_users INTEGER NOT NULL,
                 per_user_traffic_budget_gb REAL NOT NULL,
@@ -2516,6 +2616,12 @@ def startup() -> None:
             "system_config",
             "dashboard_refresh_seconds",
             f"dashboard_refresh_seconds INTEGER NOT NULL DEFAULT {DEFAULT_DASHBOARD_REFRESH_SECONDS}",
+        )
+        _ensure_column(
+            con,
+            "system_config",
+            "proxy_bypass_custom",
+            "proxy_bypass_custom TEXT NOT NULL DEFAULT ''",
         )
         row = con.execute("SELECT id FROM users WHERE username = ?", (settings.admin_username,)).fetchone()
         if not row:
@@ -2556,6 +2662,7 @@ def startup() -> None:
         cfg_row = con.execute("SELECT id FROM system_config WHERE id = 1").fetchone()
         if not cfg_row:
             defaults = _default_system_config()
+            defaults["proxy_bypass_custom"] = _write_proxy_bypass_rules_text(str(defaults.get("proxy_bypass_custom", "")))
             con.execute(
                 """
                 INSERT INTO system_config (
@@ -2563,10 +2670,10 @@ def startup() -> None:
                   avg_user_monthly_traffic_gb, active_user_ratio_pct,
                   max_registered_users, target_active_users,
                   cpu_warn_p95, cpu_crit_p95, ram_warn_p95, ram_crit_p95, disk_warn_p95, disk_crit_p95,
-                  dashboard_refresh_seconds,
+                  dashboard_refresh_seconds, proxy_bypass_custom,
                   recommended_max_users, recommended_active_users, per_user_traffic_budget_gb, updated_at
                 ) VALUES (
-                  1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                  1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -2585,6 +2692,7 @@ def startup() -> None:
                     defaults["disk_warn_p95"],
                     defaults["disk_crit_p95"],
                     defaults["dashboard_refresh_seconds"],
+                    defaults["proxy_bypass_custom"],
                     defaults["recommended_max_users"],
                     defaults["recommended_active_users"],
                     defaults["per_user_traffic_budget_gb"],
@@ -3341,6 +3449,10 @@ def admin(request: Request) -> HTMLResponse:
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;">
     <input id="cfg-dashboard-refresh-seconds" placeholder="Refresh interval (sec)" type="number" step="1" min="5" max="300" />
   </div>
+  <h3 style="margin-top:12px;">Proxy bypass resources (Direct/Bypass)</h3>
+  <p class="muted">Stored in <code>{PROXY_BYPASS_RULES_PATH}</code>. Format per line: <code>resource,false</code> (false = use Direct, VPN disabled).</p>
+  <textarea id="cfg-proxy-bypass-custom" placeholder="example.ru,false&#10;gosuslugi.ru,false&#10;youtube.com,true" style="width:100%;min-height:120px;padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);"></textarea>
+  <p class="muted" id="cfg-proxy-bypass-validation">Validation: -</p>
   <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
     <button data-action="apply-configurator">Apply configuration</button>
     <button class="btn-ghost" data-action="reload-configurator">Reload</button>
@@ -4212,6 +4324,58 @@ function readConfigNumber(id) {{
   if (!el) return 0;
   return Number(el.value || 0);
 }}
+function validateProxyBypassRulesText(rawText) {{
+  const lines = String(rawText || '').split('\\n');
+  const normalized = [];
+  const invalid = [];
+  const seen = {{}};
+  for (let i = 0; i < lines.length; i += 1) {{
+    const lineNo = i + 1;
+    const line = String(lines[i] || '').trim();
+    if (!line || line.indexOf('#') === 0) continue;
+    const parts = line.split(',');
+    if (parts.length < 2) {{
+      invalid.push('L' + lineNo + ': expected "resource,true|false"');
+      continue;
+    }}
+    const resource = String(parts[0] || '').trim().toLowerCase();
+    const flag = String(parts[1] || '').trim().toLowerCase();
+    if (!resource) {{
+      invalid.push('L' + lineNo + ': empty resource');
+      continue;
+    }}
+    if (flag !== 'true' && flag !== 'false') {{
+      invalid.push('L' + lineNo + ': flag must be true or false');
+      continue;
+    }}
+    if (seen[resource]) continue;
+    seen[resource] = true;
+    normalized.push(resource + ',' + flag);
+  }}
+  return {{
+    ok: invalid.length === 0,
+    normalized_text: normalized.join('\\n'),
+    valid_count: normalized.length,
+    errors: invalid
+  }};
+}}
+function renderProxyBypassValidation(rawText) {{
+  const input = document.getElementById('cfg-proxy-bypass-custom');
+  const validation = document.getElementById('cfg-proxy-bypass-validation');
+  const check = validateProxyBypassRulesText(rawText);
+  if (validation) {{
+    validation.textContent = check.ok
+      ? ('Validation: OK (' + String(check.valid_count) + ' rules)')
+      : ('Validation: errors -> ' + check.errors.slice(0, 4).join('; '));
+    validation.style.color = check.ok ? '#166534' : '#b91c1c';
+  }}
+  if (input) {{
+    input.style.border = check.ok
+      ? '1px solid rgba(22,101,52,0.45)'
+      : '1px solid rgba(185,28,28,0.65)';
+  }}
+  return check;
+}}
 function renderConfigurator(config) {{
   if (!config) return;
   setConfigField('cfg-server-cpu-cores', config.server_cpu_cores);
@@ -4229,13 +4393,16 @@ function renderConfigurator(config) {{
   setConfigField('cfg-disk-warn-p95', config.disk_warn_p95);
   setConfigField('cfg-disk-crit-p95', config.disk_crit_p95);
   setConfigField('cfg-dashboard-refresh-seconds', config.dashboard_refresh_seconds || 30);
+  setConfigField('cfg-proxy-bypass-custom', config.proxy_bypass_custom || '');
+  renderProxyBypassValidation(config.proxy_bypass_custom || '');
   const derived = document.getElementById('cfg-derived');
   if (derived) {{
     derived.textContent =
       `derived: recommended_max_users=${{Number(config.recommended_max_users || 0)}} · ` +
       `recommended_active_users=${{Number(config.recommended_active_users || 0)}} · ` +
       `traffic_budget_per_user=${{Number(config.per_user_traffic_budget_gb || 0).toFixed(2)}} GB/month · ` +
-      `refresh=${{Number(config.dashboard_refresh_seconds || 30)}}s`;
+      `refresh=${{Number(config.dashboard_refresh_seconds || 30)}}s · ` +
+      `bypass_custom=${{String(config.proxy_bypass_custom || '').split('\\n').filter(Boolean).length}}`;
   }}
   scheduleAdminRefresh(config.dashboard_refresh_seconds || 30);
 }}
@@ -4259,6 +4426,13 @@ async function loadConfigurator() {{
 }}
 async function applyConfigurator() {{
   const out = document.getElementById('cfg-out');
+  const bypassInput = document.getElementById('cfg-proxy-bypass-custom');
+  const bypassRaw = String((bypassInput && bypassInput.value) || '');
+  const bypassCheck = renderProxyBypassValidation(bypassRaw);
+  if (!bypassCheck.ok) {{
+    if (out) out.textContent = 'Invalid bypass rules format. Fix lines: ' + bypassCheck.errors.slice(0, 8).join('; ');
+    return;
+  }}
   const payload = {{
     server_cpu_cores: readConfigNumber('cfg-server-cpu-cores'),
     server_ram_gb: readConfigNumber('cfg-server-ram-gb'),
@@ -4275,6 +4449,7 @@ async function applyConfigurator() {{
     disk_warn_p95: readConfigNumber('cfg-disk-warn-p95'),
     disk_crit_p95: readConfigNumber('cfg-disk-crit-p95'),
     dashboard_refresh_seconds: Math.trunc(readConfigNumber('cfg-dashboard-refresh-seconds')),
+    proxy_bypass_custom: bypassCheck.normalized_text,
   }};
   if (out) out.textContent = 'Applying...';
   const r = await fetch('/api/v1/admin/configurator', {{
@@ -4477,6 +4652,12 @@ document.addEventListener('change', (event) => {{
   const target = event.target;
   if (!target) return;
   if (target.id === 'service-log-stderr-only') refreshServiceLogsNow();
+  if (target.id === 'cfg-proxy-bypass-custom') renderProxyBypassValidation(String(target.value || ''));
+}});
+document.addEventListener('input', (event) => {{
+  const target = event.target;
+  if (!target) return;
+  if (target.id === 'cfg-proxy-bypass-custom') renderProxyBypassValidation(String(target.value || ''));
 }});
 document.addEventListener('click', (event) => {{
   const target = event.target;
@@ -4819,6 +5000,22 @@ def user_device_config(
         f"?encryption=none&flow={flow}&security=reality&sni={sni}&fp=chrome&pbk={pbk}&sid={sid}&type=tcp"
         f"#proxy-vpn-{user['username']}-{platform}"
     )
+    cfg = _load_system_config()
+    bypass_custom = _disabled_proxy_bypass_resources(str(cfg.get("proxy_bypass_custom", "")))
+    bypass_ru_domains = [
+        "yandex.ru",
+        "vk.com",
+        "gosuslugi.ru",
+    ]
+    bypass_all = bypass_custom if bypass_custom else []
+    bypass_hint = (
+        "Routing/Bypass rules: set GeoIP RU and geosite category-ru to DIRECT (bypass proxy). "
+        + (
+            ("Custom DIRECT resources: " + ", ".join(bypass_all[:20]) + ".")
+            if bypass_all
+            else "No custom DIRECT resources configured."
+        )
+    )
     manual_fields_hint = (
         f"Manual fields from this card: Address={host}, Port={port}, UUID={profile['xray_uuid']}, "
         f"Network=tcp, TLS/Reality SNI={sni}, Public Key={pbk}, Short ID={sid}, Flow={flow}, Encryption=none."
@@ -4843,6 +5040,8 @@ def user_device_config(
             "Install Karing from App Store using the button below.",
             "Karing menu: Profiles -> + -> Add profile -> VLESS/Reality.",
             manual_fields_hint,
+            "Karing menu: Routing -> Bypass/Direct rules -> enable direct for GeoIP: RU and geosite: category-ru.",
+            bypass_hint,
             "Alternative quick path: Profiles -> + -> Import from Clipboard, then paste Config URI from this card.",
             "Tap Save -> Connect/Start tunnel -> open blocked site and verify traffic.",
         ]
@@ -4865,6 +5064,8 @@ def user_device_config(
             "Install client using the button below (store variant is prioritized).",
             "Hiddify Next menu: Profiles -> + -> Add profile -> VLESS/Reality.",
             manual_fields_hint,
+            "Client menu: Routing/Rules -> add DIRECT for GeoIP: RU and geosite: category-ru.",
+            bypass_hint,
             "If profile form is unavailable, use Import from Clipboard and paste Config URI from this card.",
             "Tap Connect (Android VPN permission prompt -> Allow) and verify blocked resource access.",
         ]
@@ -4882,6 +5083,8 @@ def user_device_config(
             "Download latest v2rayN from releases page.",
             "v2rayN menu: Servers -> Add [VLESS] (or Servers -> Import bulk URL from clipboard).",
             manual_fields_hint,
+            "v2rayN menu: Routing settings -> set GeoIP RU and geosite:category-ru to Direct.",
+            bypass_hint,
             "Set created node as active -> System Proxy -> Set system proxy.",
             "Start service (if needed) and verify traffic in v2rayN logs + blocked resource test.",
         ]
@@ -4899,6 +5102,8 @@ def user_device_config(
             "Download and install V2rayU from releases page.",
             "V2rayU menu: Server -> Add [VLESS] (or Import vmess/vless URL from clipboard).",
             manual_fields_hint,
+            "V2rayU menu: Routing -> Bypass/Direct -> add GeoIP RU + geosite:category-ru.",
+            bypass_hint,
             "Select server as active -> V2rayU -> Turn On V2rayU -> Set System Proxy (Auto/PAC).",
             "Open blocked resource and verify traffic through tunnel.",
         ]
@@ -4916,6 +5121,8 @@ def user_device_config(
             "Download Karing (AppImage/DEB/RPM) from releases page.",
             "Karing menu: Profiles -> + -> Add profile -> VLESS/Reality (or Import from Clipboard).",
             manual_fields_hint,
+            "Karing menu: Routing -> Bypass/Direct -> add GeoIP RU + geosite:category-ru.",
+            bypass_hint,
             "Enable Tun or System Proxy mode (according to distro/network manager setup).",
             "Connect and validate access to blocked endpoint.",
         ]
@@ -4951,6 +5158,10 @@ def user_device_config(
                     "public_key": pbk,
                     "short_id": sid,
                     "flow": flow,
+                    "bypass_geoip": "ru",
+                    "bypass_geosite": "category-ru",
+                    "bypass_custom": ", ".join(bypass_all[:20]) if bypass_all else "",
+                    "bypass_ru_examples": ", ".join(bypass_ru_domains),
                 },
                 "instructions": instructions,
                 "primary_client": primary_client,

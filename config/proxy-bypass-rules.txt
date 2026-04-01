@@ -1,0 +1,6 @@
+# resource,use_vpn
+# false = Direct (VPN bypass for this resource)
+# true  = keep VPN route for this resource
+yandex.ru,false
+vk.com,false
+gosuslugi.ru,false
