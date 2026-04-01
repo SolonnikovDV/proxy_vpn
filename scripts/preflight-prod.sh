@@ -47,6 +47,12 @@ fi
 
 [ -f compose.prod.yaml ] || die "compose.prod.yaml not found."
 
+# Ensure runtime .env exists for docker compose env_file contract.
+if [ ! -f .env ]; then
+  log ".env is missing, generating from production template..."
+  bash ./scripts/sync-env.sh prod
+fi
+
 # Load from .env if present; otherwise rely on runtime env vars (e.g. GitHub Actions secrets/vars).
 fallback_vpn_panel_domain="${VPN_PANEL_DOMAIN:-}"
 fallback_app_secret_key="${APP_SECRET_KEY:-}"
