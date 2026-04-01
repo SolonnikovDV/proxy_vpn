@@ -19,12 +19,12 @@ require_file() {
 }
 
 gen_wg_key() {
-  dc run --rm --no-deps wireguard sh -lc "wg genkey" | tr -d '\r\n'
+  dc run --rm --no-deps -T --entrypoint sh wireguard -lc "wg genkey" | tr -d '\r\n'
 }
 
 pub_from_priv() {
   local key="$1"
-  printf '%s' "${key}" | dc run --rm --no-deps -T wireguard sh -lc "wg pubkey" | tr -d '\r\n'
+  printf '%s' "${key}" | dc run --rm --no-deps -T --entrypoint sh wireguard -lc "wg pubkey" | tr -d '\r\n'
 }
 
 SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-}"

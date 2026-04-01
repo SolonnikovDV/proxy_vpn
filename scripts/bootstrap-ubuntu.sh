@@ -19,6 +19,35 @@ wait_for_docker_daemon() {
   return 1
 }
 
+cleanup_stale_wireguard_run_containers() {
+  local ids=""
+  ids="$(docker ps -aq --filter "name=proxy-vpn-wireguard-run" 2>/dev/null || true)"
+  if [ -n "${ids}" ]; then
+    log "Cleaning stale one-shot wireguard containers..."
+    # shellcheck disable=SC2086
+    docker rm -f ${ids} >/dev/null 2>&1 || true
+  fi
+}
+
+run_with_timeout() {
+  local timeout_seconds="$1"
+  local description="$2"
+  shift 2
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${timeout_seconds}" "$@"
+    local rc=$?
+    if [ "${rc}" -ne 0 ]; then
+      if [ "${rc}" -eq 124 ]; then
+        die "${description} timed out after ${timeout_seconds}s. Check Docker/container health and rerun bootstrap."
+      fi
+      die "${description} failed with exit code ${rc}."
+    fi
+  else
+    log "WARN: timeout utility not found; running without timeout guard: ${description}"
+    "$@" || die "${description} failed."
+  fi
+}
+
 ensure_docker_ready() {
   systemctl daemon-reload || true
   systemctl enable --now docker
@@ -488,14 +517,18 @@ if [ "${AUTO_GENERATE_VPN_CONFIGS}" = "1" ]; then
       "${XRAY_CONFIG_PATH_ABS}" "${DEPLOY_PATH}/xray/client-connection.txt"
   fi
 
+  cleanup_stale_wireguard_run_containers
+
   if [ ! -f "${WG_SERVER_CONF_PATH}" ]; then
-    su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && SERVER_PUBLIC_IP='${SERVER_PUBLIC_IP}' WG_PORT='${WG_PORT}' bash ./scripts/setup-wireguard.sh"
+    run_with_timeout 180 "WireGuard config generation" \
+      su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && SERVER_PUBLIC_IP='${SERVER_PUBLIC_IP}' WG_PORT='${WG_PORT}' bash ./scripts/setup-wireguard.sh"
   else
     log "WireGuard config exists, skip generation: ${WG_SERVER_CONF_PATH}"
   fi
 
   if [ ! -f "${XRAY_CONFIG_PATH_ABS}" ]; then
-    su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && SERVER_PUBLIC_IP='${SERVER_PUBLIC_IP}' XRAY_PORT='${XRAY_PORT}' bash ./scripts/setup-xray-reality.sh"
+    run_with_timeout 180 "Xray REALITY config generation" \
+      su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && SERVER_PUBLIC_IP='${SERVER_PUBLIC_IP}' XRAY_PORT='${XRAY_PORT}' bash ./scripts/setup-xray-reality.sh"
   else
     log "Xray config exists, skip generation: ${XRAY_CONFIG_PATH_ABS}"
   fi

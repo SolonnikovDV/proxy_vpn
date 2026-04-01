@@ -32,7 +32,7 @@ mkdir -p wireguard/conf xray/clients
 
 SERVER_PRIVATE_KEY="$(awk -F'= ' '/^PrivateKey/{print $2; exit}' wireguard/conf/wg0.conf | tr -d '[:space:]')"
 [ -n "${SERVER_PRIVATE_KEY}" ] || die "Cannot read server PrivateKey from wireguard/conf/wg0.conf"
-SERVER_PUBLIC_KEY="$(printf '%s' "${SERVER_PRIVATE_KEY}" | dc run --rm --no-deps -T wireguard sh -lc "wg pubkey" | tr -d '\r\n')"
+SERVER_PUBLIC_KEY="$(printf '%s' "${SERVER_PRIVATE_KEY}" | dc run --rm --no-deps -T --entrypoint sh wireguard -lc "wg pubkey" | tr -d '\r\n')"
 [ -n "${SERVER_PUBLIC_KEY}" ] || die "Cannot derive WireGuard server public key."
 
 XRAY_SNI="$(awk -F': ' '/^SNI:/{print $2; exit}' xray/client-connection.txt | tr -d '\r\n')"
@@ -59,8 +59,8 @@ for name in "${CLIENT_LIST[@]}"; do
     die "Client files already exist for '${name}'. Remove or rename before rerun."
   fi
 
-  wg_priv="$(dc run --rm --no-deps wireguard sh -lc "wg genkey" | tr -d '\r\n')"
-  wg_pub="$(printf '%s' "${wg_priv}" | dc run --rm --no-deps -T wireguard sh -lc "wg pubkey" | tr -d '\r\n')"
+  wg_priv="$(dc run --rm --no-deps -T --entrypoint sh wireguard -lc "wg genkey" | tr -d '\r\n')"
+  wg_pub="$(printf '%s' "${wg_priv}" | dc run --rm --no-deps -T --entrypoint sh wireguard -lc "wg pubkey" | tr -d '\r\n')"
   wg_ip="${WG_BASE_PREFIX}.${WG_INDEX}/32"
 
   cat >> wireguard/conf/wg0.conf <<EOF
