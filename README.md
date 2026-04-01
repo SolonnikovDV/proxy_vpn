@@ -341,6 +341,8 @@ Optional bootstrap flags:
 - `ENABLE_UNATTENDED_UPGRADES=0` - skip security auto-updates
 - `SSH_PORT=22` - custom SSH port for UFW/fail2ban profile
 - `AUTO_PULL_REPO=0` - skip auto `git pull --ff-only` on existing clone
+- `AUTO_PULL_LOCAL_CHANGES_POLICY=stash|commit|fail` - behavior when existing clone has local changes before bootstrap auto-pull (default `stash`)
+- `AUTO_PULL_LOCAL_CHANGES_COMMIT_MESSAGE="..."` - commit message used when `AUTO_PULL_LOCAL_CHANGES_POLICY=commit`
 - `AUTO_GENERATE_VPN_CONFIGS=0` - skip automatic WireGuard/Xray config generation
 - `FORCE_REGENERATE_VPN_CONFIGS=1` - force regeneration of WireGuard/Xray configs
 - `CONFIGURE_GITHUB_REPO_ACCESS=0` - skip GitHub SSH key management and validation
@@ -397,7 +399,7 @@ Install systemd timer to periodically pull latest `main` and rebuild stack when 
 
 ```bash
 sudo DEPLOY_PATH=/opt/proxy_vpn RUN_USER=root BRANCH=main MODE=prod ON_CALENDAR="*:0/15" \
-  bash ./scripts/setup-auto-update.sh
+  LOCAL_CHANGES_POLICY=stash bash ./scripts/setup-auto-update.sh
 ```
 
 Default update policy is approval-based (`UPDATE_APPROVAL_REQUIRED=1`):
@@ -416,6 +418,8 @@ Auto-update also includes safe rollback:
 - after update, runs health check through Caddy and verifies `proxy-vpn-security-guard` container is running
 - if health check fails, restores previous commit and redeploys automatically
 - writes deployment and rollback history to `logs/deploy-history.log`
+- if repository has local uncommitted changes, auto-update now preserves them before pull (`LOCAL_CHANGES_POLICY=stash` by default; also supports `commit` and `fail`; `commit` mode uses `git pull --rebase`)
+- writes incremental structured update audit to `logs/update-audit.jsonl` (commit titles, changed files, from/to SHA, local-changes handling)
 
 Manual trigger:
 
@@ -443,13 +447,37 @@ tail -n 50 logs/deploy-history.log
 
 Admin panel (`/admin` -> `Overview`) also shows latest deploy events from this log.
 
+Pull audit helper (manual, with auto stash/commit before pull when needed):
+
+```bash
+bash ./scripts/pull-audit.sh
+```
+
+Options:
+- `APPLY_PULL=0` -> audit only (no pull)
+- `LOCAL_CHANGES_POLICY=stash|commit|fail` (default `stash`)
+- `BRANCH=main` (default `main`)
+
+Example:
+
+```bash
+BRANCH=main LOCAL_CHANGES_POLICY=stash bash ./scripts/pull-audit.sh
+```
+
 Release metadata and update requests files:
 - `logs/app-release-state.json`
 - `logs/update-check-request.json`
 - `logs/update-apply-request.json`
+- `logs/update-audit.jsonl`
 
 Release notes source used by update UI:
 - `RELEASE_NOTES.md` (latest section is shown as update notes)
+
+Admin update audit table:
+- `/admin` -> `Overview` -> `Updates audit`
+- shows incremental update records with date, status, branch, from/to SHA, first commit title, changed files preview, message
+- supports filters: status, branch, file text, commit text, date from/to
+- API endpoint: `/api/v1/admin/update-audit`
 
 ## Backup and restore (critical data)
 

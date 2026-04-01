@@ -23,6 +23,7 @@ check_repo_contract() {
   require_file_nonempty "scripts/backup-critical.sh"
   require_file_nonempty "scripts/restore-critical.sh"
   require_file_nonempty "scripts/setup-backup.sh"
+  require_file_nonempty "scripts/pull-audit.sh"
   require_file_nonempty "scripts/bootstrap-ubuntu.sh"
   require_file_nonempty "security_guard/app.py"
 
@@ -40,6 +41,7 @@ check_repo_contract() {
 
   # Ensure backups are guarded by integrity checks before snapshot creation.
   grep -Eq "integrity-check\\.sh" scripts/backup-critical.sh || die "backup-critical.sh is not gated by integrity checks"
+  grep -Eq "LOCAL_CHANGES_POLICY=.*stash" scripts/auto-update.sh || die "auto-update.sh missing local change preservation policy"
 
   # Bootstrap contract: some vars have defaults, some are interactive-required.
   for k in TARGET_USER DEPLOY_PATH CLONE_REPO AUTO_PULL_REPO CONFIGURE_GITHUB_REPO_ACCESS AUTO_GENERATE_VPN_CONFIGS CONFIGURE_GITHUB_ACTIONS_FROM_SERVER APP_SECRET_KEY_FILE ADMIN_PASSWORD_FILE; do

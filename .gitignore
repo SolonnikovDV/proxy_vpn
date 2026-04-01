@@ -18,5 +18,7 @@ logs/app-release-state.json
 logs/update-check-request.json
 logs/update-apply-request.json
 logs/backup-status.json
+logs/update-audit.jsonl
+logs/pull-audit-*.log
 backups/
 TODO.md

@@ -61,6 +61,7 @@ APP_RELEASE_STATE_PATH = os.getenv("APP_RELEASE_STATE_PATH", "/logs/app-release-
 UPDATE_CHECK_REQUEST_PATH = os.getenv("UPDATE_CHECK_REQUEST_PATH", "/logs/update-check-request.json")
 UPDATE_APPLY_REQUEST_PATH = os.getenv("UPDATE_APPLY_REQUEST_PATH", "/logs/update-apply-request.json")
 BACKUP_STATUS_PATH = os.getenv("BACKUP_STATUS_PATH", "/logs/backup-status.json")
+UPDATE_AUDIT_PATH = os.getenv("UPDATE_AUDIT_PATH", "/logs/update-audit.jsonl")
 SECURITY_GUARD_URL = os.getenv("SECURITY_GUARD_URL", "http://security-guard:9100").rstrip("/")
 SECURITY_HTTP_WINDOW_SECONDS = int(os.getenv("SECURITY_HTTP_WINDOW_SECONDS", "10"))
 SECURITY_HTTP_MAX_REQUESTS = int(os.getenv("SECURITY_HTTP_MAX_REQUESTS", "120"))
@@ -977,6 +978,98 @@ def _read_deploy_history(limit: int = 20) -> dict[str, Any]:
             item[k.strip()] = v.strip()
         items.append(item)
     return {"status": "ok", "path": str(path), "items": items}
+
+
+def _read_update_audit(
+    limit: int = 50,
+    status: str = "",
+    branch: str = "",
+    file_q: str = "",
+    commit_q: str = "",
+    date_from: str = "",
+    date_to: str = "",
+) -> dict[str, Any]:
+    limit = max(1, min(300, int(limit)))
+    status_q = status.strip().lower()
+    branch_q = branch.strip().lower()
+    file_q = file_q.strip().lower()
+    commit_q = commit_q.strip().lower()
+    date_from = date_from.strip()
+    date_to = date_to.strip()
+    path = Path(UPDATE_AUDIT_PATH)
+    if not path.exists():
+        return {
+            "status": "ok",
+            "path": str(path),
+            "items": [],
+            "reason": "update audit file not found yet",
+            "filters": {
+                "status": status_q,
+                "branch": branch_q,
+                "file_q": file_q,
+                "commit_q": commit_q,
+                "date_from": date_from,
+                "date_to": date_to,
+            },
+        }
+    try:
+        rows = []
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    item = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                ts = str(item.get("ts", ""))
+                st = str(item.get("status", "")).lower()
+                br = str(item.get("branch", "")).lower()
+                if status_q and st != status_q:
+                    continue
+                if branch_q and br != branch_q:
+                    continue
+                if date_from and ts and ts < date_from:
+                    continue
+                if date_to and ts and ts > date_to:
+                    continue
+                commits = item.get("commits") if isinstance(item.get("commits"), list) else []
+                files = item.get("files") if isinstance(item.get("files"), list) else []
+                commit_text = " ".join(
+                    str(c.get("title", ""))
+                    for c in commits
+                    if isinstance(c, dict)
+                ).lower()
+                file_text = " ".join(
+                    str(fi.get("path", ""))
+                    for fi in files
+                    if isinstance(fi, dict)
+                ).lower()
+                if commit_q and commit_q not in commit_text:
+                    continue
+                if file_q and file_q not in file_text:
+                    continue
+                rows.append(item)
+    except Exception as e:
+        return {"status": "degraded", "path": str(path), "items": [], "reason": f"read error: {e}"}
+    rows = rows[-limit:]
+    rows.reverse()
+    return {
+        "status": "ok",
+        "path": str(path),
+        "items": rows,
+        "filters": {
+            "status": status_q,
+            "branch": branch_q,
+            "file_q": file_q,
+            "commit_q": commit_q,
+            "date_from": date_from,
+            "date_to": date_to,
+        },
+    }
 
 
 def _default_release_state() -> dict[str, Any]:
@@ -3187,6 +3280,38 @@ def admin(request: Request) -> HTMLResponse:
   <p class="muted" id="deploy-events-meta"></p>
 </div>
 
+<div class="card admin-section" data-section="overview" data-subsection="updates">
+  <h2>Update audit summary</h2>
+  <p class="muted">Incremental audit of applied updates: commit titles, changed files, local changes handling before pull.</p>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-bottom:10px;">
+    <select id="upd-filter-status" style="padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);">
+      <option value="">Status: any</option>
+      <option value="updated">updated</option>
+      <option value="available">available</option>
+      <option value="noop">noop</option>
+      <option value="failed">failed</option>
+      <option value="failed_with_rollback">failed_with_rollback</option>
+      <option value="blocked_local_changes">blocked_local_changes</option>
+    </select>
+    <input id="upd-filter-branch" placeholder="Branch (e.g. main)" />
+    <input id="upd-filter-file" placeholder="File contains (e.g. compose.yaml)" />
+    <input id="upd-filter-commit" placeholder="Commit text contains" />
+    <input id="upd-filter-date-from" placeholder="Date from (ISO UTC)" />
+    <input id="upd-filter-date-to" placeholder="Date to (ISO UTC)" />
+  </div>
+  <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <button class="btn-ghost" onclick="applyUpdateAuditFilters()">Apply filters</button>
+    <button class="btn-ghost" onclick="resetUpdateAuditFilters()">Reset filters</button>
+  </div>
+  <table style="width:100%; border-collapse:collapse;">
+    <thead>
+      <tr><th align="left">Time (UTC)</th><th align="left">Status</th><th align="left">Branch</th><th align="left">From</th><th align="left">To</th><th align="left">Commit title</th><th align="left">Files</th><th align="left">Message</th></tr>
+    </thead>
+    <tbody id="update-audit-body"><tr><td colspan="8" class="muted">Loading...</td></tr></tbody>
+  </table>
+  <p class="muted" id="update-audit-meta"></p>
+</div>
+
 <div class="card admin-section" data-section="overview" data-subsection="backup">
   <h2>Backup integrity status</h2>
   <p class="muted">Scheduled backups run only after runtime integrity checks pass.</p>
@@ -3378,6 +3503,7 @@ const sectionSubsections = {{
     ['online', 'Online users'],
     ['services', 'Services'],
     ['deploy', 'Deploy'],
+    ['updates', 'Updates audit'],
     ['backup', 'Backup'],
   ],
   security: [
@@ -3510,6 +3636,77 @@ function renderDeployEvents(items, path, reason) {{
     <td>${{escHtml(i.details || i.raw || '-')}}</td>
   </tr>`).join('');
   if (meta) meta.textContent = 'Source file: ' + (path || '-') + ' | showing latest ' + items.length + ' events';
+}}
+function firstCommitTitle(item) {{
+  const commits = Array.isArray(item?.commits) ? item.commits : [];
+  if (!commits.length) return '-';
+  const first = commits[0] || {{}};
+  return String(first.title || first.sha || '-');
+}}
+function filePreview(item) {{
+  const files = Array.isArray(item?.files) ? item.files : [];
+  if (!files.length) return '-';
+  const preview = files.slice(0, 3).map(f => `${{String(f.status || '?')}} ${{String(f.path || '-')}}`).join(', ');
+  if (files.length > 3) return preview + ` (+${{files.length - 3}} more)`;
+  return preview;
+}}
+function renderUpdateAudit(items, path, reason) {{
+  const body = document.getElementById('update-audit-body');
+  const meta = document.getElementById('update-audit-meta');
+  if (!body) return;
+  if (!items || items.length === 0) {{
+    body.innerHTML = '<tr><td colspan="8" class="muted">No update audit records yet.</td></tr>';
+    if (meta) meta.textContent = (reason || 'Audit file is empty.') + (path ? (' Path: ' + path) : '');
+    return;
+  }}
+  body.innerHTML = items.map(i => `<tr>
+    <td>${{escHtml(i.ts || '-')}}</td>
+    <td>${{deployStatusBadge(i.status)}}</td>
+    <td>${{escHtml(i.branch || '-')}}</td>
+    <td><code>${{escHtml(i.from || '-')}}</code></td>
+    <td><code>${{escHtml(i.to || '-')}}</code></td>
+    <td>${{escHtml(firstCommitTitle(i))}}</td>
+    <td>${{escHtml(filePreview(i))}}</td>
+    <td>${{escHtml(i.message || '-')}}</td>
+  </tr>`).join('');
+  if (meta) meta.textContent = 'Source file: ' + (path || '-') + ' | showing latest ' + items.length + ' records';
+}}
+function buildUpdateAuditQuery() {{
+  const status = String(document.getElementById('upd-filter-status')?.value || '').trim();
+  const branch = String(document.getElementById('upd-filter-branch')?.value || '').trim();
+  const fileQ = String(document.getElementById('upd-filter-file')?.value || '').trim();
+  const commitQ = String(document.getElementById('upd-filter-commit')?.value || '').trim();
+  const dateFrom = String(document.getElementById('upd-filter-date-from')?.value || '').trim();
+  const dateTo = String(document.getElementById('upd-filter-date-to')?.value || '').trim();
+  const p = new URLSearchParams();
+  p.set('limit', '50');
+  if (status) p.set('status', status);
+  if (branch) p.set('branch', branch);
+  if (fileQ) p.set('file_q', fileQ);
+  if (commitQ) p.set('commit_q', commitQ);
+  if (dateFrom) p.set('date_from', dateFrom);
+  if (dateTo) p.set('date_to', dateTo);
+  return p.toString();
+}}
+async function loadUpdateAuditByFilters() {{
+  const q = buildUpdateAuditQuery();
+  const r = await fetch('/api/v1/admin/update-audit?' + q);
+  if (!r.ok) return;
+  const d = await r.json();
+  renderUpdateAudit(d.items || [], d.path || '', d.reason || '');
+}}
+function applyUpdateAuditFilters() {{
+  loadUpdateAuditByFilters();
+}}
+function resetUpdateAuditFilters() {{
+  const ids = ['upd-filter-branch', 'upd-filter-file', 'upd-filter-commit', 'upd-filter-date-from', 'upd-filter-date-to'];
+  ids.forEach((id) => {{
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  }});
+  const st = document.getElementById('upd-filter-status');
+  if (st) st.value = '';
+  loadUpdateAuditByFilters();
 }}
 function securitySeverityBadge(level) {{
   const l = String(level || 'unknown').toLowerCase();
@@ -3971,13 +4168,14 @@ async function applyConfigurator() {{
   await refreshAdminLive();
 }}
 async function refreshAdminLive() {{
-  const [statsR, onlineR, tsR, trafficR, servicesR, deployEventsR, capacityR, backupStatusR, securityEventsR, securityBlockedR] = await Promise.all([
+  const [statsR, onlineR, tsR, trafficR, servicesR, deployEventsR, updateAuditR, capacityR, backupStatusR, securityEventsR, securityBlockedR] = await Promise.all([
     fetch('/api/v1/admin/stats'),
     fetch('/api/v1/admin/online-users'),
     fetch('/api/v1/admin/system-metrics/timeseries?minutes=60'),
     fetch('/api/v1/admin/user-traffic/summary?hours=24'),
     fetch('/api/v1/admin/services/status'),
     fetch('/api/v1/admin/deploy-events?limit=12'),
+    fetch('/api/v1/admin/update-audit?' + buildUpdateAuditQuery()),
     fetch('/api/v1/admin/capacity-status?window_minutes=60'),
     fetch('/api/v1/admin/backup-status'),
     fetch('/api/v1/admin/security/events?limit=120'),
@@ -4022,6 +4220,10 @@ async function refreshAdminLive() {{
   if (deployEventsR.ok) {{
     const d = await deployEventsR.json();
     renderDeployEvents(d.items || [], d.path || '', d.reason || '');
+  }}
+  if (updateAuditR.ok) {{
+    const u = await updateAuditR.json();
+    renderUpdateAudit(u.items || [], u.path || '', u.reason || '');
   }}
   if (capacityR.ok) {{
     const c = await capacityR.json();
@@ -4715,6 +4917,30 @@ def admin_service_logs(request: Request, container_name: str, tail: int = 120, s
 def admin_deploy_events(request: Request, limit: int = 20) -> JSONResponse:
     _require_admin(request)
     data = _read_deploy_history(limit=limit)
+    return JSONResponse(data)
+
+
+@app.get("/api/v1/admin/update-audit")
+def admin_update_audit(
+    request: Request,
+    limit: int = 50,
+    status: str = "",
+    branch: str = "",
+    file_q: str = "",
+    commit_q: str = "",
+    date_from: str = "",
+    date_to: str = "",
+) -> JSONResponse:
+    _require_admin(request)
+    data = _read_update_audit(
+        limit=limit,
+        status=status,
+        branch=branch,
+        file_q=file_q,
+        commit_q=commit_q,
+        date_from=date_from,
+        date_to=date_to,
+    )
     return JSONResponse(data)
 
 

@@ -321,6 +321,8 @@ DEPLOY_PATH="${DEPLOY_PATH:-/opt/proxy_vpn}"
 RUN_DOCKER_HELLO="${RUN_DOCKER_HELLO:-1}"
 CLONE_REPO="${CLONE_REPO:-1}"
 AUTO_PULL_REPO="${AUTO_PULL_REPO:-1}"
+AUTO_PULL_LOCAL_CHANGES_POLICY="${AUTO_PULL_LOCAL_CHANGES_POLICY:-stash}" # stash | commit | fail
+AUTO_PULL_LOCAL_CHANGES_COMMIT_MESSAGE="${AUTO_PULL_LOCAL_CHANGES_COMMIT_MESSAGE:-chore(bootstrap): checkpoint local changes before auto-pull}"
 CONFIGURE_GITHUB_REPO_ACCESS="${CONFIGURE_GITHUB_REPO_ACCESS:-1}"
 AUTO_GENERATE_VPN_CONFIGS="${AUTO_GENERATE_VPN_CONFIGS:-1}"
 FORCE_REGENERATE_VPN_CONFIGS="${FORCE_REGENERATE_VPN_CONFIGS:-0}"
@@ -488,11 +490,32 @@ if [ "${CLONE_REPO}" = "1" ]; then
   else
     log "Repository already exists at ${DEPLOY_PATH}, skipping clone."
     if [ "${AUTO_PULL_REPO}" = "1" ]; then
+      auto_pull_mode="ff-only"
       if [ -n "$(su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && git status --porcelain" 2>/dev/null)" ]; then
-        die "Repository has local changes at ${DEPLOY_PATH}. Commit/stash/reset and rerun bootstrap."
+        case "${AUTO_PULL_LOCAL_CHANGES_POLICY}" in
+          stash)
+            su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && git stash push -u -m 'bootstrap-auto-pull-$(date -u +%Y%m%dT%H%M%SZ)' >/dev/null"
+            log "Detected local changes at ${DEPLOY_PATH}; stashed before auto-pull."
+            ;;
+          commit)
+            su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && git add -A && git commit -m \"${AUTO_PULL_LOCAL_CHANGES_COMMIT_MESSAGE}\" >/dev/null"
+            auto_pull_mode="rebase"
+            log "Detected local changes at ${DEPLOY_PATH}; committed checkpoint before auto-pull."
+            ;;
+          fail)
+            die "Repository has local changes at ${DEPLOY_PATH} and AUTO_PULL_LOCAL_CHANGES_POLICY=fail."
+            ;;
+          *)
+            die "Unknown AUTO_PULL_LOCAL_CHANGES_POLICY=${AUTO_PULL_LOCAL_CHANGES_POLICY}. Use stash|commit|fail."
+            ;;
+        esac
       fi
       git_ssh_cmd="$(build_git_ssh_command)"
-      su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && b=\$(git rev-parse --abbrev-ref HEAD) && GIT_SSH_COMMAND='${git_ssh_cmd}' git fetch origin \"\$b\" && GIT_SSH_COMMAND='${git_ssh_cmd}' git pull --ff-only origin \"\$b\""
+      if [ "${auto_pull_mode}" = "rebase" ]; then
+        su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && b=\$(git rev-parse --abbrev-ref HEAD) && GIT_SSH_COMMAND='${git_ssh_cmd}' git fetch origin \"\$b\" && GIT_SSH_COMMAND='${git_ssh_cmd}' git pull --rebase origin \"\$b\""
+      else
+        su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && b=\$(git rev-parse --abbrev-ref HEAD) && GIT_SSH_COMMAND='${git_ssh_cmd}' git fetch origin \"\$b\" && GIT_SSH_COMMAND='${git_ssh_cmd}' git pull --ff-only origin \"\$b\""
+      fi
       log "Repository updated to latest remote revision."
     fi
   fi

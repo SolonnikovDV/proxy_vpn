@@ -15,6 +15,8 @@ BRANCH="${BRANCH:-main}"
 MODE="${MODE:-prod}"
 ON_CALENDAR="${ON_CALENDAR:-*:0/15}"
 UPDATE_APPROVAL_REQUIRED="${UPDATE_APPROVAL_REQUIRED:-1}"
+LOCAL_CHANGES_POLICY="${LOCAL_CHANGES_POLICY:-stash}"
+LOCAL_CHANGES_COMMIT_MESSAGE="${LOCAL_CHANGES_COMMIT_MESSAGE:-chore(auto-update): checkpoint local changes before pull}"
 
 [ -d "${DEPLOY_PATH}" ] || die "DEPLOY_PATH does not exist: ${DEPLOY_PATH}"
 id "${RUN_USER}" >/dev/null 2>&1 || die "RUN_USER does not exist: ${RUN_USER}"
@@ -36,6 +38,8 @@ WorkingDirectory=${DEPLOY_PATH}
 Environment=BRANCH=${BRANCH}
 Environment=MODE=${MODE}
 Environment=UPDATE_APPROVAL_REQUIRED=${UPDATE_APPROVAL_REQUIRED}
+Environment=LOCAL_CHANGES_POLICY=${LOCAL_CHANGES_POLICY}
+Environment=LOCAL_CHANGES_COMMIT_MESSAGE=${LOCAL_CHANGES_COMMIT_MESSAGE}
 ExecStart=/usr/bin/env bash ${DEPLOY_PATH}/scripts/auto-update.sh
 EOF
 

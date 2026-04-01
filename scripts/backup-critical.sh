@@ -179,7 +179,7 @@ docker run --rm \
 
 if [ "${INCLUDE_LOGS}" = "1" ] && [ -d "logs" ]; then
   mkdir -p "${payload}/repo/logs"
-  for f in deploy-history.log app-release-state.json backup-status.json; do
+  for f in deploy-history.log app-release-state.json backup-status.json update-audit.jsonl; do
     [ -f "logs/${f}" ] && cp -f "logs/${f}" "${payload}/repo/logs/${f}"
   done
 fi
