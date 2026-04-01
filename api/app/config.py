@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     admin_email: str = "admin@local"
     admin_password: str = "admin123!"
     admin_password_file: str = ""
+    admin_sync_on_start: bool = True
 
 
 def _read_secret_from_file(path: str) -> str:

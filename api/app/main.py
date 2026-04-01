@@ -2522,6 +2522,28 @@ def startup() -> None:
                     _now().isoformat(),
                 ),
             )
+        elif settings.admin_sync_on_start:
+            admin_row = con.execute(
+                "SELECT id, email, password_hash, role, is_active FROM users WHERE id = ?",
+                (int(row["id"]),),
+            ).fetchone()
+            if admin_row:
+                updates: list[str] = []
+                values: list[Any] = []
+                if settings.admin_email and settings.admin_email != str(admin_row["email"] or ""):
+                    updates.append("email = ?")
+                    values.append(settings.admin_email)
+                stored_hash = str(admin_row["password_hash"] or "")
+                if settings.admin_password and (not stored_hash or not _verify_password(settings.admin_password, stored_hash)):
+                    updates.append("password_hash = ?")
+                    values.append(_hash_password(settings.admin_password))
+                if str(admin_row["role"] or "") != "admin":
+                    updates.append("role = 'admin'")
+                if int(admin_row["is_active"] or 0) != 1:
+                    updates.append("is_active = 1")
+                if updates:
+                    values.append(int(admin_row["id"]))
+                    con.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", tuple(values))
         cfg_row = con.execute("SELECT id FROM system_config WHERE id = 1").fetchone()
         if not cfg_row:
             defaults = _default_system_config()
@@ -2728,7 +2750,7 @@ def login_page(request: Request) -> HTMLResponse:
   <input id="login-username" placeholder="username" />
   <input id="login-password" placeholder="password" type="password" />
   <button onclick="login()">Sign in</button>
-  <p class="muted">Default admin from env: admin / admin123!</p>
+  <p class="muted">Admin credentials are configured from environment/secret files.</p>
 </div>
 <div class="card">
   <h2>Register</h2>

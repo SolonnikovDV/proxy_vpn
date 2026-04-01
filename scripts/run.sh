@@ -77,11 +77,24 @@ run_local() {
 
 run_prod() {
   bash ./scripts/sync-env.sh prod
+  set -a
+  . ./.env
+  set +a
+  export VPN_PANEL_DOMAIN="${VPN_PANEL_DOMAIN:-}"
+  export XRAY_PORT="${XRAY_PORT:-8443}"
+  export WG_PORT="${WG_PORT:-51820}"
   case "${ACTION}" in
     up)
       bash ./scripts/preflight-prod.sh
       dc -f compose.yaml -f compose.prod.yaml up -d --build
       dc -f compose.yaml -f compose.prod.yaml ps
+      log "Production URLs:"
+      log "  https://${VPN_PANEL_DOMAIN}/"
+      log "  https://${VPN_PANEL_DOMAIN}/login"
+      log "  https://${VPN_PANEL_DOMAIN}/admin"
+      log "VPN endpoints:"
+      log "  WireGuard endpoint: ${VPN_PANEL_DOMAIN}:${WG_PORT} (client: wireguard/conf/client1.conf)"
+      log "  Xray endpoint: ${VPN_PANEL_DOMAIN}:${XRAY_PORT} (client: xray/client-connection.txt)"
       ;;
     down)
       dc -f compose.yaml -f compose.prod.yaml down
@@ -91,6 +104,13 @@ run_prod() {
       bash ./scripts/preflight-prod.sh
       dc -f compose.yaml -f compose.prod.yaml up -d --build
       dc -f compose.yaml -f compose.prod.yaml ps
+      log "Production URLs:"
+      log "  https://${VPN_PANEL_DOMAIN}/"
+      log "  https://${VPN_PANEL_DOMAIN}/login"
+      log "  https://${VPN_PANEL_DOMAIN}/admin"
+      log "VPN endpoints:"
+      log "  WireGuard endpoint: ${VPN_PANEL_DOMAIN}:${WG_PORT} (client: wireguard/conf/client1.conf)"
+      log "  Xray endpoint: ${VPN_PANEL_DOMAIN}:${XRAY_PORT} (client: xray/client-connection.txt)"
       ;;
     logs)
       dc -f compose.yaml -f compose.prod.yaml logs -f caddy api xray wireguard
