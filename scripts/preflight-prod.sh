@@ -26,8 +26,16 @@ is_valid_port() {
 assert_caddy_route_present() {
   local route="$1"
   local file="$2"
-  rg -n "handle[[:space:]]+${route}(\\*|[[:space:]]|\\{)" "${file}" >/dev/null 2>&1 \
-    || die "${file} is missing required route matcher for ${route}"
+  [ -f "${file}" ] || die "Caddy file is missing: ${file}"
+  local line
+  local trimmed
+  while IFS= read -r line || [ -n "${line}" ]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    if [[ "${trimmed}" =~ ^handle[[:space:]]+${route}(\*|[[:space:]]|\{) ]]; then
+      return 0
+    fi
+  done < "${file}"
+  die "${file} is missing required route matcher for ${route}"
 }
 
 read_secret_value() {
