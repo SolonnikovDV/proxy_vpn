@@ -8,7 +8,19 @@ on:
   workflow_dispatch:
 
 jobs:
+  sensitive_audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fail-fast sensitive data audit
+        run: |
+          set -euo pipefail
+          bash ./scripts/audit-sensitive.sh
+
   checks:
+    needs: sensitive_audit
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -18,11 +30,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Audit sensitive data
-        run: |
-          set -euo pipefail
-          bash ./scripts/audit-sensitive.sh
 
       - name: Integrity contract checks
         run: |

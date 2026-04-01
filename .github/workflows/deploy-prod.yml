@@ -155,17 +155,17 @@ jobs:
           ssh "${SSH_USER}@${SSH_HOST}" "
             set -euo pipefail
             cd '${DEPLOY_PATH}'
+            export VPN_PANEL_DOMAIN='${VPN_PANEL_DOMAIN}'
+            export APP_SECRET_KEY_FILE='${APP_SECRET_KEY_FILE}'
+            export ADMIN_PASSWORD_FILE='${ADMIN_PASSWORD_FILE}'
             if [ '${RENDER_ENV_FROM_CI:-0}' = '1' ]; then
               export CADDYFILE_PATH='${CADDYFILE_PATH}'
-              export VPN_PANEL_DOMAIN='${VPN_PANEL_DOMAIN}'
               export CADDY_HTTP_PORT='${CADDY_HTTP_PORT}'
               export CADDY_HTTPS_PORT='${CADDY_HTTPS_PORT}'
               export XRAY_PORT='${XRAY_PORT}'
               export WG_PORT='${WG_PORT}'
               export ADMIN_USERNAME='${ADMIN_USERNAME}'
               export ADMIN_EMAIL='${ADMIN_EMAIL}'
-              export APP_SECRET_KEY_FILE='${APP_SECRET_KEY_FILE}'
-              export ADMIN_PASSWORD_FILE='${ADMIN_PASSWORD_FILE}'
               export CAPACITY_TARGET_ACTIVE_USERS='${CAPACITY_TARGET_ACTIVE_USERS}'
               export CAPACITY_CPU_WARN_P95='${CAPACITY_CPU_WARN_P95}'
               export CAPACITY_CPU_CRIT_P95='${CAPACITY_CPU_CRIT_P95}'

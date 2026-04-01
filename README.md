@@ -399,7 +399,8 @@ Install systemd timer to periodically pull latest `main` and rebuild stack when 
 
 ```bash
 sudo DEPLOY_PATH=/opt/proxy_vpn RUN_USER=root BRANCH=main MODE=prod ON_CALENDAR="*:0/15" \
-  LOCAL_CHANGES_POLICY=stash bash ./scripts/setup-auto-update.sh
+  LOCAL_CHANGES_POLICY=stash REQUIRE_GREEN_CI=1 GITHUB_REPO="owner/repo" GITHUB_API_TOKEN="<token>" \
+  bash ./scripts/setup-auto-update.sh
 ```
 
 Default update policy is approval-based (`UPDATE_APPROVAL_REQUIRED=1`):
@@ -420,6 +421,7 @@ Auto-update also includes safe rollback:
 - writes deployment and rollback history to `logs/deploy-history.log`
 - if repository has local uncommitted changes, auto-update now preserves them before pull (`LOCAL_CHANGES_POLICY=stash` by default; also supports `commit` and `fail`; `commit` mode uses `git pull --rebase`)
 - writes incremental structured update audit to `logs/update-audit.jsonl` (commit titles, changed files, from/to SHA, local-changes handling)
+- applies updates only when CI is green if `REQUIRE_GREEN_CI=1` (default)
 
 Manual trigger:
 
@@ -478,6 +480,11 @@ Admin update audit table:
 - shows incremental update records with date, status, branch, from/to SHA, first commit title, changed files preview, message
 - supports filters: status, branch, file text, commit text, date from/to
 - API endpoint: `/api/v1/admin/update-audit`
+
+Green CI gate:
+- auto-update checks GitHub commit status API (`/repos/<repo>/commits/<sha>/status`)
+- for private repositories set `GITHUB_API_TOKEN` in auto-update service environment
+- if status is not `success` (or API check fails), update is skipped and recorded in update audit/deploy history
 
 ## Backup and restore (critical data)
 
@@ -577,6 +584,10 @@ Run local scan before publishing changes:
 ```bash
 bash ./scripts/audit-sensitive.sh
 ```
+
+CI fail-fast:
+- workflow `CI Checks` now starts with dedicated job `sensitive_audit`
+- other CI checks run only after this audit passes
 
 ## Nightly self-check
 

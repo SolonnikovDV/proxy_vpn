@@ -15,6 +15,9 @@ UPDATE_AUDIT_FILE="${UPDATE_AUDIT_FILE:-logs/update-audit.jsonl}"
 UPDATE_APPROVAL_REQUIRED="${UPDATE_APPROVAL_REQUIRED:-1}"
 LOCAL_CHANGES_POLICY="${LOCAL_CHANGES_POLICY:-stash}" # stash | commit | fail
 LOCAL_CHANGES_COMMIT_MESSAGE="${LOCAL_CHANGES_COMMIT_MESSAGE:-chore(auto-update): checkpoint local changes before pull}"
+REQUIRE_GREEN_CI="${REQUIRE_GREEN_CI:-1}"
+GITHUB_REPO="${GITHUB_REPO:-}"
+GITHUB_API_TOKEN="${GITHUB_API_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
 mkdir -p "$(dirname "${REPORT_FILE}")"
 mkdir -p "$(dirname "${RELEASE_STATE_FILE}")"
 mkdir -p "$(dirname "${UPDATE_AUDIT_FILE}")"
@@ -155,6 +158,56 @@ release_info_for_ref() {
   printf '%s\n%s\n' "${version}" "${notes}"
 }
 
+infer_github_repo_from_origin() {
+  local origin_url
+  origin_url="$(git remote get-url origin 2>/dev/null || true)"
+  if [ -z "${origin_url}" ]; then
+    return 1
+  fi
+  if [[ "${origin_url}" == git@github.com:* ]]; then
+    printf '%s' "${origin_url#git@github.com:}" | sed -E 's#\.git$##'
+    return 0
+  fi
+  if [[ "${origin_url}" == https://github.com/* ]]; then
+    printf '%s' "${origin_url#https://github.com/}" | sed -E 's#\.git$##'
+    return 0
+  fi
+  return 1
+}
+
+github_commit_status_state() {
+  local repo="$1"
+  local sha="$2"
+  local token="$3"
+  python3 - "$repo" "$sha" "$token" <<'PY'
+import json
+import sys
+import urllib.request
+
+repo = sys.argv[1]
+sha = sys.argv[2]
+token = sys.argv[3].strip()
+url = f"https://api.github.com/repos/{repo}/commits/{sha}/status"
+req = urllib.request.Request(url, headers={
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "proxy-vpn-auto-update",
+})
+if token:
+    req.add_header("Authorization", f"Bearer {token}")
+try:
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+except Exception as e:
+    print(f"__ERROR__:{e}")
+    raise SystemExit(0)
+state = str(payload.get("state", "")).strip().lower()
+if not state:
+    print("__ERROR__:empty_state")
+    raise SystemExit(0)
+print(state)
+PY
+}
+
 write_release_state() {
   local update_status="${1:-idle}"
   local update_message="${2:-}"
@@ -217,6 +270,56 @@ if [ "${LOCAL_SHA}" != "${REMOTE_SHA}" ]; then
 else
   REMOTE_VERSION=""
   REMOTE_NOTES=""
+fi
+
+if [ "${REQUIRE_GREEN_CI}" = "1" ]; then
+  repo_for_ci="${GITHUB_REPO}"
+  if [ -z "${repo_for_ci}" ]; then
+    repo_for_ci="$(infer_github_repo_from_origin || true)"
+  fi
+  if [ -z "${repo_for_ci}" ]; then
+    report_event "blocked_ci_gate" "auto-update" "Cannot infer GitHub repo for CI gate check; update skipped" "${LOCAL_SHA}" "${REMOTE_SHA}" "na"
+    append_update_audit "blocked_ci_gate" "Cannot infer GitHub repo for CI gate check; update skipped." "${LOCAL_SHA}" "${REMOTE_SHA}" "none"
+    REL_UPDATE_STATUS="available" \
+    REL_UPDATE_MESSAGE="Update available, but CI gate check is not configured (missing GITHUB_REPO)." \
+    REL_CURRENT_SHA="${LOCAL_SHA}" \
+    REL_CURRENT_VERSION="${LOCAL_VERSION}" \
+    REL_CURRENT_NOTES="${LOCAL_NOTES}" \
+    REL_AVAILABLE_SHA="${REMOTE_SHA}" \
+    REL_AVAILABLE_VERSION="${REMOTE_VERSION}" \
+    REL_AVAILABLE_NOTES="${REMOTE_NOTES}" \
+    write_release_state
+    exit 0
+  fi
+  ci_state="$(github_commit_status_state "${repo_for_ci}" "${REMOTE_SHA}" "${GITHUB_API_TOKEN}")"
+  if [[ "${ci_state}" == __ERROR__:* ]]; then
+    report_event "blocked_ci_gate" "auto-update" "CI gate check error: ${ci_state#__ERROR__:}" "${LOCAL_SHA}" "${REMOTE_SHA}" "na"
+    append_update_audit "blocked_ci_gate" "CI gate check error; update skipped." "${LOCAL_SHA}" "${REMOTE_SHA}" "none"
+    REL_UPDATE_STATUS="available" \
+    REL_UPDATE_MESSAGE="Update available, but CI gate check failed (${ci_state#__ERROR__:})." \
+    REL_CURRENT_SHA="${LOCAL_SHA}" \
+    REL_CURRENT_VERSION="${LOCAL_VERSION}" \
+    REL_CURRENT_NOTES="${LOCAL_NOTES}" \
+    REL_AVAILABLE_SHA="${REMOTE_SHA}" \
+    REL_AVAILABLE_VERSION="${REMOTE_VERSION}" \
+    REL_AVAILABLE_NOTES="${REMOTE_NOTES}" \
+    write_release_state
+    exit 0
+  fi
+  if [ "${ci_state}" != "success" ]; then
+    report_event "awaiting_ci_green" "auto-update" "Update skipped until CI is green (state=${ci_state})" "${LOCAL_SHA}" "${REMOTE_SHA}" "na"
+    append_update_audit "awaiting_ci_green" "Update available, waiting for green CI." "${LOCAL_SHA}" "${REMOTE_SHA}" "none"
+    REL_UPDATE_STATUS="available" \
+    REL_UPDATE_MESSAGE="Update available, waiting for green CI (state=${ci_state})." \
+    REL_CURRENT_SHA="${LOCAL_SHA}" \
+    REL_CURRENT_VERSION="${LOCAL_VERSION}" \
+    REL_CURRENT_NOTES="${LOCAL_NOTES}" \
+    REL_AVAILABLE_SHA="${REMOTE_SHA}" \
+    REL_AVAILABLE_VERSION="${REMOTE_VERSION}" \
+    REL_AVAILABLE_NOTES="${REMOTE_NOTES}" \
+    write_release_state
+    exit 0
+  fi
 fi
 
 check_requested="0"
