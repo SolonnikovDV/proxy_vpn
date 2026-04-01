@@ -12,9 +12,10 @@ RELEASE_STATE_FILE="${RELEASE_STATE_FILE:-logs/app-release-state.json}"
 UPDATE_CHECK_REQUEST_FILE="${UPDATE_CHECK_REQUEST_FILE:-logs/update-check-request.json}"
 UPDATE_APPLY_REQUEST_FILE="${UPDATE_APPLY_REQUEST_FILE:-logs/update-apply-request.json}"
 UPDATE_AUDIT_FILE="${UPDATE_AUDIT_FILE:-logs/update-audit.jsonl}"
-UPDATE_APPROVAL_REQUIRED="${UPDATE_APPROVAL_REQUIRED:-1}"
+UPDATE_APPROVAL_REQUIRED="${UPDATE_APPROVAL_REQUIRED:-0}"
 LOCAL_CHANGES_POLICY="${LOCAL_CHANGES_POLICY:-stash}" # stash | commit | fail
 LOCAL_CHANGES_COMMIT_MESSAGE="${LOCAL_CHANGES_COMMIT_MESSAGE:-chore(auto-update): checkpoint local changes before pull}"
+REPO_SYNC_STRATEGY="${REPO_SYNC_STRATEGY:-mirror}" # mirror | pull
 REQUIRE_GREEN_CI="${REQUIRE_GREEN_CI:-1}"
 GITHUB_REPO="${GITHUB_REPO:-}"
 GITHUB_API_TOKEN="${GITHUB_API_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
@@ -108,6 +109,11 @@ PY
 
 BRANCH="${BRANCH:-main}"
 MODE="${MODE:-prod}" # prod or local
+
+case "${REPO_SYNC_STRATEGY}" in
+  mirror|pull) ;;
+  *) die "Unknown REPO_SYNC_STRATEGY=${REPO_SYNC_STRATEGY}. Use mirror|pull." ;;
+esac
 
 if docker compose version >/dev/null 2>&1; then
   dc() { docker compose "$@"; }
@@ -346,31 +352,40 @@ fi
 
 LOCAL_CHANGE_RESULT="none"
 PULL_MODE="ff-only"
-if [ -n "$(git status --porcelain)" ]; then
-  case "${LOCAL_CHANGES_POLICY}" in
-    stash)
-      stash_ref="auto-update-$(date -u +'%Y%m%dT%H%M%SZ')"
-      git stash push -u -m "${stash_ref}" >/dev/null
-      LOCAL_CHANGE_RESULT="stashed:${stash_ref}"
-      log "Detected local changes, saved to stash (${stash_ref}) before pull."
-      ;;
-    commit)
-      git add -A
-      git commit -m "${LOCAL_CHANGES_COMMIT_MESSAGE}" >/dev/null
-      local_checkpoint_sha="$(git rev-parse HEAD)"
-      LOCAL_CHANGE_RESULT="committed:${local_checkpoint_sha}"
-      PULL_MODE="rebase"
-      log "Detected local changes, committed checkpoint (${local_checkpoint_sha}) before pull."
-      ;;
-    fail)
-      append_update_audit "blocked_local_changes" "Working tree is dirty and LOCAL_CHANGES_POLICY=fail." "${LOCAL_SHA}" "${REMOTE_SHA}" "blocked"
-      die "Working tree is dirty and LOCAL_CHANGES_POLICY=fail."
-      ;;
-    *)
-      append_update_audit "blocked_local_changes" "Unknown LOCAL_CHANGES_POLICY value." "${LOCAL_SHA}" "${REMOTE_SHA}" "blocked"
-      die "Unknown LOCAL_CHANGES_POLICY=${LOCAL_CHANGES_POLICY}. Use stash|commit|fail."
-      ;;
-  esac
+if [ "${REPO_SYNC_STRATEGY}" = "mirror" ]; then
+  if [ -n "$(git status --porcelain)" ]; then
+    stash_ref="auto-update-pre-mirror-$(date -u +'%Y%m%dT%H%M%SZ')"
+    git stash push -u -m "${stash_ref}" >/dev/null
+    LOCAL_CHANGE_RESULT="stashed:${stash_ref}"
+    log "Detected local changes, saved to stash (${stash_ref}) before mirror sync."
+  fi
+else
+  if [ -n "$(git status --porcelain)" ]; then
+    case "${LOCAL_CHANGES_POLICY}" in
+      stash)
+        stash_ref="auto-update-$(date -u +'%Y%m%dT%H%M%SZ')"
+        git stash push -u -m "${stash_ref}" >/dev/null
+        LOCAL_CHANGE_RESULT="stashed:${stash_ref}"
+        log "Detected local changes, saved to stash (${stash_ref}) before pull."
+        ;;
+      commit)
+        git add -A
+        git commit -m "${LOCAL_CHANGES_COMMIT_MESSAGE}" >/dev/null
+        local_checkpoint_sha="$(git rev-parse HEAD)"
+        LOCAL_CHANGE_RESULT="committed:${local_checkpoint_sha}"
+        PULL_MODE="rebase"
+        log "Detected local changes, committed checkpoint (${local_checkpoint_sha}) before pull."
+        ;;
+      fail)
+        append_update_audit "blocked_local_changes" "Working tree is dirty and LOCAL_CHANGES_POLICY=fail." "${LOCAL_SHA}" "${REMOTE_SHA}" "blocked"
+        die "Working tree is dirty and LOCAL_CHANGES_POLICY=fail."
+        ;;
+      *)
+        append_update_audit "blocked_local_changes" "Unknown LOCAL_CHANGES_POLICY value." "${LOCAL_SHA}" "${REMOTE_SHA}" "blocked"
+        die "Unknown LOCAL_CHANGES_POLICY=${LOCAL_CHANGES_POLICY}. Use stash|commit|fail."
+        ;;
+    esac
+  fi
 fi
 
 if [ "${UPDATE_APPROVAL_REQUIRED}" = "1" ] && [ "${apply_requested}" != "1" ]; then
@@ -403,10 +418,16 @@ REL_AVAILABLE_VERSION="${REMOTE_VERSION}" \
 REL_AVAILABLE_NOTES="${REMOTE_NOTES}" \
 write_release_state
 git checkout "${BRANCH}"
-if [ "${PULL_MODE}" = "rebase" ]; then
-  git pull --rebase origin "${BRANCH}"
+if [ "${REPO_SYNC_STRATEGY}" = "mirror" ]; then
+  # Make the server clone byte-for-byte aligned with origin/<branch>.
+  git reset --hard "origin/${BRANCH}"
+  git clean -fd
 else
-  git pull --ff-only origin "${BRANCH}"
+  if [ "${PULL_MODE}" = "rebase" ]; then
+    git pull --rebase origin "${BRANCH}"
+  else
+    git pull --ff-only origin "${BRANCH}"
+  fi
 fi
 
 deploy_current() {

@@ -395,31 +395,34 @@ SSH_HOST="v734690.hosted-by-vdsina.com" SSH_USER="root" SSH_PASSWORD="CHANGE_ME_
 
 ## Scheduled auto-update (CD stage)
 
-Install systemd timer to periodically pull latest `main` and rebuild stack when changed:
+Install systemd timer to periodically sync latest `main` and rebuild stack when changed:
 
 ```bash
 sudo DEPLOY_PATH=/opt/proxy_vpn RUN_USER=root BRANCH=main MODE=prod ON_CALENDAR="*:0/15" \
-  LOCAL_CHANGES_POLICY=stash REQUIRE_GREEN_CI=1 GITHUB_REPO="owner/repo" GITHUB_API_TOKEN="<token>" \
+  REPO_SYNC_STRATEGY=mirror LOCAL_CHANGES_POLICY=stash REQUIRE_GREEN_CI=1 \
+  GITHUB_REPO="owner/repo" GITHUB_API_TOKEN="<token>" \
   bash ./scripts/setup-auto-update.sh
 ```
 
-Default update policy is approval-based (`UPDATE_APPROVAL_REQUIRED=1`):
-- timer checks remote updates and writes release state
-- app shows update sticker/banner
-- admin triggers update from `/about` (`Update now`)
+Default production policy is fully automatic (`UPDATE_APPROVAL_REQUIRED=0`, `REPO_SYNC_STRATEGY=mirror`):
+- timer checks remote updates and waits for green CI (`REQUIRE_GREEN_CI=1`)
+- when green, server clone is force-synced to `origin/main` (`git reset --hard` + `git clean -fd`)
+- production stack is rebuilt and health-checked automatically
+- resulting runtime matches repository state 1:1 (same as local code for that commit)
 
-To keep old auto-apply behavior:
+To keep old approval-based behavior:
 
 ```bash
 sudo DEPLOY_PATH=/opt/proxy_vpn RUN_USER=root BRANCH=main MODE=prod ON_CALENDAR="*:0/15" \
-  UPDATE_APPROVAL_REQUIRED=0 bash ./scripts/setup-auto-update.sh
+  UPDATE_APPROVAL_REQUIRED=1 REPO_SYNC_STRATEGY=pull bash ./scripts/setup-auto-update.sh
 ```
 
 Auto-update also includes safe rollback:
 - after update, runs health check through Caddy and verifies `proxy-vpn-security-guard` container is running
 - if health check fails, restores previous commit and redeploys automatically
 - writes deployment and rollback history to `logs/deploy-history.log`
-- if repository has local uncommitted changes, auto-update now preserves them before pull (`LOCAL_CHANGES_POLICY=stash` by default; also supports `commit` and `fail`; `commit` mode uses `git pull --rebase`)
+- in `REPO_SYNC_STRATEGY=mirror` mode, local changes are stashed (for audit/recovery) and then clone is synced 1:1 with `origin/<branch>`
+- in `REPO_SYNC_STRATEGY=pull` mode, `LOCAL_CHANGES_POLICY=stash|commit|fail` controls behavior before pull (`commit` mode uses `git pull --rebase`)
 - writes incremental structured update audit to `logs/update-audit.jsonl` (commit titles, changed files, from/to SHA, local-changes handling)
 - applies updates only when CI is green if `REQUIRE_GREEN_CI=1` (default)
 
@@ -456,7 +459,7 @@ bash ./scripts/pull-audit.sh
 ```
 
 Options:
-- `APPLY_PULL=0` -> audit only (no pull)
+- `APPLY_PULL=0` -> audit only (default, no pull)
 - `LOCAL_CHANGES_POLICY=stash|commit|fail` (default `stash`)
 - `BRANCH=main` (default `main`)
 

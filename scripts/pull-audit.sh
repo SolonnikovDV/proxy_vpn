@@ -7,7 +7,7 @@ log() { printf '%s\n' "$*"; }
 die() { log "ERROR: $*"; exit 1; }
 
 BRANCH="${BRANCH:-main}"
-APPLY_PULL="${APPLY_PULL:-1}" # 1 | 0
+APPLY_PULL="${APPLY_PULL:-0}" # 0 (audit-only default) | 1 (apply pull)
 LOCAL_CHANGES_POLICY="${LOCAL_CHANGES_POLICY:-stash}" # stash | commit | fail
 LOCAL_CHANGES_COMMIT_MESSAGE="${LOCAL_CHANGES_COMMIT_MESSAGE:-chore(pull-audit): checkpoint local changes before pull}"
 AUDIT_DIR="${AUDIT_DIR:-logs}"
