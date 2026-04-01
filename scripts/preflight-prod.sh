@@ -71,6 +71,13 @@ ADMIN_PASSWORD="${ADMIN_PASSWORD:-${fallback_admin_password}}"
 APP_SECRET_KEY_FILE="${APP_SECRET_KEY_FILE:-${fallback_app_secret_key_file}}"
 ADMIN_PASSWORD_FILE="${ADMIN_PASSWORD_FILE:-${fallback_admin_password_file}}"
 
+# If .env contains placeholder domain, prefer runtime-provided value (e.g. SSH_HOST fallback from CI workflow).
+if [ "${VPN_PANEL_DOMAIN:-}" = "panel.example.com" ] || [ "${VPN_PANEL_DOMAIN:-}" = "localhost" ]; then
+  if [ -n "${fallback_vpn_panel_domain:-}" ] && [ "${fallback_vpn_panel_domain}" != "panel.example.com" ] && [ "${fallback_vpn_panel_domain}" != "localhost" ]; then
+    VPN_PANEL_DOMAIN="${fallback_vpn_panel_domain}"
+  fi
+fi
+
 export CADDYFILE_PATH="${CADDYFILE_PATH:-Caddyfile.prod}"
 export CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
 export CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}"
