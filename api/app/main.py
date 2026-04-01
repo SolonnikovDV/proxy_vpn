@@ -3960,7 +3960,7 @@ function renderBackupStatus(data) {{
   archiveEl.textContent = 'archive: ' + String(path);
   const msg = (data && data.message) ? data.message : 'No backup status yet.';
   const reason = (data && data.integrity && data.integrity.reason) ? data.integrity.reason : '';
-  msgEl.textContent = reason ? (String(msg) + '\n' + String(reason)) : String(msg);
+  msgEl.textContent = reason ? (String(msg) + '\\n' + String(reason)) : String(msg);
 }}
 async function openServiceLogs(containerName) {{
   currentServiceLogContainer = containerName;
