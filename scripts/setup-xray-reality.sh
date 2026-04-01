@@ -34,6 +34,8 @@ import sys
 
 text = sys.argv[1] if len(sys.argv) > 1 else ""
 m = re.search(r"private\s*key\s*:\s*([A-Za-z0-9+/_=-]{20,})", text, flags=re.IGNORECASE)
+if not m:
+    m = re.search(r"privatekey\s*:\s*([A-Za-z0-9+/_=-]{20,})", text, flags=re.IGNORECASE)
 if m:
     print(m.group(1).strip())
 PY
@@ -43,7 +45,15 @@ import re
 import sys
 
 text = sys.argv[1] if len(sys.argv) > 1 else ""
+# Xray output varies by version:
+# - "Public key: ..."
+# - "PublicKey: ..."
+# - "Password (PublicKey): ..."
 m = re.search(r"public\s*key\s*:\s*([A-Za-z0-9+/_=-]{20,})", text, flags=re.IGNORECASE)
+if not m:
+    m = re.search(r"publickey\s*:\s*([A-Za-z0-9+/_=-]{20,})", text, flags=re.IGNORECASE)
+if not m:
+    m = re.search(r"password\s*\(\s*publickey\s*\)\s*:\s*([A-Za-z0-9+/_=-]{20,})", text, flags=re.IGNORECASE)
 if m:
     print(m.group(1).strip())
 PY
