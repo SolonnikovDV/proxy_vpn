@@ -72,14 +72,13 @@ jobs:
         run: |
           set -euo pipefail
           missing=()
-          for name in SSH_HOST SSH_USER DEPLOY_PATH VPN_PANEL_DOMAIN; do
+          for name in SSH_HOST SSH_USER DEPLOY_PATH; do
             if [ -z "${!name:-}" ]; then
               missing+=("${name}")
             fi
           done
           render_missing=()
           if [ "${RENDER_ENV_FROM_CI:-0}" = "1" ]; then
-            [ -n "${VPN_PANEL_DOMAIN:-}" ] || render_missing+=("VPN_PANEL_DOMAIN")
             if [ -z "${APP_SECRET_KEY:-}" ] && [ -z "${APP_SECRET_KEY_FILE:-}" ]; then
               render_missing+=("APP_SECRET_KEY_OR_APP_SECRET_KEY_FILE")
             fi
@@ -155,7 +154,12 @@ jobs:
           ssh "${SSH_USER}@${SSH_HOST}" "
             set -euo pipefail
             cd '${DEPLOY_PATH}'
-            export VPN_PANEL_DOMAIN='${VPN_PANEL_DOMAIN}'
+            effective_domain='${VPN_PANEL_DOMAIN}'
+            if [ -z \"\${effective_domain}\" ] || [ \"\${effective_domain}\" = 'panel.example.com' ] || [ \"\${effective_domain}\" = 'localhost' ]; then
+              effective_domain='${SSH_HOST}'
+              echo \"VPN_PANEL_DOMAIN is not set to a real domain yet; fallback to SSH_HOST: \${effective_domain}\"
+            fi
+            export VPN_PANEL_DOMAIN=\"\${effective_domain}\"
             export APP_SECRET_KEY_FILE='${APP_SECRET_KEY_FILE}'
             export ADMIN_PASSWORD_FILE='${ADMIN_PASSWORD_FILE}'
             if [ '${RENDER_ENV_FROM_CI:-0}' = '1' ]; then
