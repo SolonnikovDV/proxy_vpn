@@ -48,21 +48,28 @@ fi
 [ -f compose.prod.yaml ] || die "compose.prod.yaml not found."
 
 # Load from .env if present; otherwise rely on runtime env vars (e.g. GitHub Actions secrets/vars).
+fallback_vpn_panel_domain="${VPN_PANEL_DOMAIN:-}"
+fallback_app_secret_key="${APP_SECRET_KEY:-}"
+fallback_admin_password="${ADMIN_PASSWORD:-}"
+fallback_app_secret_key_file="${APP_SECRET_KEY_FILE:-}"
+fallback_admin_password_file="${ADMIN_PASSWORD_FILE:-}"
 if [ -f .env ]; then
   set -a
   . ./.env
   set +a
 fi
 
+VPN_PANEL_DOMAIN="${VPN_PANEL_DOMAIN:-${fallback_vpn_panel_domain}}"
+APP_SECRET_KEY="${APP_SECRET_KEY:-${fallback_app_secret_key}}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-${fallback_admin_password}}"
+APP_SECRET_KEY_FILE="${APP_SECRET_KEY_FILE:-${fallback_app_secret_key_file}}"
+ADMIN_PASSWORD_FILE="${ADMIN_PASSWORD_FILE:-${fallback_admin_password_file}}"
+
 export CADDYFILE_PATH="${CADDYFILE_PATH:-Caddyfile.prod}"
 export CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
 export CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}"
 export XRAY_PORT="${XRAY_PORT:-8443}"
 export WG_PORT="${WG_PORT:-51820}"
-export APP_SECRET_KEY="${APP_SECRET_KEY:-}"
-export ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
-export APP_SECRET_KEY_FILE="${APP_SECRET_KEY_FILE:-}"
-export ADMIN_PASSWORD_FILE="${ADMIN_PASSWORD_FILE:-}"
 
 [ "${CADDYFILE_PATH}" = "Caddyfile.prod" ] || die "CADDYFILE_PATH must be Caddyfile.prod for production."
 [ -n "${VPN_PANEL_DOMAIN:-}" ] || die "VPN_PANEL_DOMAIN is empty."
