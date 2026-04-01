@@ -18,6 +18,12 @@
     handle /login {
         reverse_proxy api:8000
     }
+    handle /about {
+        reverse_proxy api:8000
+    }
+    handle /license {
+        reverse_proxy api:8000
+    }
     handle /health {
         reverse_proxy api:8000
     }

@@ -3660,13 +3660,13 @@ function renderDeployEvents(items, path, reason) {{
   if (meta) meta.textContent = 'Source file: ' + (path || '-') + ' | showing latest ' + items.length + ' events';
 }}
 function firstCommitTitle(item) {{
-  const commits = Array.isArray(item?.commits) ? item.commits : [];
+  const commits = Array.isArray(item && item.commits) ? item.commits : [];
   if (!commits.length) return '-';
   const first = commits[0] || {{}};
   return String(first.title || first.sha || '-');
 }}
 function filePreview(item) {{
-  const files = Array.isArray(item?.files) ? item.files : [];
+  const files = Array.isArray(item && item.files) ? item.files : [];
   if (!files.length) return '-';
   const preview = files.slice(0, 3).map(f => `${{String(f.status || '?')}} ${{String(f.path || '-')}}`).join(', ');
   if (files.length > 3) return preview + ` (+${{files.length - 3}} more)`;
@@ -3694,12 +3694,18 @@ function renderUpdateAudit(items, path, reason) {{
   if (meta) meta.textContent = 'Source file: ' + (path || '-') + ' | showing latest ' + items.length + ' records';
 }}
 function buildUpdateAuditQuery() {{
-  const status = String(document.getElementById('upd-filter-status')?.value || '').trim();
-  const branch = String(document.getElementById('upd-filter-branch')?.value || '').trim();
-  const fileQ = String(document.getElementById('upd-filter-file')?.value || '').trim();
-  const commitQ = String(document.getElementById('upd-filter-commit')?.value || '').trim();
-  const dateFrom = String(document.getElementById('upd-filter-date-from')?.value || '').trim();
-  const dateTo = String(document.getElementById('upd-filter-date-to')?.value || '').trim();
+  const statusEl = document.getElementById('upd-filter-status');
+  const branchEl = document.getElementById('upd-filter-branch');
+  const fileEl = document.getElementById('upd-filter-file');
+  const commitEl = document.getElementById('upd-filter-commit');
+  const dateFromEl = document.getElementById('upd-filter-date-from');
+  const dateToEl = document.getElementById('upd-filter-date-to');
+  const status = String((statusEl && statusEl.value) || '').trim();
+  const branch = String((branchEl && branchEl.value) || '').trim();
+  const fileQ = String((fileEl && fileEl.value) || '').trim();
+  const commitQ = String((commitEl && commitEl.value) || '').trim();
+  const dateFrom = String((dateFromEl && dateFromEl.value) || '').trim();
+  const dateTo = String((dateToEl && dateToEl.value) || '').trim();
   const p = new URLSearchParams();
   p.set('limit', '50');
   if (status) p.set('status', status);
@@ -3768,11 +3774,16 @@ function aggregateSecurityEvents(items) {{
   return Array.from(groups.values()).sort((a, b) => String(b.ts || '').localeCompare(String(a.ts || '')));
 }}
 function applySecurityFilters() {{
-  const ipQ = String(document.getElementById('sec-filter-ip')?.value || '').trim().toLowerCase();
-  const attackQ = String(document.getElementById('sec-filter-attack')?.value || '').trim().toLowerCase();
-  const directionQ = String(document.getElementById('sec-filter-direction')?.value || '').trim().toLowerCase();
-  const severityQ = String(document.getElementById('sec-filter-severity')?.value || '').trim().toLowerCase();
-  const aggregate = !!document.getElementById('sec-aggregate')?.checked;
+  const ipEl = document.getElementById('sec-filter-ip');
+  const attackEl = document.getElementById('sec-filter-attack');
+  const directionEl = document.getElementById('sec-filter-direction');
+  const severityEl = document.getElementById('sec-filter-severity');
+  const aggregateEl = document.getElementById('sec-aggregate');
+  const ipQ = String((ipEl && ipEl.value) || '').trim().toLowerCase();
+  const attackQ = String((attackEl && attackEl.value) || '').trim().toLowerCase();
+  const directionQ = String((directionEl && directionEl.value) || '').trim().toLowerCase();
+  const severityQ = String((severityEl && severityEl.value) || '').trim().toLowerCase();
+  const aggregate = !!(aggregateEl && aggregateEl.checked);
   let items = (securityEventsCache || []).filter((i) => {{
     if (ipQ && !String(i.ip || '').toLowerCase().includes(ipQ)) return false;
     if (attackQ && !String(i.attack_type || '').toLowerCase().includes(attackQ)) return false;
@@ -3797,9 +3808,12 @@ function resetSecurityFilters() {{
 }}
 async function manualBlockIp() {{
   const out = document.getElementById('security-admin-out');
-  const ip = String(document.getElementById('sec-manual-ip')?.value || '').trim();
-  const reason = String(document.getElementById('sec-manual-reason')?.value || '').trim();
-  const blockSeconds = Number(document.getElementById('sec-manual-seconds')?.value || 900);
+  const ipEl = document.getElementById('sec-manual-ip');
+  const reasonEl = document.getElementById('sec-manual-reason');
+  const secondsEl = document.getElementById('sec-manual-seconds');
+  const ip = String((ipEl && ipEl.value) || '').trim();
+  const reason = String((reasonEl && reasonEl.value) || '').trim();
+  const blockSeconds = Number((secondsEl && secondsEl.value) || 900);
   if (!ip) {{
     if (out) out.textContent = 'IP is required.';
     return;
@@ -3816,8 +3830,10 @@ async function manualBlockIp() {{
 }}
 async function manualUnblockIp(ipArg = null) {{
   const out = document.getElementById('security-admin-out');
-  const ip = String(ipArg || document.getElementById('sec-manual-ip')?.value || '').trim();
-  const reason = String(document.getElementById('sec-manual-reason')?.value || '').trim();
+  const ipEl = document.getElementById('sec-manual-ip');
+  const reasonEl = document.getElementById('sec-manual-reason');
+  const ip = String(ipArg || ((ipEl && ipEl.value) || '')).trim();
+  const reason = String((reasonEl && reasonEl.value) || '').trim();
   if (!ip) {{
     if (out) out.textContent = 'IP is required.';
     return;
@@ -4012,12 +4028,14 @@ function renderCapacityStatus(c) {{
     overallEl.innerHTML = badge;
   }}
   if (targetEl) targetEl.textContent = `${{Number(c.active_sessions || 0)}} / ${{Number(c.target_active_users || 15)}}`;
-  if (cpuEl) cpuEl.textContent = `${{Number(c.p95?.cpu_pct || 0).toFixed(1)}}%`;
-  if (memEl) memEl.textContent = `${{Number(c.p95?.mem_pct || 0).toFixed(1)}}%`;
-  if (diskEl) diskEl.textContent = `${{Number(c.p95?.disk_pct || 0).toFixed(1)}}%`;
+  const p95 = c && c.p95 ? c.p95 : {{}};
+  const signals = c && c.signals ? c.signals : {{}};
+  if (cpuEl) cpuEl.textContent = `${{Number(p95.cpu_pct || 0).toFixed(1)}}%`;
+  if (memEl) memEl.textContent = `${{Number(p95.mem_pct || 0).toFixed(1)}}%`;
+  if (diskEl) diskEl.textContent = `${{Number(p95.disk_pct || 0).toFixed(1)}}%`;
   if (summaryEl) {{
     summaryEl.textContent = `window: ${{Number(c.window_minutes || 0)}} min, samples: ${{Number(c.samples || 0)}}. ` +
-      `signals -> cpu:${{c.signals?.cpu || '-'}}, mem:${{c.signals?.memory || '-'}}, disk:${{c.signals?.disk || '-'}}, concurrency:${{c.signals?.concurrency || '-'}}.`;
+      `signals -> cpu:${{signals.cpu || '-'}}, mem:${{signals.memory || '-'}}, disk:${{signals.disk || '-'}}, concurrency:${{signals.concurrency || '-'}}.`;
   }}
   renderConfigRuntime(c);
 }}
@@ -4074,14 +4092,14 @@ function renderConfigRuntime(c) {{
       <td>${{ramTotal.toFixed(2)}} GB</td>
       <td>${{ramUsed.toFixed(2)}} GB (${{Number(usage.ram_current_pct || 0).toFixed(1)}}%)</td>
       <td>${{ramLeft.toFixed(2)}} GB</td>
-      <td>${{signalBadge(ramState)}} · p95: ${{Number(c.p95?.mem_pct || 0).toFixed(1)}}%</td>
+      <td>${{signalBadge(ramState)}} · p95: ${{Number(((c.p95 || {{}}).mem_pct) || 0).toFixed(1)}}%</td>
     </tr>
     <tr>
       <td><b>Storage</b></td>
       <td>${{diskTotal.toFixed(2)}} GB</td>
       <td>${{diskUsed.toFixed(2)}} GB (${{Number(usage.disk_current_pct || 0).toFixed(1)}}%)</td>
       <td>${{diskLeft.toFixed(2)}} GB</td>
-      <td>${{signalBadge(diskState)}} · p95: ${{Number(c.p95?.disk_pct || 0).toFixed(1)}}%</td>
+      <td>${{signalBadge(diskState)}} · p95: ${{Number(((c.p95 || {{}}).disk_pct) || 0).toFixed(1)}}%</td>
     </tr>
     <tr>
       <td><b>Traffic (month)</b></td>
