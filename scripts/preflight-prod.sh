@@ -175,15 +175,23 @@ is_valid_port "${WG_PORT}" || die "Invalid WG_PORT=${WG_PORT}"
 
 [ "${CADDY_HTTPS_PORT}" != "${XRAY_PORT}" ] || die "CADDY_HTTPS_PORT and XRAY_PORT cannot be equal on same host."
 [ -f wireguard/conf/wg0.conf ] || die "wireguard/conf/wg0.conf is missing."
-[ -f xray/config.json ] || die "xray/config.json is missing."
-[ -f xray/client-connection.txt ] || die "xray/client-connection.txt is missing."
 [ -f "caddy/${CADDYFILE_PATH}" ] || die "Caddy file is missing: caddy/${CADDYFILE_PATH}"
+
+# Auto-generate Xray REALITY artifacts for fresh servers (out-of-box bootstrap).
+if [ ! -f xray/config.json ] || [ ! -f xray/client-connection.txt ]; then
+  log "xray artifacts are missing, generating REALITY config..."
+  SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-${VPN_PANEL_DOMAIN}}" XRAY_PORT="${XRAY_PORT}" bash ./scripts/setup-xray-reality.sh
+fi
 
 # Catch UI route regressions before deployment.
 assert_caddy_route_present "/admin" "caddy/${CADDYFILE_PATH}"
 assert_caddy_route_present "/about" "caddy/${CADDYFILE_PATH}"
 assert_caddy_route_present "/license" "caddy/${CADDYFILE_PATH}"
-assert_xray_reality_prod_config "xray/config.json" "xray/client-connection.txt"
+if ! assert_xray_reality_prod_config "xray/config.json" "xray/client-connection.txt"; then
+  log "xray config is invalid for production, regenerating REALITY config..."
+  SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-${VPN_PANEL_DOMAIN}}" XRAY_PORT="${XRAY_PORT}" bash ./scripts/setup-xray-reality.sh
+  assert_xray_reality_prod_config "xray/config.json" "xray/client-connection.txt"
+fi
 
 if command -v getent >/dev/null 2>&1; then
   if ! getent ahostsv4 "${VPN_PANEL_DOMAIN}" >/dev/null 2>&1; then
