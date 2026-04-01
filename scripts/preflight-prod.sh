@@ -38,6 +38,62 @@ assert_caddy_route_present() {
   die "${file} is missing required route matcher for ${route}"
 }
 
+assert_xray_reality_prod_config() {
+  local config_path="$1"
+  local client_info_path="$2"
+  python3 - "$config_path" "$client_info_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+cfg_path = Path(sys.argv[1])
+info_path = Path(sys.argv[2])
+if not cfg_path.exists():
+    print(f"ERROR: xray config missing: {cfg_path}")
+    raise SystemExit(1)
+
+try:
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"ERROR: invalid xray json at {cfg_path}: {exc}")
+    raise SystemExit(1)
+
+inbounds = cfg.get("inbounds") or []
+ok = False
+for item in inbounds:
+    if not isinstance(item, dict):
+        continue
+    if str(item.get("protocol", "")).lower() != "vless":
+        continue
+    ss = item.get("streamSettings") or {}
+    if str(ss.get("security", "")).lower() != "reality":
+        continue
+    rs = ss.get("realitySettings") or {}
+    if rs.get("privateKey") and rs.get("shortIds") and rs.get("serverNames"):
+        ok = True
+        break
+
+if not ok:
+    print("ERROR: xray/config.json is not a production REALITY config.")
+    print("Run: SERVER_PUBLIC_IP=<your-domain-or-ip> bash ./scripts/setup-xray-reality.sh")
+    raise SystemExit(1)
+
+if not info_path.exists():
+    print(f"ERROR: xray client template missing: {info_path}")
+    print("Run: SERVER_PUBLIC_IP=<your-domain-or-ip> bash ./scripts/setup-xray-reality.sh")
+    raise SystemExit(1)
+
+text = info_path.read_text(encoding="utf-8", errors="ignore")
+required = ("Security: reality", "Public key:", "Short ID:")
+missing = [x for x in required if x not in text]
+if missing:
+    print("ERROR: xray/client-connection.txt is incomplete for REALITY.")
+    print("Missing:", ", ".join(missing))
+    print("Run: SERVER_PUBLIC_IP=<your-domain-or-ip> bash ./scripts/setup-xray-reality.sh")
+    raise SystemExit(1)
+PY
+}
+
 read_secret_value() {
   local raw="${1:-}"
   local file_path="${2:-}"
@@ -120,12 +176,14 @@ is_valid_port "${WG_PORT}" || die "Invalid WG_PORT=${WG_PORT}"
 [ "${CADDY_HTTPS_PORT}" != "${XRAY_PORT}" ] || die "CADDY_HTTPS_PORT and XRAY_PORT cannot be equal on same host."
 [ -f wireguard/conf/wg0.conf ] || die "wireguard/conf/wg0.conf is missing."
 [ -f xray/config.json ] || die "xray/config.json is missing."
+[ -f xray/client-connection.txt ] || die "xray/client-connection.txt is missing."
 [ -f "caddy/${CADDYFILE_PATH}" ] || die "Caddy file is missing: caddy/${CADDYFILE_PATH}"
 
 # Catch UI route regressions before deployment.
 assert_caddy_route_present "/admin" "caddy/${CADDYFILE_PATH}"
 assert_caddy_route_present "/about" "caddy/${CADDYFILE_PATH}"
 assert_caddy_route_present "/license" "caddy/${CADDYFILE_PATH}"
+assert_xray_reality_prod_config "xray/config.json" "xray/client-connection.txt"
 
 if command -v getent >/dev/null 2>&1; then
   if ! getent ahostsv4 "${VPN_PANEL_DOMAIN}" >/dev/null 2>&1; then

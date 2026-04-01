@@ -80,14 +80,20 @@ check_prod_route_not_fallback() {
   local url="https://${VPN_PANEL_DOMAIN}${route}"
   local tmp_file=""
   local code=""
+  local code_num=0
   local body=""
   local attempt=1
   while [ "${attempt}" -le 10 ]; do
     tmp_file="$(mktemp)"
-    code="$(curl -ksS --max-time 10 -o "${tmp_file}" -w "%{http_code}" "${url}" || printf '000')"
+    code="$(curl -ksS --max-time 10 -o "${tmp_file}" -w "%{http_code}" "${url}" || true)"
     body="$(tr -d '\r' < "${tmp_file}" || true)"
     rm -f "${tmp_file}" || true
-    if [ "${code}" != "000" ] && [ "${code}" -lt 500 ] && [[ "${body}" != *"proxy-vpn panel"* ]]; then
+    if [[ "${code}" =~ ^[0-9]{3}$ ]]; then
+      code_num=$((10#${code}))
+    else
+      code_num=0
+    fi
+    if [ "${code_num}" -ge 200 ] && [ "${code_num}" -lt 500 ] && [[ "${body}" != *"proxy-vpn panel"* ]]; then
       log "Smoke route OK: ${route} (HTTP ${code})"
       return 0
     fi
