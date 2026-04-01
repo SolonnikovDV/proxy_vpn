@@ -186,6 +186,14 @@ jobs:
             else
               echo 'Using server-side .env (RENDER_ENV_FROM_CI=0)'
             fi
+            if [ ! -f wireguard/conf/wg0.conf ]; then
+              echo 'wireguard/conf/wg0.conf is missing, generating WireGuard config...'
+              SERVER_PUBLIC_IP='${VPN_PANEL_DOMAIN}' WG_PORT='${WG_PORT}' bash ./scripts/setup-wireguard.sh
+            fi
+            if [ ! -f xray/config.json ]; then
+              echo 'xray/config.json is missing, generating Xray REALITY config...'
+              SERVER_PUBLIC_IP='${VPN_PANEL_DOMAIN}' XRAY_PORT='${XRAY_PORT}' bash ./scripts/setup-xray-reality.sh
+            fi
             bash ./scripts/preflight-prod.sh
           "
 
