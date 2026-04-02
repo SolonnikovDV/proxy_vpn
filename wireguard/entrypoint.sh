@@ -11,6 +11,12 @@ wg-quick down wg0 2>/dev/null || true
 wg-quick up wg0
 echo "[proxy-vpn] wireguard: wg0 is up"
 
+# Ensure forwarding rules exist even for legacy wg0.conf files
+# that only contain NAT PostUp/PostDown lines.
+iptables -C FORWARD -i wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -j ACCEPT
+iptables -C FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
 # Periodically export real peer counters for API sampler.
 while true; do
   if wg show wg0 dump > /etc/wireguard/wg_dump.txt.tmp 2>/dev/null; then

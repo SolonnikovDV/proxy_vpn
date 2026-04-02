@@ -74,7 +74,11 @@ Address = ${WG_SERVER_CIDR}
 ListenPort = ${WG_PORT}
 PrivateKey = ${SERVER_PRIVATE_KEY}
 PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT
+PostUp = iptables -A FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT
+PostDown = iptables -D FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
 [Peer]
 PublicKey = ${CLIENT_PUBLIC_KEY}
