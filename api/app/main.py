@@ -6035,12 +6035,20 @@ def update_user_profile(request: Request, payload: UserProfileUpdateRequest) -> 
     if payload.password and len(payload.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 chars")
     with _db_connect() as con:
-        exists = con.execute(
-            "SELECT id FROM users WHERE (username = ? OR email = ?) AND id != ?",
-            (username, email, user["id"]),
+        current_row = con.execute(
+            "SELECT username, email FROM users WHERE id = ?",
+            (user["id"],),
         ).fetchone()
-        if exists:
-            raise HTTPException(status_code=409, detail="Username or email is already in use")
+        current_username = str((current_row["username"] if current_row else user.get("username", "")) or "").strip().lower()
+        current_email = str((current_row["email"] if current_row else user.get("email", "")) or "").strip().lower()
+        changed_identity = (username != current_username) or (email != current_email)
+        if changed_identity:
+            exists = con.execute(
+                "SELECT id FROM users WHERE (username = ? OR email = ?) AND id != ?",
+                (username, email, user["id"]),
+            ).fetchone()
+            if exists:
+                raise HTTPException(status_code=409, detail="Username or email is already in use")
         if payload.password:
             con.execute(
                 """
