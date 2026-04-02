@@ -120,14 +120,83 @@ run_prod() {
   export XRAY_PORT="${XRAY_PORT:-8443}"
   export WG_PORT="${WG_PORT:-51820}"
   export PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
-  prod_up_stack() {
-    if [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ]; then
-      log "Safe rebuild mode: preserving active VPN tunnels (xray/wireguard are not rebuilt by default)."
-      dc -f compose.yaml -f compose.prod.yaml up -d --build api security-guard caddy
+  export VPN_CORE_REBUILD_MODE="${VPN_CORE_REBUILD_MODE:-auto}" # auto | always | never
+  export PROD_DEPLOY_SHA_FILE="${PROD_DEPLOY_SHA_FILE:-logs/last-prod-up.sha}"
+  mkdir -p "$(dirname "${PROD_DEPLOY_SHA_FILE}")"
+  vpn_core_rebuild_required_for_range() {
+    local from_ref="$1"
+    local to_ref="$2"
+    local changed
+    changed="$(git diff --name-only "${from_ref}..${to_ref}" 2>/dev/null || true)"
+    [ -z "${changed}" ] && return 1
+    while IFS= read -r path; do
+      [ -z "${path}" ] && continue
+      case "${path}" in
+        xray/*|wireguard/*|compose.yaml|compose.prod.yaml|Caddyfile.prod|Caddyfile.dev|scripts/setup-xray-reality.sh|scripts/setup-wireguard.sh|scripts/preflight-prod.sh)
+          return 0
+          ;;
+      esac
+    done <<EOF
+${changed}
+EOF
+    return 1
+  }
+  detect_vpn_core_rebuild_flag() {
+    case "${VPN_CORE_REBUILD_MODE}" in
+      always)
+        printf '1'
+        return 0
+        ;;
+      never)
+        printf '0'
+        return 0
+        ;;
+      auto) ;;
+      *)
+        die "Unknown VPN_CORE_REBUILD_MODE=${VPN_CORE_REBUILD_MODE}. Use auto|always|never."
+        ;;
+    esac
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      printf '0'
+      return 0
+    fi
+    local current_sha previous_sha
+    current_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+    previous_sha="$( [ -f "${PROD_DEPLOY_SHA_FILE}" ] && tr -d '\r\n' < "${PROD_DEPLOY_SHA_FILE}" || true )"
+    if [ -z "${previous_sha}" ] || [ -z "${current_sha}" ] || [ "${previous_sha}" = "${current_sha}" ]; then
+      printf '0'
+      return 0
+    fi
+    if vpn_core_rebuild_required_for_range "${previous_sha}" "${current_sha}"; then
+      printf '1'
+    else
+      printf '0'
+    fi
+  }
+  ensure_vpn_core_running() {
+    # Do not recreate xray/wireguard in safe mode; only start them if stopped.
+    if ! dc -f compose.yaml -f compose.prod.yaml start xray wireguard >/dev/null 2>&1; then
       dc -f compose.yaml -f compose.prod.yaml up -d xray wireguard
+    fi
+  }
+  prod_up_stack() {
+    local vpn_core_rebuild
+    vpn_core_rebuild="$(detect_vpn_core_rebuild_flag)"
+    if [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${vpn_core_rebuild}" != "1" ]; then
+      log "Safe mode: no VPN core changes detected; preserving active VPN tunnels."
+      dc -f compose.yaml -f compose.prod.yaml up -d --build api security-guard caddy
+      ensure_vpn_core_running
+    elif [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${vpn_core_rebuild}" = "1" ]; then
+      log "VPN core changes detected; rebuilding full stack (including xray/wireguard)."
+      dc -f compose.yaml -f compose.prod.yaml up -d --build
     else
       log "Full rebuild mode: rebuilding all services including VPN core."
       dc -f compose.yaml -f compose.prod.yaml up -d --build
+    fi
+  }
+  mark_prod_deploy_sha() {
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      git rev-parse HEAD > "${PROD_DEPLOY_SHA_FILE}" 2>/dev/null || true
     fi
   }
   case "${ACTION}" in
@@ -137,6 +206,7 @@ run_prod() {
       dc -f compose.yaml -f compose.prod.yaml up -d --force-recreate caddy
       run_prod_smoke_checks
       dc -f compose.yaml -f compose.prod.yaml ps
+      mark_prod_deploy_sha
       log "Production URLs:"
       log "  https://${VPN_PANEL_DOMAIN}/"
       log "  https://${VPN_PANEL_DOMAIN}/login"
@@ -157,6 +227,7 @@ run_prod() {
       dc -f compose.yaml -f compose.prod.yaml up -d --force-recreate caddy
       run_prod_smoke_checks
       dc -f compose.yaml -f compose.prod.yaml ps
+      mark_prod_deploy_sha
       log "Production URLs:"
       log "  https://${VPN_PANEL_DOMAIN}/"
       log "  https://${VPN_PANEL_DOMAIN}/login"

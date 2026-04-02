@@ -233,6 +233,15 @@ bash ./scripts/run.sh prod up
 By default, production rebuild uses safe mode to preserve active VPN tunnels:
 - `PRESERVE_VPN_CORE_ON_REBUILD=1` (default): rebuilds `api/caddy/security-guard`, keeps `xray/wireguard` running.
 - `PRESERVE_VPN_CORE_ON_REBUILD=0`: full rebuild of all services (may interrupt active VPN sessions).
+- `VPN_CORE_REBUILD_MODE=auto` (default): rebuild VPN core only when git diff touches VPN core logic/files (`xray/*`, `wireguard/*`, related compose/setup/preflight files).
+- `VPN_CORE_REBUILD_MODE=always`: always rebuild VPN core.
+- `VPN_CORE_REBUILD_MODE=never`: never rebuild VPN core (edge services only + start if core is stopped).
+
+Xray endpoint mismatch troubleshooting (`:443` vs `:8443`):
+- common issue: old client profile remains on `:443` while active service endpoint is `:8443`
+- symptom: client may look connected, but sites do not open
+- fix: open `/cabinet` -> `Device setup`, copy/import fresh `Config URI` and reconnect
+- in user UI, open `/cabinet` -> `Troubleshooting` -> `Run checks` to see expected endpoint/port and recovery steps for your selected device/platform
 
 ## GitHub Secrets/Variables deploy
 

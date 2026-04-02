@@ -2392,7 +2392,7 @@ def _strip_peer_blocks(lines: list[str]) -> list[str]:
     return out
 
 
-def _sync_wireguard_server_peers() -> None:
+def _sync_wireguard_server_peers(force_apply_empty: bool = True) -> None:
     tpl = _parse_wireguard_client_template()
     with _db_connect() as con:
         rows = con.execute(
@@ -2406,6 +2406,10 @@ def _sync_wireguard_server_peers() -> None:
     for r in rows:
         allowed_ip = _allocate_wireguard_client_address(int(r["user_id"]), tpl.get("template_address", "10.13.0.2/32"))
         peers.append({"public_key": str(r["public_key"]), "allowed_ip": allowed_ip})
+    if not peers and not bool(force_apply_empty):
+        # Non-destructive mode (used on startup): do not wipe existing runtime/config peers
+        # when managed bindings are not yet available.
+        return
     cfg_path = Path(WG_SERVER_CONFIG_PATH)
     if not cfg_path.exists():
         raise HTTPException(status_code=503, detail=f"WireGuard server config is missing: {WG_SERVER_CONFIG_PATH}")
@@ -4222,9 +4226,15 @@ def startup() -> None:
     _start_metrics_sampler_once()
     # Re-apply managed WG peers on API startup so tunnel state survives service rebuilds.
     try:
-        _sync_wireguard_server_peers()
+        _sync_wireguard_server_peers(force_apply_empty=False)
     except Exception as e:
         print(f"[startup] WARN: cannot sync WireGuard peers on startup: {e}")
+    # Warm up Xray/WG binding maps right after startup so paired state doesn't drift
+    # during the first sampler window after rebuild.
+    try:
+        _refresh_user_traffic_samples_once()
+    except Exception as e:
+        print(f"[startup] WARN: initial traffic/binding refresh failed: {e}")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -4558,6 +4568,7 @@ def cabinet(request: Request) -> HTMLResponse:
     <button class="tab-btn" data-cab-section-btn="profile">User card</button>
     <button class="tab-btn" data-cab-section-btn="device">Device setup</button>
     <button class="tab-btn" data-cab-section-btn="traffic">Traffic and resources</button>
+    <button class="tab-btn" data-cab-section-btn="troubleshooting">Troubleshooting</button>
   </div>
 </div>
 <div class="card cab-section" data-cab-section="profile">
@@ -4616,6 +4627,16 @@ def cabinet(request: Request) -> HTMLResponse:
     <canvas id="cab-traffic-canvas" width="900" height="220" style="width:100%;max-width:100%;border:1px solid rgba(100,116,139,0.2);border-radius:10px;background:rgba(255,255,255,0.6);"></canvas>
   </div>
 </div>
+<div class="card cab-section" data-cab-section="troubleshooting">
+  <h2>Troubleshooting</h2>
+  <p class="muted" style="margin:0 0 8px;">
+    If profile connects but websites do not open, first verify endpoint/port and re-import profile when needed.
+  </p>
+  <div style="margin-bottom:8px;">
+    <button data-action="load-troubleshooting">Run checks</button>
+  </div>
+  <div id="cab-troubleshooting-out" class="muted">Press "Run checks" to load current troubleshooting hints.</div>
+</div>
 <div id="edit-profile-modal" class="modal-backdrop">
   <div class="modal-card">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
@@ -4655,6 +4676,8 @@ function showCabSection(section) {{
     loadCabinetTraffic();
   }} else if (s === 'device') {{
     initDeviceCard();
+  }} else if (s === 'troubleshooting') {{
+    loadCabinetTroubleshooting();
   }}
 }}
 function openEditProfileModal() {{
@@ -4712,6 +4735,15 @@ function renderDeviceCard(card) {{
   const wgQuickJsonUrl = escHtml(wgQuick.json_url || '');
   const wgQuickDownloadUrl = escHtml(wgQuick.download_url || '');
   const fields = card.config_fields || {{}};
+  const xrayPort = String(fields.port || '').trim();
+  const xrayPortNotice = (xrayPort && xrayPort !== '443')
+    ? `
+      <div style="margin-top:8px;padding:8px 10px;border-radius:10px;border:1px solid rgba(245,158,11,0.35);background:rgba(245,158,11,0.10);">
+        <b>Important:</b> this server uses Xray port <code>${{escHtml(xrayPort)}}</code>. Old client profiles on <code>443</code> may show "connected" but no traffic.
+        Re-import Config URI from this card and reconnect.
+      </div>
+    `
+    : '';
   const wgFields = card.wireguard_manual_fields || {{}};
   const xrayFieldPairs = [
     ['Address', fields.server],
@@ -4803,6 +4835,7 @@ function renderDeviceCard(card) {{
       <p class="muted">Protocol: <b>${{escHtml(card.protocol || '-')}}</b> · Recommended app: <b>${{clientName}}</b></p>
       <p class="muted" style="margin:6px 0 8px;">${{escHtml(card.client_about || 'Free client for importing VLESS URI and connecting in VPN/proxy mode.')}}</p>
       <div class="user-meta-row"><div class="label-muted">Config URI</div><div><code id="cfg-uri" style="word-break:break-all;">${{escHtml(card.config_uri || '')}}</code></div></div>
+      ${{xrayPortNotice}}
       <div style="margin-top:8px;">
         <button class="btn-ghost" data-action="copy-config-uri">Copy URI</button>
       </div>
@@ -4842,6 +4875,45 @@ function renderDeviceCard(card) {{
       }});
     }});
   }});
+}}
+async function loadCabinetTroubleshooting() {{
+  const out = document.getElementById('cab-troubleshooting-out');
+  if (!out) return;
+  out.textContent = 'Loading checks...';
+  const type = String((document.getElementById('dev-type') || {{}}).value || 'mobile');
+  const platform = String((document.getElementById('dev-platform') || {{}}).value || 'apple');
+  const region = String((document.getElementById('dev-region') || {{}}).value || 'ru');
+  try {{
+    const r = await fetch('/api/v1/user/device-config?device_type=' + encodeURIComponent(type) + '&platform=' + encodeURIComponent(platform) + '&region_profile=' + encodeURIComponent(region));
+    const t = await r.text();
+    if (!r.ok) {{
+      out.innerHTML = '<pre>' + escHtml(t) + '</pre>';
+      return;
+    }}
+    let j = null;
+    try {{ j = JSON.parse(t); }} catch (e) {{ j = null; }}
+    const fields = (((j || {{}}).card || {{}}).config_fields || {{}});
+    const host = String(fields.server || '').trim();
+    const port = String(fields.port || '').trim();
+    const portMismatchRisk = (port && port !== '443');
+    const checks = [
+      `<li><b>Expected Xray endpoint:</b> <code>${{escHtml(host)}}:${{escHtml(port || '8443')}}</code>.</li>`,
+      portMismatchRisk
+        ? '<li><b>Port mismatch risk:</b> old profiles often stay on <code>443</code>, while your current service uses another port. Re-import fresh Config URI from Device setup.</li>'
+        : '<li><b>Port check:</b> service uses <code>443</code> for Xray endpoint.</li>',
+      '<li><b>Quick recovery:</b> remove old Xray profile in client, import new URI from Device setup, reconnect tunnel, then retry <code>https://ifconfig.me</code>.</li>',
+      '<li><b>If connected but no pages:</b> verify client routing mode is Proxy/VPN (not bypass), then reconnect tunnel.</li>',
+      '<li><b>WireGuard paired mode:</b> if fallback is recommended, switch to WG client and confirm active protocol in cabinet.</li>',
+    ];
+    out.innerHTML = `
+      <div style="padding:10px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);">
+        <div><b>Current checks for ${{escHtml(type)}}/${{escHtml(platform)}}:</b></div>
+        <ul style="margin:8px 0 0 14px;padding:0;">${{checks.join('')}}</ul>
+      </div>
+    `;
+  }} catch (e) {{
+    out.innerHTML = '<pre>' + escHtml(String(e && e.message ? e.message : e)) + '</pre>';
+  }}
 }}
 function fmtBytes(v) {{
   const n = Number(v || 0);
@@ -5274,13 +5346,16 @@ document.getElementById('dev-type').addEventListener('change', () => {{
   refreshPlatformOptions();
   ensureWireGuardLabel(true);
   loadDeviceCard();
+  loadCabinetTroubleshooting();
 }});
 document.getElementById('dev-region').addEventListener('change', () => {{
   loadDeviceCard();
+  loadCabinetTroubleshooting();
 }});
 document.getElementById('dev-platform').addEventListener('change', () => {{
   ensureWireGuardLabel(true);
   loadDeviceCard();
+  loadCabinetTroubleshooting();
   loadCabinetTraffic();
 }});
 document.addEventListener('click', (event) => {{
@@ -5311,6 +5386,7 @@ document.addEventListener('click', (event) => {{
   if (action === 'show-switch-guide') return void showSwitchGuideNow();
   if (action === 'show-wg-quick-config') return void showWireGuardQuickConfig(btn.getAttribute('data-url') || '');
   if (action === 'copy-config-uri') return void copyConfigUri();
+  if (action === 'load-troubleshooting') return void loadCabinetTroubleshooting();
   if (action === 'copy-value') {{
     const encoded = String(btn.getAttribute('data-copy-value') || '');
     return void navigator.clipboard.writeText(decodeURIComponent(encoded));
@@ -5327,6 +5403,7 @@ const savedCabSection = (() => {{
 }})();
 showCabSection(savedCabSection || 'profile');
 initDeviceCard();
+loadCabinetTroubleshooting();
 loadCabinetTraffic();
 setInterval(loadCabinetTraffic, 30000);
 </script>

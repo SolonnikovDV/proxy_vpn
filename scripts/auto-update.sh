@@ -127,6 +127,25 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   die "Current directory is not a git repository"
 fi
 
+vpn_core_rebuild_required_for_range() {
+  local from_ref="$1"
+  local to_ref="$2"
+  local changed
+  changed="$(git diff --name-only "${from_ref}..${to_ref}" 2>/dev/null || true)"
+  [ -z "${changed}" ] && return 1
+  while IFS= read -r path; do
+    [ -z "${path}" ] && continue
+    case "${path}" in
+      xray/*|wireguard/*|compose.yaml|compose.prod.yaml|Caddyfile.prod|Caddyfile.dev|scripts/setup-xray-reality.sh|scripts/setup-wireguard.sh|scripts/preflight-prod.sh)
+        return 0
+        ;;
+    esac
+  done <<EOF
+${changed}
+EOF
+  return 1
+}
+
 release_info_for_ref() {
   local ref="$1"
   local fallback_sha="${2:-na}"
@@ -436,10 +455,27 @@ deploy_current() {
     log "Running production preflight"
     bash ./scripts/preflight-prod.sh
     PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
-    if [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ]; then
-      log "Rebuilding app edge only (safe mode, preserves active VPN tunnels)"
+    VPN_CORE_REBUILD_MODE="${VPN_CORE_REBUILD_MODE:-auto}" # auto | always | never
+    vpn_core_rebuild="0"
+    case "${VPN_CORE_REBUILD_MODE}" in
+      always) vpn_core_rebuild="1" ;;
+      never) vpn_core_rebuild="0" ;;
+      auto)
+        if vpn_core_rebuild_required_for_range "${LOCAL_SHA}" "${REMOTE_SHA}"; then
+          vpn_core_rebuild="1"
+        fi
+        ;;
+      *) die "Unknown VPN_CORE_REBUILD_MODE=${VPN_CORE_REBUILD_MODE}. Use auto|always|never." ;;
+    esac
+    if [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${vpn_core_rebuild}" != "1" ]; then
+      log "Safe mode: no VPN core changes detected; rebuilding edge only."
       dc -f compose.yaml -f compose.prod.yaml up -d --build api security-guard caddy
-      dc -f compose.yaml -f compose.prod.yaml up -d xray wireguard
+      if ! dc -f compose.yaml -f compose.prod.yaml start xray wireguard >/dev/null 2>&1; then
+        dc -f compose.yaml -f compose.prod.yaml up -d xray wireguard
+      fi
+    elif [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${vpn_core_rebuild}" = "1" ]; then
+      log "VPN core changes detected; rebuilding full stack (including xray/wireguard)."
+      dc -f compose.yaml -f compose.prod.yaml up -d --build
     else
       log "Rebuilding/restarting full production stack"
       dc -f compose.yaml -f compose.prod.yaml up -d --build
@@ -460,9 +496,25 @@ rollback_to_previous() {
   git checkout -f "${LOCAL_SHA}"
   if [ "${MODE}" = "prod" ]; then
     PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
-    if [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ]; then
+    VPN_CORE_REBUILD_MODE="${VPN_CORE_REBUILD_MODE:-auto}" # auto | always | never
+    rollback_vpn_core_rebuild="0"
+    case "${VPN_CORE_REBUILD_MODE}" in
+      always) rollback_vpn_core_rebuild="1" ;;
+      never) rollback_vpn_core_rebuild="0" ;;
+      auto)
+        if vpn_core_rebuild_required_for_range "${LOCAL_SHA}" "${REMOTE_SHA}"; then
+          rollback_vpn_core_rebuild="1"
+        fi
+        ;;
+      *) die "Unknown VPN_CORE_REBUILD_MODE=${VPN_CORE_REBUILD_MODE}. Use auto|always|never." ;;
+    esac
+    if [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${rollback_vpn_core_rebuild}" != "1" ]; then
       dc -f compose.yaml -f compose.prod.yaml up -d --build api security-guard caddy
-      dc -f compose.yaml -f compose.prod.yaml up -d xray wireguard
+      if ! dc -f compose.yaml -f compose.prod.yaml start xray wireguard >/dev/null 2>&1; then
+        dc -f compose.yaml -f compose.prod.yaml up -d xray wireguard
+      fi
+    elif [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${rollback_vpn_core_rebuild}" = "1" ]; then
+      dc -f compose.yaml -f compose.prod.yaml up -d --build
     else
       dc -f compose.yaml -f compose.prod.yaml up -d --build
     fi
