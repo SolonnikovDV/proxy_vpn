@@ -5986,6 +5986,11 @@ function showSection(section, preferredSubsection = '') {{
   renderSubtabs(section);
   showSubsection(section, selected);
   refreshAdminLive();
+  if (section === 'configurator') {{
+    loadConfigurator();
+  }} else if (section === 'whitelist') {{
+    loadProxyBypass();
+  }}
 }}
 const fmtBytes = (n) => {{
   if (!Number.isFinite(n)) return '-';
@@ -7065,7 +7070,7 @@ function renderConfigurator(config) {{
 async function loadConfigurator() {{
   const out = document.getElementById('cfg-out');
   if (out) out.textContent = 'Loading...';
-  const r = await fetch('/api/v1/admin/configurator');
+  const r = await fetch('/api/v1/admin/configurator?ts=' + Date.now(), {{ cache: 'no-store' }});
   const txt = await r.text();
   if (!r.ok) {{
     if (out) out.textContent = txt;
@@ -7121,7 +7126,7 @@ async function applyConfigurator() {{
 async function loadProxyBypass() {{
   const out = getBypassOutEl();
   if (out) out.textContent = 'Loading whitelist...';
-  const r = await fetch('/api/v1/admin/configurator/proxy-bypass');
+  const r = await fetch('/api/v1/admin/configurator/proxy-bypass?ts=' + Date.now(), {{ cache: 'no-store' }});
   const txt = await r.text();
   if (!r.ok) {{
     if (out) out.textContent = txt;
@@ -7167,21 +7172,22 @@ async function applyProxyBypass() {{
   await refreshAdminLive();
 }}
 async function refreshAdminLive() {{
+  const nc = () => 'ts=' + Date.now() + '&r=' + Math.random().toString(36).slice(2, 8);
   const [statsR, onlineR, tsR, trafficR, servicesR, deployEventsR, updateAuditR, capacityR, backupStatusR, securityEventsR, securityBlockedR, pairedR, wgBindingsR, xrayBindingsR] = await Promise.all([
-    fetch('/api/v1/admin/stats'),
-    fetch('/api/v1/admin/online-users'),
-    fetch('/api/v1/admin/system-metrics/timeseries?minutes=60'),
-    fetch('/api/v1/admin/user-traffic/summary?hours=24'),
-    fetch('/api/v1/admin/services/status'),
-    fetch('/api/v1/admin/deploy-events?limit=12'),
-    fetch('/api/v1/admin/update-audit?' + buildUpdateAuditQuery()),
-    fetch('/api/v1/admin/capacity-status?window_minutes=60'),
-    fetch('/api/v1/admin/backup-status'),
-    fetch('/api/v1/admin/security/events?limit=120'),
-    fetch('/api/v1/admin/security/blocked?limit=120'),
-    fetch('/api/v1/admin/paired-status'),
-    fetch('/api/v1/admin/wireguard-bindings'),
-    fetch('/api/v1/admin/xray-bindings')
+    fetch('/api/v1/admin/stats?' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/online-users?' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/system-metrics/timeseries?minutes=60&' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/user-traffic/summary?hours=24&' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/services/status?' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/deploy-events?limit=12&' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/update-audit?' + buildUpdateAuditQuery() + '&' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/capacity-status?window_minutes=60&' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/backup-status?' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/security/events?limit=120&' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/security/blocked?limit=120&' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/paired-status?' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/wireguard-bindings?' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/xray-bindings?' + nc(), {{ cache: 'no-store' }})
   ]);
   if (statsR.ok) {{
     const s = (await statsR.json()).stats || {{}};
