@@ -461,7 +461,7 @@ deploy_current() {
     PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
     XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT:-${XRAY_PORT:-8443}}"
     WG_CLIENT_PORT="${WG_CLIENT_PORT:-${WG_PORT:-51820}}"
-    VPN_CORE_REBUILD_MODE="${VPN_CORE_REBUILD_MODE:-auto}" # auto | always | never
+    VPN_CORE_REBUILD_MODE="${VPN_CORE_REBUILD_MODE:-never}" # auto | always | never
     vpn_core_rebuild="0"
     case "${VPN_CORE_REBUILD_MODE}" in
       always) vpn_core_rebuild="1" ;;
@@ -480,7 +480,7 @@ deploy_current() {
         dc -f compose.yaml -f compose.prod.yaml up -d xray wireguard
       fi
     elif [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${vpn_core_rebuild}" = "1" ]; then
-      log "VPN core changes detected; rebuilding full stack (including xray/wireguard)."
+      log "VPN core rebuild explicitly enabled; rebuilding full stack (including xray/wireguard)."
       dc -f compose.yaml -f compose.prod.yaml up -d --build
     else
       log "Rebuilding/restarting full production stack"
@@ -510,7 +510,7 @@ rollback_to_previous() {
     PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
     XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT:-${XRAY_PORT:-8443}}"
     WG_CLIENT_PORT="${WG_CLIENT_PORT:-${WG_PORT:-51820}}"
-    VPN_CORE_REBUILD_MODE="${VPN_CORE_REBUILD_MODE:-auto}" # auto | always | never
+    VPN_CORE_REBUILD_MODE="${VPN_CORE_REBUILD_MODE:-never}" # auto | always | never
     rollback_vpn_core_rebuild="0"
     case "${VPN_CORE_REBUILD_MODE}" in
       always) rollback_vpn_core_rebuild="1" ;;

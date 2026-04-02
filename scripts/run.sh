@@ -113,7 +113,9 @@ run_prod_smoke_checks() {
 run_prod() {
   bash ./scripts/sync-env.sh prod
   chmod +x ./scripts/write-release-state.sh >/dev/null 2>&1 || true
-  bash ./scripts/write-release-state.sh >/dev/null 2>&1 || true
+  if ! bash ./scripts/write-release-state.sh; then
+    log "WARN: failed to refresh release metadata file (logs/app-release-state.json)."
+  fi
   set -a
   . ./.env
   set +a
@@ -124,7 +126,7 @@ run_prod() {
   export XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT:-${XRAY_PORT}}"
   export WG_CLIENT_PORT="${WG_CLIENT_PORT:-${WG_PORT}}"
   export PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
-  export VPN_CORE_REBUILD_MODE="${VPN_CORE_REBUILD_MODE:-auto}" # auto | always | never
+  export VPN_CORE_REBUILD_MODE="${VPN_CORE_REBUILD_MODE:-never}" # auto | always | never
   export PROD_DEPLOY_SHA_FILE="${PROD_DEPLOY_SHA_FILE:-logs/last-prod-up.sha}"
   mkdir -p "$(dirname "${PROD_DEPLOY_SHA_FILE}")"
   vpn_core_rebuild_required_for_range() {
@@ -191,7 +193,7 @@ EOF
       dc -f compose.yaml -f compose.prod.yaml up -d --build api security-guard caddy
       ensure_vpn_core_running
     elif [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${vpn_core_rebuild}" = "1" ]; then
-      log "VPN core changes detected; rebuilding full stack (including xray/wireguard)."
+      log "VPN core rebuild explicitly enabled; rebuilding full stack (including xray/wireguard)."
       dc -f compose.yaml -f compose.prod.yaml up -d --build
     else
       log "Full rebuild mode: rebuilding all services including VPN core."

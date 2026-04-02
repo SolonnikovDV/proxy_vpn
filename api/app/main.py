@@ -1318,6 +1318,47 @@ def _release_metadata_from_repo() -> dict[str, str]:
     }
 
 
+def _infer_current_sha_from_runtime_logs() -> str:
+    # Fallback for production containers where repo metadata may be unavailable.
+    # Prefer update-audit "to" SHA, then deploy-history "to=...".
+    audit_path = Path(UPDATE_AUDIT_PATH)
+    if audit_path.exists():
+        try:
+            lines = audit_path.read_text(encoding="utf-8").splitlines()
+            for raw in reversed(lines[-400:]):
+                line = str(raw or "").strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                to_sha = str(item.get("to", "") or "").strip()
+                if to_sha and to_sha.lower() != "na":
+                    return to_sha
+        except Exception:
+            pass
+    deploy_path = Path(DEPLOY_HISTORY_PATH)
+    if deploy_path.exists():
+        try:
+            lines = deploy_path.read_text(encoding="utf-8").splitlines()
+            for raw in reversed(lines[-400:]):
+                line = str(raw or "").strip()
+                if not line:
+                    continue
+                m = re.search(r"(?:^|\|)to=([0-9a-fA-F]{7,40}|na)(?:\||$)", line)
+                if not m:
+                    continue
+                to_sha = str(m.group(1) or "").strip()
+                if to_sha and to_sha.lower() != "na":
+                    return to_sha
+        except Exception:
+            pass
+    return ""
+
+
 def _default_release_state() -> dict[str, Any]:
     repo_meta = _release_metadata_from_repo()
     return {
@@ -1355,16 +1396,29 @@ def _read_release_state() -> dict[str, Any]:
     repo_meta = _release_metadata_from_repo()
     merged = _default_release_state()["state"]
     merged["current"].update(current)
-    if str(merged["current"].get("version", "") or "").strip().lower() in {"", "unknown"}:
+    if str(merged["current"].get("version", "") or "").strip().lower() in {"", "unknown", "na"}:
         merged["current"]["version"] = repo_meta["version"]
-    if str(merged["current"].get("sha", "") or "").strip().lower() in {"", "na"}:
-        merged["current"]["sha"] = repo_meta["sha"]
-    if str(merged["current"].get("notes", "") or "").strip().lower() in {"", "no release metadata yet."}:
+    cur_sha_val = str(merged["current"].get("sha", "") or "").strip()
+    if cur_sha_val.lower() in {"", "na"}:
+        candidate_sha = repo_meta["sha"]
+        if not candidate_sha or str(candidate_sha).lower() in {"", "na"}:
+            candidate_sha = _infer_current_sha_from_runtime_logs()
+        if candidate_sha:
+            merged["current"]["sha"] = candidate_sha
+    if str(merged["current"].get("notes", "") or "").strip().lower() in {"", "no release metadata yet.", "na"}:
         merged["current"]["notes"] = repo_meta["notes"]
     # Keep build short-sha synchronized when only full sha is present in state file.
     if not str(merged["current"].get("build", "") or "").strip():
         cur_sha = str(merged["current"].get("sha", "") or "").strip()
         merged["current"]["build"] = cur_sha[:7] if cur_sha and cur_sha != "na" else repo_meta["build"]
+    if str(merged["current"].get("version", "") or "").strip().lower() in {"", "unknown", "na"}:
+        cur_build = str(merged["current"].get("build", "") or "").strip()
+        if cur_build and cur_build.lower() != "na":
+            merged["current"]["version"] = cur_build
+    if str(merged["current"].get("build", "") or "").strip().lower() in {"", "na"}:
+        merged["current"]["build"] = "unknown"
+    if str(merged["current"].get("sha", "") or "").strip().lower() in {"", "na"}:
+        merged["current"]["sha"] = "unknown"
     merged["available"] = available if isinstance(available, dict) else None
     merged["update"].update(update)
     return {"status": "ok", "state": merged}
@@ -3827,7 +3881,7 @@ async function refreshGlobalReleaseState() {{
     const available = state.available || null;
     const update = state.update || {{}};
     const currentVersion = String(current.version || 'unknown');
-    const currentBuild = String(current.build || ((current.sha ? String(current.sha).slice(0, 7) : 'na')));
+    const currentBuild = String(current.build || ((current.sha ? String(current.sha).slice(0, 7) : 'unknown')));
     versionEl.textContent = 'version: ' + currentVersion + ' · build: ' + currentBuild;
     if (available && available.version && available.version !== currentVersion) {{
       banner.style.display = 'block';
@@ -4466,7 +4520,7 @@ async function loadAboutState() {{
   const up = s.update || {{}};
   const notes = av && av.notes ? av.notes : (cur.notes || '-');
   const vCur = String(cur.version || 'unknown');
-  const buildCur = String(cur.build || (cur.sha ? String(cur.sha).slice(0, 7) : 'na'));
+  const buildCur = String(cur.build || (cur.sha ? String(cur.sha).slice(0, 7) : 'unknown'));
   const curVersionEl = document.getElementById('about-current-version');
   const curShaEl = document.getElementById('about-current-sha');
   const curAtEl = document.getElementById('about-current-at');
