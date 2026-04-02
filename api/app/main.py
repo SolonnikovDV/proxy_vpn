@@ -59,11 +59,14 @@ DEFAULT_MAX_REGISTERED_USERS = int(os.getenv("MAX_REGISTERED_USERS", "0"))
 DEFAULT_DASHBOARD_REFRESH_SECONDS = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "30"))
 DEFAULT_PROXY_BYPASS_CUSTOM = os.getenv("DEFAULT_PROXY_BYPASS_CUSTOM", "")
 WG_DUMP_PATH = "/wireguard-config/wg_dump.txt"
+WG_SERVER_CONFIG_PATH = "/wireguard-config/wg0.conf"
 XRAY_STATS_PATH = "/xray-config/stats_raw.txt"
 XRAY_CONFIG_PATH = "/xray-config/config.json"
 XRAY_CLIENT_INFO_PATH = "/xray-config/client-connection.txt"
 WG_CLIENT_TEMPLATE_PATH = "/wireguard-config/client1.conf"
 WG_CLIENT_DEFAULT_MTU = os.getenv("WG_CLIENT_DEFAULT_MTU", "1280")
+WG_MANAGED_BEGIN = "# BEGIN PROXY_VPN_MANAGED_PEERS"
+WG_MANAGED_END = "# END PROXY_VPN_MANAGED_PEERS"
 DEPLOY_HISTORY_PATH = os.getenv("DEPLOY_HISTORY_PATH", "/logs/deploy-history.log")
 APP_RELEASE_STATE_PATH = os.getenv("APP_RELEASE_STATE_PATH", "/logs/app-release-state.json")
 UPDATE_CHECK_REQUEST_PATH = os.getenv("UPDATE_CHECK_REQUEST_PATH", "/logs/update-check-request.json")
@@ -1999,8 +2002,13 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
             """,
             (user_id, profile["public_key"], label, now_iso),
         )
+        con.execute(
+            "DELETE FROM wg_peer_bindings WHERE user_id = ? AND public_key != ?",
+            (user_id, profile["public_key"]),
+        )
         _evaluate_user_protocol_state(con, user_id)
         con.commit()
+    _sync_wireguard_server_peers()
     return profile
 
 
@@ -2029,6 +2037,103 @@ def _wireguard_profile_to_conf(profile: dict[str, str]) -> str:
         ]
     )
     return "\n".join(interface_lines + [""] + peer_lines) + "\n"
+
+
+def _extract_peer_keys_from_config_block(lines: list[str]) -> set[str]:
+    keys: set[str] = set()
+    for line in lines:
+        raw = line.strip()
+        if raw.lower().startswith("publickey"):
+            parts = raw.split("=", 1)
+            if len(parts) == 2:
+                key = parts[1].strip()
+                if key:
+                    keys.add(key)
+    return keys
+
+
+def _render_managed_wireguard_peer_block(peers: list[dict[str, str]]) -> list[str]:
+    out = [WG_MANAGED_BEGIN]
+    for item in peers:
+        pub = str(item.get("public_key", "")).strip()
+        ip = str(item.get("allowed_ip", "")).strip()
+        if not pub or not ip:
+            continue
+        out.extend(
+            [
+                "[Peer]",
+                f"PublicKey = {pub}",
+                f"AllowedIPs = {ip}",
+                "",
+            ]
+        )
+    out.append(WG_MANAGED_END)
+    return out
+
+
+def _sync_wireguard_server_peers() -> None:
+    tpl = _parse_wireguard_client_template()
+    with _db_connect() as con:
+        rows = con.execute(
+            """
+            SELECT b.user_id, b.public_key
+            FROM wg_peer_bindings b
+            ORDER BY b.user_id ASC
+            """
+        ).fetchall()
+    peers: list[dict[str, str]] = []
+    for r in rows:
+        allowed_ip = _allocate_wireguard_client_address(int(r["user_id"]), tpl.get("template_address", "10.13.0.2/32"))
+        peers.append({"public_key": str(r["public_key"]), "allowed_ip": allowed_ip})
+    cfg_path = Path(WG_SERVER_CONFIG_PATH)
+    if not cfg_path.exists():
+        raise HTTPException(status_code=503, detail=f"WireGuard server config is missing: {WG_SERVER_CONFIG_PATH}")
+    lines = cfg_path.read_text(encoding="utf-8").splitlines()
+    begin_idx = next((i for i, ln in enumerate(lines) if ln.strip() == WG_MANAGED_BEGIN), -1)
+    end_idx = next((i for i, ln in enumerate(lines) if ln.strip() == WG_MANAGED_END), -1)
+    previous_block: list[str] = []
+    if begin_idx >= 0 and end_idx > begin_idx:
+        previous_block = lines[begin_idx : end_idx + 1]
+        base_lines = lines[:begin_idx] + lines[end_idx + 1 :]
+    else:
+        base_lines = lines[:]
+    while base_lines and not base_lines[-1].strip():
+        base_lines.pop()
+    managed_block = _render_managed_wireguard_peer_block(peers)
+    new_lines = base_lines + [""] + managed_block + [""]
+    cfg_path.write_text("\n".join(new_lines), encoding="utf-8")
+
+    old_keys = _extract_peer_keys_from_config_block(previous_block)
+    new_keys = {str(p["public_key"]) for p in peers if str(p.get("public_key", "")).strip()}
+
+    if docker is None:
+        raise HTTPException(status_code=503, detail="docker SDK unavailable in api container")
+    client = None
+    try:
+        client = docker.from_env()
+        container = client.containers.get("proxy-vpn-wireguard")
+        for key in sorted(old_keys - new_keys):
+            container.exec_run(["wg", "set", "wg0", "peer", key, "remove"], stdout=False, stderr=False)
+        for item in peers:
+            pub = str(item["public_key"]).strip()
+            ip = str(item["allowed_ip"]).strip()
+            if not pub or not ip:
+                continue
+            container.exec_run(
+                ["wg", "set", "wg0", "peer", pub, "allowed-ips", ip],
+                stdout=False,
+                stderr=True,
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to sync WireGuard peers on server: {e}")
+    finally:
+        try:
+            if client is not None:
+                client.close()
+        except Exception:
+            pass
 
 
 def _set_user_wg_public_key(user_id: int, public_key: str) -> None:
@@ -6398,6 +6503,7 @@ def user_register_wireguard_key(request: Request, payload: UserWireGuardKeyReque
         )
         _evaluate_user_protocol_state(con, user_id)
         con.commit()
+    _sync_wireguard_server_peers()
     return JSONResponse({"status": "ok", "message": "WireGuard public key registered and replaced"})
 
 
@@ -7509,6 +7615,10 @@ def admin_wireguard_bind(request: Request, payload: AdminBindWireGuardRequest) -
             (payload.user_id, public_key, payload.label.strip(), _now().isoformat()),
         )
         con.execute(
+            "DELETE FROM wg_peer_bindings WHERE user_id = ? AND public_key != ?",
+            (int(payload.user_id), public_key),
+        )
+        con.execute(
             """
             UPDATE user_access_profiles
             SET wg_public_key = ?, updated_at = ?
@@ -7517,6 +7627,7 @@ def admin_wireguard_bind(request: Request, payload: AdminBindWireGuardRequest) -
             (public_key, _now().isoformat(), int(payload.user_id)),
         )
         con.commit()
+    _sync_wireguard_server_peers()
     return JSONResponse({"status": "ok", "message": "wireguard peer bound"})
 
 
@@ -7535,6 +7646,7 @@ def admin_wireguard_unbind(public_key: str, request: Request) -> JSONResponse:
                 (_now().isoformat(), int(row["user_id"])),
             )
         con.commit()
+    _sync_wireguard_server_peers()
     return JSONResponse({"status": "ok", "message": "wireguard peer unbound"})
 
 
