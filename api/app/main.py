@@ -2874,21 +2874,41 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
         ("/about", "about", "About"),
         ("/docs", "docs", "API docs"),
     ]
+    pending_requests_count = 0
+    if user is not None and str(user.get("role", "")).strip().lower() == "admin":
+        try:
+            with _db_connect() as con:
+                row = con.execute(
+                    "SELECT COUNT(*) c FROM registration_requests WHERE status = 'pending'"
+                ).fetchone()
+                pending_requests_count = int((row["c"] if row else 0) or 0)
+        except Exception:
+            pending_requests_count = 0
+
+    def _nav_label(key: str, label: str) -> str:
+        if key == "admin" and pending_requests_count > 0:
+            return (
+                f"<span>{label}</span>"
+                f"<span id='sidebar-admin-pending-badge' class='status-pill status-pending nav-badge'>{pending_requests_count}</span>"
+            )
+        return f"<span>{label}</span>"
+
     if user is None:
         nav_html = "".join(
             [
-                f'<a class="nav-item {"active" if key == active else ""}" href="{href}">{label}</a>'
+                f'<a class="nav-item {"active" if key == active else ""}" href="{href}">{_nav_label(key, label)}</a>'
                 for href, key, label in nav_items
                 if key in {"login", "docs"}
             ]
         )
         profile_html = "<div class='muted'>Not signed in</div>"
     else:
+        is_admin_user = str(user.get("role", "")).strip().lower() == "admin"
         nav_html = "".join(
             [
-                f'<a class="nav-item {"active" if key == active else ""}" href="{href}">{label}</a>'
+                f'<a class="nav-item {"active" if key == active else ""}" href="{href}">{_nav_label(key, label)}</a>'
                 for href, key, label in nav_items
-                if key != "login"
+                if key != "login" and (is_admin_user or key != "admin")
             ]
         )
         profile_html = (
@@ -3011,6 +3031,10 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       border-radius: 10px;
       border: 1px solid transparent;
       font-size: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
     }}
     .nav-item:hover {{
       background: var(--hover-bg);
@@ -3096,6 +3120,23 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       background: var(--blue);
       color: #fff;
       cursor: pointer;
+      transition: transform 0.12s ease, box-shadow 0.2s ease, filter 0.2s ease, background 0.2s ease;
+    }}
+    button:hover {{
+      transform: translateY(-1px);
+      box-shadow: 0 8px 18px rgba(37, 99, 235, 0.22);
+      filter: brightness(1.03);
+    }}
+    button:active {{
+      transform: translateY(0);
+      box-shadow: 0 2px 8px rgba(37, 99, 235, 0.2);
+      filter: brightness(0.98);
+    }}
+    button:disabled {{
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+      filter: none;
     }}
     pre {{
       white-space: pre-wrap;
@@ -3133,6 +3174,17 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       padding: 7px 10px;
       border-radius: 7px;
       font-size: 12px;
+    }}
+    .btn-ghost:hover {{
+      box-shadow: 0 8px 18px rgba(15, 23, 42, 0.14);
+    }}
+    .btn-ghost:active {{
+      box-shadow: 0 2px 8px rgba(15, 23, 42, 0.14);
+    }}
+    .nav-badge {{
+      min-width: 20px;
+      text-align: center;
+      padding: 2px 6px;
     }}
     .tab-strip {{
       display: flex;
@@ -3828,6 +3880,11 @@ def startup() -> None:
 @app.get("/", response_class=HTMLResponse)
 def landing(request: Request) -> HTMLResponse:
     user = _read_current_user(request)
+    if user:
+        role = str(user.get("role", "")).strip().lower()
+        if role == "admin":
+            return RedirectResponse(url="/admin", status_code=307)
+        return RedirectResponse(url="/cabinet", status_code=307)
     auth_block = (
         f'<p>Signed in as <b>{escape(user["username"])}</b> ({escape(user["role"])})</p>'
         if user
@@ -3857,35 +3914,19 @@ def landing(request: Request) -> HTMLResponse:
 def about_page(request: Request) -> HTMLResponse:
     user = _read_current_user(request)
     is_admin = bool(user and user.get("role") == "admin")
-    admin_controls = (
+    admin_meta_rows = (
         """
-  <div style="display:flex;gap:8px;align-items:center;">
-    <button data-action="about-check-updates">Check updates</button>
-    <button data-action="about-apply-update">Update now</button>
-  </div>
-"""
-        if is_admin
-        else """
-  <div style="display:flex;gap:8px;align-items:center;">
-    <button disabled title="Only admin can run update checks">Check updates</button>
-    <button disabled title="Only admin can apply updates">Update now</button>
-  </div>
-  <p class="muted">Only admin can run update checks and apply updates.</p>
-"""
-    )
-    return _page(
-        "About application",
-        f"""
-<div class="card">
-  <h2>About proxy-vpn</h2>
-  <p class="muted">Version and update channel info from server release metadata.</p>
   <div class="user-meta-row"><div class="label-muted">Current version</div><div id="about-current-version">-</div></div>
   <div class="user-meta-row"><div class="label-muted">Current build</div><div id="about-current-sha">-</div></div>
   <div class="user-meta-row"><div class="label-muted">Deployed at</div><div id="about-current-at">-</div></div>
   <div class="user-meta-row"><div class="label-muted">Available update</div><div id="about-available-version">-</div></div>
   <div class="user-meta-row"><div class="label-muted">Update status</div><div id="about-update-status">-</div></div>
-  <h3 style="margin-top:12px;">Release notes</h3>
-  <pre id="about-release-notes">Loading...</pre>
+"""
+        if is_admin
+        else ""
+    )
+    admin_history_block = (
+        """
   <h3 style="margin-top:12px;">Updates history</h3>
   <table style="width:100%; border-collapse:collapse;">
     <thead>
@@ -3894,6 +3935,30 @@ def about_page(request: Request) -> HTMLResponse:
     <tbody id="about-history-body"><tr><td colspan="5" class="muted">Loading...</td></tr></tbody>
   </table>
   <p class="muted" id="about-history-meta"></p>
+"""
+        if is_admin
+        else ""
+    )
+    admin_controls = (
+        """
+  <div style="display:flex;gap:8px;align-items:center;">
+    <button data-action="about-check-updates">Check updates</button>
+    <button data-action="about-apply-update">Update now</button>
+  </div>
+"""
+        if is_admin
+        else ""
+    )
+    return _page(
+        "About application",
+        f"""
+<div class="card">
+  <h2>About proxy-vpn</h2>
+  <p class="muted">Release notes, authorship and license information.</p>
+  {admin_meta_rows}
+  <h3 style="margin-top:12px;">Release notes</h3>
+  <pre id="about-release-notes">Loading...</pre>
+  {admin_history_block}
   <h3 style="margin-top:12px;">Authorship, rights and license</h3>
   <div class="user-meta-row"><div class="label-muted">Author</div><div>Dmitry Solonnikov</div></div>
   <div class="user-meta-row"><div class="label-muted">Contacts</div><div><a href="https://t.me/Dmitry_as_Solod" target="_blank" rel="noopener noreferrer">@Dmitry_as_Solod</a></div></div>
@@ -3951,20 +4016,30 @@ async function loadAboutState() {{
   const up = s.update || {{}};
   const notes = av && av.notes ? av.notes : (cur.notes || '-');
   const vCur = String(cur.version || 'unknown');
-  document.getElementById('about-current-version').textContent = vCur;
-  document.getElementById('about-current-sha').textContent = String(cur.sha || '-');
-  document.getElementById('about-current-at').textContent = String(cur.deployed_at || '-');
-  document.getElementById('about-available-version').textContent = av && av.version ? String(av.version) : 'no update';
-  document.getElementById('about-update-status').textContent = String(up.status || 'idle') + ' - ' + String(up.message || '-');
-  document.getElementById('about-release-notes').textContent = String(notes || '-');
+  const curVersionEl = document.getElementById('about-current-version');
+  const curShaEl = document.getElementById('about-current-sha');
+  const curAtEl = document.getElementById('about-current-at');
+  const avVersionEl = document.getElementById('about-available-version');
+  const upStatusEl = document.getElementById('about-update-status');
+  const notesEl = document.getElementById('about-release-notes');
+  if (curVersionEl) curVersionEl.textContent = vCur;
+  if (curShaEl) curShaEl.textContent = String(cur.sha || '-');
+  if (curAtEl) curAtEl.textContent = String(cur.deployed_at || '-');
+  if (avVersionEl) avVersionEl.textContent = av && av.version ? String(av.version) : 'no update';
+  if (upStatusEl) upStatusEl.textContent = String(up.status || 'idle') + ' - ' + String(up.message || '-');
+  if (notesEl) notesEl.textContent = String(notes || '-');
   const history = (j.history && Array.isArray(j.history.items)) ? j.history.items : [];
-  renderAboutHistory(history);
-  if (window.__aboutLastVersion && window.__aboutLastVersion !== vCur) {{
-    const out = document.getElementById('about-out');
-    if (out) out.textContent = 'Application updated to version ' + vCur + '. Reloading page...';
-    setTimeout(() => window.location.reload(), 1200);
+  if (document.getElementById('about-history-body')) {{
+    renderAboutHistory(history);
   }}
-  window.__aboutLastVersion = vCur;
+  if (document.getElementById('about-current-version')) {{
+    if (window.__aboutLastVersion && window.__aboutLastVersion !== vCur) {{
+      const out = document.getElementById('about-out');
+      if (out) out.textContent = 'Application updated to version ' + vCur + '. Reloading page...';
+      setTimeout(() => window.location.reload(), 1200);
+    }}
+    window.__aboutLastVersion = vCur;
+  }}
 }}
 async function requestUpdateCheck() {{
   const out = document.getElementById('about-out');
@@ -4085,7 +4160,12 @@ async function login() {
   });
   const t = await r.text();
   document.getElementById('out').textContent = t;
-  if (r.ok) window.location.href = '/cabinet';
+  if (r.ok) {
+    let j = null;
+    try { j = JSON.parse(t); } catch (e) { j = null; }
+    const role = String((j && j.user && j.user.role) || '').trim().toLowerCase();
+    window.location.href = role === 'admin' ? '/admin' : '/cabinet';
+  }
 }
 async function registerUser() {
   const username = document.getElementById('reg-username').value;
@@ -4173,39 +4253,8 @@ def cabinet(request: Request) -> HTMLResponse:
 </div>
 <div class="card cab-section" data-cab-section="traffic">
   <h2>Traffic and resource usage</h2>
-  <p class="muted">Live counters and aggregated usage for your profile.</p>
+  <p class="muted">Traffic activity and aggregated usage for your profile.</p>
   <div id="cab-paired-status" class="muted" style="margin-bottom:8px;">Paired status: loading...</div>
-  <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto auto;gap:8px;align-items:end;margin-bottom:8px;">
-    <div>
-      <div class="label-muted">Primary protocol</div>
-      <select id="proto-primary" style="width:100%;padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);">
-        <option value="xray">xray</option>
-        <option value="wireguard">wireguard</option>
-      </select>
-    </div>
-    <div>
-      <div class="label-muted">Fallback protocol</div>
-      <select id="proto-fallback" style="width:100%;padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);">
-        <option value="">none</option>
-        <option value="xray">xray</option>
-        <option value="wireguard">wireguard</option>
-      </select>
-    </div>
-    <div>
-      <div class="label-muted">T_fail (sec)</div>
-      <input id="proto-tfail" type="number" min="30" step="10" value="120" />
-    </div>
-    <button class="btn-ghost" data-action="save-protocol-preference">Save protocol policy</button>
-    <button class="btn-ghost" data-action="confirm-protocol-switch">Confirm active protocol</button>
-  </div>
-  <pre id="proto-state-out" style="margin-top:0;">Protocol policy: loading...</pre>
-  <div id="proto-switch-alert" style="display:none;margin:8px 0;padding:10px 12px;border-radius:10px;border:1px solid rgba(245,158,11,0.35);background:rgba(245,158,11,0.12);color:#78350f;"></div>
-  <div style="display:flex;gap:8px;align-items:center;margin:8px 0;">
-    <button class="btn-ghost" data-action="show-switch-guide">Show switch guide</button>
-    <span class="muted">Personalized fallback instructions for your current state.</span>
-  </div>
-  <pre id="proto-switch-guide" style="margin-top:0;">Switch guide: loading...</pre>
-  <div id="cab-traffic-resources" class="muted">Resources: loading...</div>
   <div style="overflow:auto;margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);">
     <table style="width:100%;border-collapse:collapse;">
       <thead>
@@ -4235,6 +4284,7 @@ def cabinet(request: Request) -> HTMLResponse:
 </div>
 <script>
 const csrfToken = {repr(user["csrf_token"])};
+const CAB_SECTION_STORAGE_KEY = 'proxy_vpn_cab_section';
 const escHtml = (s) => String((s === undefined || s === null) ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 function getCsrfToken() {{
   const m = document.cookie.match(/(?:^|; )proxy_vpn_csrf=([^;]+)/);
@@ -4251,6 +4301,12 @@ function showCabSection(section) {{
     const key = String(el.getAttribute('data-cab-section') || '').trim();
     el.style.display = (key === s) ? '' : 'none';
   }});
+  try {{ localStorage.setItem(CAB_SECTION_STORAGE_KEY, s); }} catch (e) {{}}
+  if (s === 'traffic') {{
+    loadCabinetTraffic();
+  }} else if (s === 'device') {{
+    initDeviceCard();
+  }}
 }}
 function openEditProfileModal() {{
   const modal = document.getElementById('edit-profile-modal');
@@ -4450,7 +4506,6 @@ function fmtBytes(v) {{
 }}
 function renderCabinetTrafficSummary(summary) {{
   const body = document.getElementById('cab-traffic-summary-body');
-  const resources = document.getElementById('cab-traffic-resources');
   if (!body) return;
   const periods = summary && summary.periods ? summary.periods : {{}};
   const keys = [['day','Day'], ['week','Week'], ['month','Month'], ['year','Year']];
@@ -4463,11 +4518,6 @@ function renderCabinetTrafficSummary(summary) {{
       <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);"><b>${{fmtBytes(item.total_bytes || 0)}}</b></td>
     </tr>`;
   }}).join('');
-  const r = summary && summary.resources ? summary.resources : {{}};
-  if (resources) {{
-    resources.textContent = 'Resources now: CPU ' + Number(r.cpu_load_pct || 0).toFixed(1) + '% · RAM ' +
-      Number(r.memory_used_pct || 0).toFixed(1) + '% · Disk ' + Number(r.disk_used_pct || 0).toFixed(1) + '%';
-  }}
 }}
 function pairedBadge(state) {{
   const s = String(state || 'incomplete');
@@ -4914,7 +4964,14 @@ document.addEventListener('click', (event) => {{
 }});
 refreshPlatformOptions();
 ensureWireGuardLabel(true);
-showCabSection('profile');
+const savedCabSection = (() => {{
+  try {{
+    return String(localStorage.getItem(CAB_SECTION_STORAGE_KEY) || '').trim();
+  }} catch (e) {{
+    return '';
+  }}
+}})();
+showCabSection(savedCabSection || 'profile');
 initDeviceCard();
 loadCabinetTraffic();
 setInterval(loadCabinetTraffic, 30000);
@@ -5034,6 +5091,12 @@ def admin(request: Request) -> HTMLResponse:
     )
     if not user_options_html:
         user_options_html = "<option value=''>No users</option>"
+    traffic_user_rows = [row for row in users_rows if str(row["role"]) == "user"]
+    traffic_user_options_html = "".join(
+        [f"<option value='{row['id']}'>{escape(row['username'])}</option>" for row in traffic_user_rows]
+    )
+    if not traffic_user_options_html:
+        traffic_user_options_html = "<option value=''>No user accounts</option>"
 
     wg_bindings_html = "".join(
         [
@@ -5077,7 +5140,7 @@ def admin(request: Request) -> HTMLResponse:
     <button class="tab-btn" data-tab="overview" data-admin-section="overview">Overview</button>
     <button class="tab-btn" data-tab="security" data-admin-section="security">Security</button>
     <button class="tab-btn" data-tab="configurator" data-admin-section="configurator">Configurator</button>
-    <button class="tab-btn" data-tab="approvals" data-admin-section="approvals">Approvals</button>
+    <button class="tab-btn" data-tab="approvals" data-admin-section="approvals">Approvals <span id="approvals-tab-badge" class="status-pill status-pending" style="display:{'inline-block' if len(pending_rows) > 0 else 'none'};margin-left:6px;">{len(pending_rows)}</span></button>
     <button class="tab-btn" data-tab="users" data-admin-section="users">Users</button>
     <button class="tab-btn" data-tab="traffic" data-admin-section="traffic">Traffic</button>
     <button class="tab-btn" data-tab="logs" data-admin-section="logs">Logs</button>
@@ -5380,6 +5443,7 @@ def admin(request: Request) -> HTMLResponse:
   <h2>Per-user traffic (WG + Xray exact)</h2>
   <p class="muted">Data is based on WireGuard/Xray counters and binding tables above.</p>
   <p class="muted" id="traffic-source">source: -</p>
+  <p class="muted" id="bindings-refresh-meta">bindings refresh: waiting for first live cycle...</p>
   <table style="width:100%; border-collapse:collapse;">
     <thead>
       <tr><th align="left">User</th><th align="left">Email</th><th align="left">Role</th><th align="left">RX 24h</th><th align="left">TX 24h</th><th align="left">Total 24h</th></tr>
@@ -5389,7 +5453,7 @@ def admin(request: Request) -> HTMLResponse:
   <div style="margin-top:10px;display:grid;grid-template-columns:minmax(240px,1fr) auto;gap:8px;align-items:end;">
     <div>
       <div class="label-muted">Selected user details</div>
-      <select id="traffic-user-select" style="width:100%;padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);">{user_options_html}</select>
+      <select id="traffic-user-select" style="width:100%;padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);">{traffic_user_options_html}</select>
     </div>
     <button class="btn-ghost" data-action="load-user-traffic-details">Load details</button>
   </div>
@@ -5464,6 +5528,8 @@ let securityEventsCache = [];
 let pairedStatusCache = [];
 let currentAdminSection = 'overview';
 const currentAdminSubsection = {{}};
+const ADMIN_SECTION_STORAGE_KEY = 'proxy_vpn_admin_section';
+const adminSubsectionStorageKey = (section) => 'proxy_vpn_admin_subsection_' + String(section || '');
 const sectionSubsections = {{
   overview: [
     ['realtime', 'Realtime'],
@@ -5530,8 +5596,13 @@ function showSection(section, preferredSubsection = '') {{
   const fallback = subs.length ? subs[0][0] : '';
   const selected = preferredSubsection || currentAdminSubsection[section] || fallback;
   currentAdminSubsection[section] = selected;
+  try {{
+    localStorage.setItem(ADMIN_SECTION_STORAGE_KEY, section);
+    if (selected) localStorage.setItem(adminSubsectionStorageKey(section), selected);
+  }} catch (e) {{}}
   renderSubtabs(section);
   showSubsection(section, selected);
+  refreshAdminLive();
 }}
 const fmtBytes = (n) => {{
   if (!Number.isFinite(n)) return '-';
@@ -5950,6 +6021,73 @@ function renderUserTraffic(items) {{
     </tr>`;
   }}).join('');
 }}
+function renderWireGuardBindings(items) {{
+  const body = document.getElementById('wg-bindings-body');
+  if (!body) return;
+  if (!items || items.length === 0) {{
+    body.innerHTML = '<tr><td colspan="5" class="muted">No WG peer bindings yet</td></tr>';
+    return;
+  }}
+  body.innerHTML = items.map((i) => {{
+    const key = String(i.public_key || '');
+    return `<tr>
+      <td>${{escHtml(i.username || '-')}}</td>
+      <td><code style="font-size:12px">${{escHtml(key)}}</code></td>
+      <td>${{escHtml(i.label || '')}}</td>
+      <td>RX ${{fmtBytes(Number(i.last_rx_bytes || 0))}} / TX ${{fmtBytes(Number(i.last_tx_bytes || 0))}}</td>
+      <td>
+        <button class="btn-ghost" data-action="run-wg-diagnostics-user" data-user-id="${{Number(i.user_id || 0)}}">Diagnostics</button>
+        <button data-action="remove-wg-binding" data-public-key="${{escHtml(key)}}">Unbind</button>
+      </td>
+    </tr>`;
+  }}).join('');
+}}
+function renderXrayBindings(items) {{
+  const body = document.getElementById('xray-bindings-body');
+  if (!body) return;
+  if (!items || items.length === 0) {{
+    body.innerHTML = '<tr><td colspan="5" class="muted">No Xray client bindings yet</td></tr>';
+    return;
+  }}
+  body.innerHTML = items.map((i) => {{
+    const email = String(i.client_email || '').trim();
+    return `<tr>
+      <td>${{escHtml(i.username || '-')}}</td>
+      <td><code style="font-size:12px">${{escHtml(email)}}</code></td>
+      <td>${{escHtml(i.label || '')}}</td>
+      <td>RX ${{fmtBytes(Number(i.last_downlink_bytes || 0))}} / TX ${{fmtBytes(Number(i.last_uplink_bytes || 0))}}</td>
+      <td><button data-action="remove-xray-binding" data-client-email="${{escHtml(email)}}">Unbind</button></td>
+    </tr>`;
+  }}).join('');
+}}
+function renderPendingBadges(countRaw) {{
+  const count = Math.max(0, Number(countRaw || 0));
+  const approvalsBadge = document.getElementById('approvals-tab-badge');
+  if (approvalsBadge) {{
+    approvalsBadge.textContent = String(count);
+    approvalsBadge.style.display = count > 0 ? 'inline-block' : 'none';
+  }}
+  const sidebarBadge = document.getElementById('sidebar-admin-pending-badge');
+  if (sidebarBadge) {{
+    sidebarBadge.textContent = String(count);
+    sidebarBadge.style.display = count > 0 ? 'inline-block' : 'none';
+  }}
+}}
+function renderBindingsRefreshMeta(wgOk, xrayOk, wgCount, xrayCount) {{
+  const el = document.getElementById('bindings-refresh-meta');
+  if (!el) return;
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2, '0');
+  const mm = String(now.getMinutes()).padStart(2, '0');
+  const ss = String(now.getSeconds()).padStart(2, '0');
+  const status = (wgOk && xrayOk) ? 'ok' : ((wgOk || xrayOk) ? 'partial' : 'error');
+  el.textContent =
+    'bindings refresh: ' + status +
+    ' · at ' + hh + ':' + mm + ':' + ss +
+    ' · WG rows=' + String(Math.max(0, Number(wgCount || 0))) +
+    ' · Xray rows=' + String(Math.max(0, Number(xrayCount || 0)));
+  el.style.color = status === 'ok' ? '#15803d' : (status === 'partial' ? '#b45309' : '#b91c1c');
+}}
 function renderAdminPairedStatus(items) {{
   const body = document.getElementById('paired-status-body');
   const filterEl = document.getElementById('paired-wg-verdict-filter');
@@ -6361,7 +6499,7 @@ async function applyConfigurator() {{
   await refreshAdminLive();
 }}
 async function refreshAdminLive() {{
-  const [statsR, onlineR, tsR, trafficR, servicesR, deployEventsR, updateAuditR, capacityR, backupStatusR, securityEventsR, securityBlockedR, pairedR] = await Promise.all([
+  const [statsR, onlineR, tsR, trafficR, servicesR, deployEventsR, updateAuditR, capacityR, backupStatusR, securityEventsR, securityBlockedR, pairedR, wgBindingsR, xrayBindingsR] = await Promise.all([
     fetch('/api/v1/admin/stats'),
     fetch('/api/v1/admin/online-users'),
     fetch('/api/v1/admin/system-metrics/timeseries?minutes=60'),
@@ -6373,10 +6511,13 @@ async function refreshAdminLive() {{
     fetch('/api/v1/admin/backup-status'),
     fetch('/api/v1/admin/security/events?limit=120'),
     fetch('/api/v1/admin/security/blocked?limit=120'),
-    fetch('/api/v1/admin/paired-status')
+    fetch('/api/v1/admin/paired-status'),
+    fetch('/api/v1/admin/wireguard-bindings'),
+    fetch('/api/v1/admin/xray-bindings')
   ]);
   if (statsR.ok) {{
     const s = (await statsR.json()).stats || {{}};
+    renderPendingBadges(s.pending_requests);
     document.getElementById('m-online').textContent = String((s.active_sessions === undefined || s.active_sessions === null) ? '-' : s.active_sessions);
     const pairedEl = document.getElementById('m-paired');
     if (pairedEl) {{
@@ -6456,6 +6597,25 @@ async function refreshAdminLive() {{
     pairedStatusCache = Array.isArray(p.items) ? p.items : [];
     renderAdminPairedStatus(pairedStatusCache);
   }}
+  let wgOk = false;
+  let xrayOk = false;
+  let wgRows = 0;
+  let xrayRows = 0;
+  if (wgBindingsR.ok) {{
+    const j = await wgBindingsR.json();
+    const items = Array.isArray(j.items) ? j.items : [];
+    wgRows = items.length;
+    wgOk = true;
+    renderWireGuardBindings(items);
+  }}
+  if (xrayBindingsR.ok) {{
+    const j = await xrayBindingsR.json();
+    const items = Array.isArray(j.items) ? j.items : [];
+    xrayRows = items.length;
+    xrayOk = true;
+    renderXrayBindings(items);
+  }}
+  renderBindingsRefreshMeta(wgOk, xrayOk, wgRows, xrayRows);
 }}
 function openWgDiagnosticsModal() {{
   const modal = document.getElementById('wg-diagnostics-modal');
@@ -6808,9 +6968,23 @@ document.addEventListener('click', (event) => {{
   if (!userId) return;
   deleteUser(userId, username);
 }});
-refreshAdminLive();
+const savedAdminSection = (() => {{
+  try {{
+    return String(localStorage.getItem(ADMIN_SECTION_STORAGE_KEY) || '').trim();
+  }} catch (e) {{
+    return '';
+  }}
+}})();
+const initialAdminSection = (sectionSubsections[savedAdminSection] ? savedAdminSection : 'overview');
+const savedAdminSubsection = (() => {{
+  try {{
+    return String(localStorage.getItem(adminSubsectionStorageKey(initialAdminSection)) || '').trim();
+  }} catch (e) {{
+    return '';
+  }}
+}})();
 loadConfigurator();
-showSection('overview');
+showSection(initialAdminSection, savedAdminSubsection);
 scheduleAdminRefresh(30);
 </script>
 """,
@@ -8099,6 +8273,7 @@ def admin_user_traffic_summary(request: Request, hours: int = 24) -> JSONRespons
               WHERE ts >= datetime('now', ?)
               GROUP BY user_id
             ) e ON e.user_id = u.id
+            WHERE u.role = 'user'
             ORDER BY (5 + 6) DESC, u.username ASC
             """,
             (f"-{hours} hours", f"-{hours} hours", f"-{hours} hours"),

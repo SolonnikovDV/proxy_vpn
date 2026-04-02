@@ -70,6 +70,15 @@ Rate-limit knobs for auth endpoints:
 - `SECURITY_HTTP_WINDOW_SECONDS` + `SECURITY_HTTP_MAX_REQUESTS` (HTTP flood detection window/rate)
 - `SECURITY_SERVER_CHECK_INTERVAL_SECONDS` + `SECURITY_SERVER_EVENT_COOLDOWN_SECONDS` (server-state security checks and alert cooldown)
 
+Proxy bypass whitelist (traffic saving):
+- purpose: do not route selected resources through VPN when they are not blocked/slowed in Russia
+- storage: `config/proxy-bypass-rules.txt` (editable plain text file)
+- format per line: `resource,true|false`
+  - `false` = Direct/Bypass (VPN disabled for this resource)
+  - `true` = keep VPN route
+- examples: `yandex.ru,false`, `vk.com,false`, `gosuslugi.ru,false`
+- admin UI editing: `Admin -> Configurator -> Proxy bypass resources (Direct/Bypass)` (writes back to the same file)
+
 Unified launcher commands:
 - `bash ./scripts/run.sh local up`
 - `bash ./scripts/run.sh local down`
@@ -84,6 +93,12 @@ Recommended clients by platform (approved baseline):
 - Windows: `v2rayN`
 - macOS: `V2rayU`
 - Linux: `Karing`
+
+WireGuard client compatibility note (paired mode):
+- paired mode tracks WireGuard and Xray independently per user and can recommend manual primary/fallback switch
+- if WG diagnostics show `data_path_not_confirmed` / `client_attempt_seen=false`, server path is usually healthy but device routing is not applied
+- on iOS, check tunnel is active for the exact profile, disable iCloud Private Relay / "Limit IP Address Tracking" for current network, then retry
+- Admin WG validator is the source of truth for this case: `/admin` -> `Traffic` -> `WG bindings` -> `Diagnostics`
 
 ## Production
 
@@ -130,6 +145,10 @@ SERVER_PUBLIC_IP=YOUR_SERVER_IP_OR_DOMAIN bash ./scripts/setup-wireguard.sh
 SERVER_PUBLIC_IP=YOUR_SERVER_IP_OR_DOMAIN XRAY_PORT=8443 bash ./scripts/setup-xray-reality.sh
 ```
 
+Important for seamless client updates:
+- `setup-xray-reality.sh` reuses existing REALITY keypair, Short ID and primary client UUID by default (no client-side config rotation on rebuild)
+- force rotation only when explicitly needed: `FORCE_REGENERATE_XRAY_KEYS=1 bash ./scripts/setup-xray-reality.sh`
+
 This config includes Xray `StatsService` and is compatible with exact per-user traffic collection in admin UI.
 
 Generated files:
@@ -175,6 +194,9 @@ OUTPUT_PATH=exports/my-clients.json bash ./scripts/export-clients-json.sh
 ```bash
 bash ./scripts/preflight-prod.sh
 ```
+
+By default, preflight does **not** auto-regenerate invalid Xray REALITY config to avoid breaking existing clients.
+- explicit opt-in (maintenance window only): `ALLOW_XRAY_REGENERATE_ON_INVALID=1 bash ./scripts/preflight-prod.sh`
 
 8. Deploy (recommended):
 

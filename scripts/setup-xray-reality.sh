@@ -21,14 +21,95 @@ XRAY_REALITY_DEST="${XRAY_REALITY_DEST:-www.cloudflare.com:443}"
 XRAY_REALITY_SERVER_NAME="${XRAY_REALITY_SERVER_NAME:-www.cloudflare.com}"
 XRAY_CLIENT_EMAIL="${XRAY_CLIENT_EMAIL:-client1@proxy-vpn}"
 SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-}"
+FORCE_REGENERATE_XRAY_KEYS="${FORCE_REGENERATE_XRAY_KEYS:-0}"
 
 [ -n "${SERVER_PUBLIC_IP}" ] || die "Set SERVER_PUBLIC_IP (public IP or domain), e.g. SERVER_PUBLIC_IP=203.0.113.10"
 
 mkdir -p xray
 
-log "Generating REALITY x25519 keypair using xray image..."
-KEYS_OUTPUT="$(docker run --rm ghcr.io/xtls/xray-core:latest x25519 2>&1 || true)"
-REALITY_PRIVATE_KEY="$(python3 - "${KEYS_OUTPUT}" <<'PY'
+eval "$(
+python3 - "${XRAY_CONFIG_PATH}" "${XRAY_CLIENT_INFO_PATH}" <<'PY'
+import json
+import re
+import shlex
+import sys
+from pathlib import Path
+
+cfg_path = Path(sys.argv[1])
+info_path = Path(sys.argv[2])
+
+private_key = ""
+short_id = ""
+client_uuid = ""
+client_email = ""
+sni = ""
+public_key = ""
+
+if cfg_path.exists():
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        cfg = {}
+    inbounds = cfg.get("inbounds") or []
+    for item in inbounds:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("protocol", "")).lower() != "vless":
+            continue
+        settings = item.get("settings") or {}
+        clients = settings.get("clients") or []
+        if clients and isinstance(clients[0], dict):
+            client_uuid = str(clients[0].get("id") or client_uuid)
+            client_email = str(clients[0].get("email") or client_email)
+        stream = item.get("streamSettings") or {}
+        reality = stream.get("realitySettings") or {}
+        private_key = str(reality.get("privateKey") or private_key)
+        short_ids = reality.get("shortIds") or []
+        if short_ids:
+            short_id = str(short_ids[0] or short_id)
+        server_names = reality.get("serverNames") or []
+        if server_names:
+            sni = str(server_names[0] or sni)
+        break
+
+if info_path.exists():
+    text = info_path.read_text(encoding="utf-8", errors="ignore")
+    m_public = re.search(r"Public key:\s*([A-Za-z0-9+/_=-]{20,})", text, flags=re.IGNORECASE)
+    if m_public:
+        public_key = m_public.group(1).strip()
+    m_sni = re.search(r"SNI:\s*([^\r\n]+)", text, flags=re.IGNORECASE)
+    if m_sni and not sni:
+        sni = m_sni.group(1).strip()
+
+def emit(name, value):
+    print(f"{name}={shlex.quote(value)}")
+
+emit("EXISTING_PRIVATE_KEY", private_key)
+emit("EXISTING_PUBLIC_KEY", public_key)
+emit("EXISTING_SHORT_ID", short_id)
+emit("EXISTING_CLIENT_UUID", client_uuid)
+emit("EXISTING_CLIENT_EMAIL", client_email)
+emit("EXISTING_SNI", sni)
+PY
+)"
+
+if [ -z "${XRAY_REALITY_SERVER_NAME}" ] && [ -n "${EXISTING_SNI:-}" ]; then
+  XRAY_REALITY_SERVER_NAME="${EXISTING_SNI}"
+fi
+if [ -z "${XRAY_CLIENT_EMAIL}" ] && [ -n "${EXISTING_CLIENT_EMAIL:-}" ]; then
+  XRAY_CLIENT_EMAIL="${EXISTING_CLIENT_EMAIL}"
+fi
+
+REALITY_PRIVATE_KEY=""
+REALITY_PUBLIC_KEY=""
+if [ "${FORCE_REGENERATE_XRAY_KEYS}" != "1" ] && [ -n "${EXISTING_PRIVATE_KEY:-}" ] && [ -n "${EXISTING_PUBLIC_KEY:-}" ]; then
+  REALITY_PRIVATE_KEY="${EXISTING_PRIVATE_KEY}"
+  REALITY_PUBLIC_KEY="${EXISTING_PUBLIC_KEY}"
+  log "Reusing existing REALITY keypair from current config."
+else
+  log "Generating REALITY x25519 keypair using xray image..."
+  KEYS_OUTPUT="$(docker run --rm ghcr.io/xtls/xray-core:latest x25519 2>&1 || true)"
+  REALITY_PRIVATE_KEY="$(python3 - "${KEYS_OUTPUT}" <<'PY'
 import re
 import sys
 
@@ -40,15 +121,11 @@ if m:
     print(m.group(1).strip())
 PY
 )"
-REALITY_PUBLIC_KEY="$(python3 - "${KEYS_OUTPUT}" <<'PY'
+  REALITY_PUBLIC_KEY="$(python3 - "${KEYS_OUTPUT}" <<'PY'
 import re
 import sys
 
 text = sys.argv[1] if len(sys.argv) > 1 else ""
-# Xray output varies by version:
-# - "Public key: ..."
-# - "PublicKey: ..."
-# - "Password (PublicKey): ..."
 m = re.search(r"public\s*key\s*:\s*([A-Za-z0-9+/_=-]{20,})", text, flags=re.IGNORECASE)
 if not m:
     m = re.search(r"publickey\s*:\s*([A-Za-z0-9+/_=-]{20,})", text, flags=re.IGNORECASE)
@@ -58,20 +135,27 @@ if m:
     print(m.group(1).strip())
 PY
 )"
+  [ -n "${REALITY_PRIVATE_KEY}" ] || die "Failed to generate REALITY private key. xray output: ${KEYS_OUTPUT}"
+  [ -n "${REALITY_PUBLIC_KEY}" ] || die "Failed to generate REALITY public key. xray output: ${KEYS_OUTPUT}"
+fi
 
-[ -n "${REALITY_PRIVATE_KEY}" ] || die "Failed to generate REALITY private key. xray output: ${KEYS_OUTPUT}"
-[ -n "${REALITY_PUBLIC_KEY}" ] || die "Failed to generate REALITY public key. xray output: ${KEYS_OUTPUT}"
-
-CLIENT_UUID="$(python3 - <<'PY'
+CLIENT_UUID="${EXISTING_CLIENT_UUID:-}"
+if [ -z "${CLIENT_UUID}" ] || [ "${FORCE_REGENERATE_XRAY_KEYS}" = "1" ]; then
+  CLIENT_UUID="$(python3 - <<'PY'
 import uuid
 print(uuid.uuid4())
 PY
 )"
-SHORT_ID="$(python3 - <<'PY'
+fi
+
+SHORT_ID="${EXISTING_SHORT_ID:-}"
+if [ -z "${SHORT_ID}" ] || [ "${FORCE_REGENERATE_XRAY_KEYS}" = "1" ]; then
+  SHORT_ID="$(python3 - <<'PY'
 import secrets
 print(secrets.token_hex(4))
 PY
 )"
+fi
 
 cat > "${XRAY_CONFIG_PATH}" <<EOF
 {
