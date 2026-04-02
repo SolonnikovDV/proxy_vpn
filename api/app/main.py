@@ -6485,6 +6485,7 @@ async function runAdminWgDiagnosticsForUser(userId, username, email) {{
     lines.push(
       '- ' + String(item.username || '-') + ' <' + String(item.email || '-') + '>' +
       ' | verdict=' + String(d.verdict || '-') +
+      ' | bound_key=' + String(d.bound_public_key || '-') +
       ' | handshake_age=' + String((d.handshake_age_seconds === null || d.handshake_age_seconds === undefined) ? 'n/a' : (String(d.handshake_age_seconds) + 's')) +
       ' | recent=' + fmtBytes(Number(d.recent_total_bytes || 0)) +
       ' | runtime=' + fmtBytes(Number(d.runtime_rx_total || 0)) + '/' + fmtBytes(Number(d.runtime_tx_total || 0)) +
@@ -8129,6 +8130,9 @@ def admin_wireguard_diagnostics(
 ) -> JSONResponse:
     _require_admin(request)
     _refresh_user_traffic_samples_once()
+    runtime_totals = _read_wg_runtime_totals_direct()
+    if not runtime_totals:
+        runtime_totals = _read_wg_dump_totals()
     with _db_connect() as con:
         rows = con.execute(
             """
