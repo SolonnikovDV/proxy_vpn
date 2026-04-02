@@ -1917,6 +1917,16 @@ def _normalize_wg_allowed_ips(value: str) -> str:
     return ", ".join(parts)
 
 
+def _recommended_wg_mtu(device_type: str, platform: str, fallback: str) -> str:
+    d = str(device_type or "").strip().lower()
+    p = str(platform or "").strip().lower()
+    if d == "mobile":
+        return os.getenv("WG_CLIENT_MTU_MOBILE", "1200")
+    if d == "desktop" and p == "apple":
+        return os.getenv("WG_CLIENT_MTU_MACOS", fallback or WG_CLIENT_DEFAULT_MTU)
+    return fallback or WG_CLIENT_DEFAULT_MTU
+
+
 def _generate_wireguard_keypair() -> tuple[str, str]:
     if docker is None:
         raise HTTPException(status_code=503, detail="docker SDK unavailable in api container")
@@ -1958,6 +1968,7 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
     now_iso = _now().isoformat()
     tpl = _parse_wireguard_client_template()
     server_public_key = _get_wireguard_server_public_key(str(tpl.get("server_public_key", "")))
+    recommended_mtu = _recommended_wg_mtu(device_type, platform, str(tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)))
     endpoint = str(tpl.get("endpoint") or "").strip()
     panel_domain = str(os.getenv("VPN_PANEL_DOMAIN", "") or "").strip()
     wg_port = str(os.getenv("WG_PORT", "51820") or "51820").strip()
@@ -1985,7 +1996,7 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
                 "server_public_key": server_public_key,
                 "allowed_ips": norm_allowed,
                 "persistent_keepalive": str(row["persistent_keepalive"] or tpl.get("persistent_keepalive", "25")),
-                "mtu": str(row["mtu"] or tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)),
+                "mtu": recommended_mtu,
                 "preshared_key": str(row["preshared_key"] or tpl.get("preshared_key", "")),
             }
             con.execute(
@@ -2018,7 +2029,7 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
                 "server_public_key": server_public_key,
                 "allowed_ips": _normalize_wg_allowed_ips(str(tpl.get("allowed_ips", WG_CLIENT_DEFAULT_ALLOWED_IPS))),
                 "persistent_keepalive": str(tpl.get("persistent_keepalive", "25")),
-                "mtu": str(tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)),
+                "mtu": recommended_mtu,
                 "preshared_key": str(tpl.get("preshared_key", "")),
             }
             con.execute(
@@ -6684,6 +6695,7 @@ def user_device_config(
             "template_address": "10.13.0.2/32",
         }
     wg_server_public_key = _get_wireguard_server_public_key(str(wg_tpl.get("server_public_key", "")))
+    wg_recommended_mtu = _recommended_wg_mtu(device_type, platform, str(wg_tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)))
     wg_port = str(os.getenv("WG_PORT", "51820") or "51820").strip()
     panel_domain = str(os.getenv("VPN_PANEL_DOMAIN", "") or "").strip()
     wg_endpoint = str(wg_tpl.get("endpoint", "") or "").strip()
@@ -6962,7 +6974,7 @@ def user_device_config(
                     "preshared_key": str(wg_tpl.get("preshared_key", "")),
                     "allowed_ips": _normalize_wg_allowed_ips(str(wg_tpl.get("allowed_ips", WG_CLIENT_DEFAULT_ALLOWED_IPS))),
                     "persistent_keepalive": str(wg_tpl.get("persistent_keepalive", "25")),
-                    "mtu": str(wg_tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)),
+                    "mtu": wg_recommended_mtu,
                     "dns": str(wg_tpl.get("dns", "1.1.1.1,1.0.0.1")),
                 },
                 "wireguard_quick_setup": {
