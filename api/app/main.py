@@ -85,6 +85,8 @@ LIST_SYNC_STATUS_PATH = os.getenv("LIST_SYNC_STATUS_PATH", "/logs/list-sync-stat
 UPDATE_AUDIT_PATH = os.getenv("UPDATE_AUDIT_PATH", "/logs/update-audit.jsonl")
 PROXY_BYPASS_RULES_PATH = os.getenv("PROXY_BYPASS_RULES_PATH", "config/proxy-bypass-rules.txt")
 RKN_BLACKLIST_RULES_PATH = os.getenv("RKN_BLACKLIST_RULES_PATH", "config/rkn-blacklist-rules.txt")
+REPO_ROOT_PATH = Path(__file__).resolve().parents[2]
+RELEASE_NOTES_FILE_PATH = REPO_ROOT_PATH / "RELEASE_NOTES.md"
 SECURITY_GUARD_URL = os.getenv("SECURITY_GUARD_URL", "http://security-guard:9100").rstrip("/")
 SECURITY_HTTP_WINDOW_SECONDS = int(os.getenv("SECURITY_HTTP_WINDOW_SECONDS", "10"))
 SECURITY_HTTP_MAX_REQUESTS = int(os.getenv("SECURITY_HTTP_MAX_REQUESTS", "120"))
@@ -1275,14 +1277,57 @@ def _read_update_audit(
     }
 
 
+def _release_metadata_from_repo() -> dict[str, str]:
+    version = "unknown"
+    notes = "No release metadata yet."
+    full_sha = "na"
+    short_sha = "na"
+    try:
+        raw = RELEASE_NOTES_FILE_PATH.read_text(encoding="utf-8")
+        m = re.search(r"(?m)^##\s+(.+?)\s*$", raw)
+        if m:
+            version = str(m.group(1) or "").strip() or version
+        # First section body until next heading.
+        body_m = re.search(r"(?ms)^##\s+[^\n]+\n(.*?)(?:\n##\s+|\Z)", raw)
+        if body_m:
+            body = str(body_m.group(1) or "").strip()
+            if body:
+                notes = " ".join(line.strip() for line in body.splitlines() if line.strip())[:1200]
+    except Exception:
+        pass
+    try:
+        full_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(REPO_ROOT_PATH),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip() or full_sha
+        short_sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(REPO_ROOT_PATH),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip() or short_sha
+    except Exception:
+        pass
+    return {
+        "version": version,
+        "notes": notes,
+        "sha": full_sha,
+        "build": short_sha,
+    }
+
+
 def _default_release_state() -> dict[str, Any]:
+    repo_meta = _release_metadata_from_repo()
     return {
         "status": "ok",
         "state": {
             "current": {
-                "version": "unknown",
-                "sha": "na",
-                "notes": "No release metadata yet.",
+                "version": repo_meta["version"],
+                "sha": repo_meta["sha"],
+                "build": repo_meta["build"],
+                "notes": repo_meta["notes"],
                 "deployed_at": _now().isoformat(),
             },
             "available": None,
@@ -1307,8 +1352,19 @@ def _read_release_state() -> dict[str, Any]:
     current = state.get("current") if isinstance(state.get("current"), dict) else {}
     available = state.get("available")
     update = state.get("update") if isinstance(state.get("update"), dict) else {}
+    repo_meta = _release_metadata_from_repo()
     merged = _default_release_state()["state"]
     merged["current"].update(current)
+    if str(merged["current"].get("version", "") or "").strip().lower() in {"", "unknown"}:
+        merged["current"]["version"] = repo_meta["version"]
+    if str(merged["current"].get("sha", "") or "").strip().lower() in {"", "na"}:
+        merged["current"]["sha"] = repo_meta["sha"]
+    if str(merged["current"].get("notes", "") or "").strip().lower() in {"", "no release metadata yet."}:
+        merged["current"]["notes"] = repo_meta["notes"]
+    # Keep build short-sha synchronized when only full sha is present in state file.
+    if not str(merged["current"].get("build", "") or "").strip():
+        cur_sha = str(merged["current"].get("sha", "") or "").strip()
+        merged["current"]["build"] = cur_sha[:7] if cur_sha and cur_sha != "na" else repo_meta["build"]
     merged["available"] = available if isinstance(available, dict) else None
     merged["update"].update(update)
     return {"status": "ok", "state": merged}
@@ -3771,7 +3827,8 @@ async function refreshGlobalReleaseState() {{
     const available = state.available || null;
     const update = state.update || {{}};
     const currentVersion = String(current.version || 'unknown');
-    versionEl.textContent = 'version: ' + currentVersion;
+    const currentBuild = String(current.build || ((current.sha ? String(current.sha).slice(0, 7) : 'na')));
+    versionEl.textContent = 'version: ' + currentVersion + ' · build: ' + currentBuild;
     if (available && available.version && available.version !== currentVersion) {{
       banner.style.display = 'block';
       const msg = update.message || 'Update available.';
@@ -4409,6 +4466,7 @@ async function loadAboutState() {{
   const up = s.update || {{}};
   const notes = av && av.notes ? av.notes : (cur.notes || '-');
   const vCur = String(cur.version || 'unknown');
+  const buildCur = String(cur.build || (cur.sha ? String(cur.sha).slice(0, 7) : 'na'));
   const curVersionEl = document.getElementById('about-current-version');
   const curShaEl = document.getElementById('about-current-sha');
   const curAtEl = document.getElementById('about-current-at');
@@ -4416,7 +4474,7 @@ async function loadAboutState() {{
   const upStatusEl = document.getElementById('about-update-status');
   const notesEl = document.getElementById('about-release-notes');
   if (curVersionEl) curVersionEl.textContent = vCur;
-  if (curShaEl) curShaEl.textContent = String(cur.sha || '-');
+  if (curShaEl) curShaEl.textContent = buildCur;
   if (curAtEl) curAtEl.textContent = String(cur.deployed_at || '-');
   if (avVersionEl) avVersionEl.textContent = av && av.version ? String(av.version) : 'no update';
   if (upStatusEl) upStatusEl.textContent = String(up.status || 'idle') + ' - ' + String(up.message || '-');

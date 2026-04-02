@@ -253,6 +253,7 @@ state = {
     "current": {
         "version": os.environ.get("REL_CURRENT_VERSION", "unknown"),
         "sha": os.environ.get("REL_CURRENT_SHA", "na"),
+        "build": os.environ.get("REL_CURRENT_BUILD", ""),
         "notes": os.environ.get("REL_CURRENT_NOTES", ""),
         "deployed_at": datetime.now(timezone.utc).isoformat(),
     },
@@ -263,6 +264,9 @@ state = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
 }
+if not state["current"]["build"]:
+    sha = str(state["current"].get("sha", "") or "").strip()
+    state["current"]["build"] = (sha[:7] if sha and sha != "na" else "")
 av_sha = os.environ.get("REL_AVAILABLE_SHA", "").strip()
 if av_sha:
     state["available"] = {

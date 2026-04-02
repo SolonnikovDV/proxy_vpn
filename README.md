@@ -538,6 +538,9 @@ Release metadata and update requests files:
 
 Release notes source used by update UI:
 - `RELEASE_NOTES.md` (latest section is shown as update notes)
+- version is taken from the first heading like `## vX.Y.Z`
+- notes are taken from that first section body (until next `##`)
+- build is current git short SHA; if `logs/app-release-state.json` is missing/stale, app falls back to live repo metadata (`RELEASE_NOTES.md` + `git rev-parse`)
 
 Admin update audit table:
 - `/admin` -> `Overview` -> `Updates audit`

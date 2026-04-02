@@ -75,6 +75,7 @@ state = {
     "current": {
         "version": os.environ.get("REL_CURRENT_VERSION", "unknown"),
         "sha": os.environ.get("REL_CURRENT_SHA", "na"),
+        "build": os.environ.get("REL_CURRENT_BUILD", ""),
         "notes": os.environ.get("REL_CURRENT_NOTES", ""),
         "deployed_at": datetime.now(timezone.utc).isoformat(),
     },
@@ -85,6 +86,9 @@ state = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
 }
+if not state["current"]["build"]:
+    sha = str(state["current"].get("sha", "") or "").strip()
+    state["current"]["build"] = (sha[:7] if sha and sha != "na" else "")
 with open(path, "w", encoding="utf-8") as f:
     json.dump(state, f, ensure_ascii=True, indent=2)
     f.write("\n")
