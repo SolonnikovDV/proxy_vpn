@@ -6,6 +6,7 @@ import binascii
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import threading
 import time
@@ -1905,6 +1906,37 @@ def _normalize_endpoint_with_port(endpoint: str, wg_port: str) -> str:
     return f"{raw}:{wg_port}"
 
 
+def _is_ipv4_literal(value: str) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    try:
+        ipaddress.IPv4Address(raw)
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_ipv4_address(host: str) -> str:
+    raw = str(host or "").strip()
+    if not raw:
+        return ""
+    if _is_ipv4_literal(raw):
+        return raw
+    try:
+        infos = socket.getaddrinfo(raw, None, socket.AF_INET, socket.SOCK_DGRAM)
+    except Exception:
+        return ""
+    for item in infos:
+        try:
+            addr = str(item[4][0]).strip()
+        except Exception:
+            continue
+        if _is_ipv4_literal(addr):
+            return addr
+    return ""
+
+
 def _normalize_wg_allowed_ips(value: str) -> str:
     raw = str(value or "").strip()
     if not raw:
@@ -1921,7 +1953,7 @@ def _recommended_wg_mtu(device_type: str, platform: str, fallback: str) -> str:
     d = str(device_type or "").strip().lower()
     p = str(platform or "").strip().lower()
     if d == "mobile":
-        return os.getenv("WG_CLIENT_MTU_MOBILE", "1200")
+        return os.getenv("WG_CLIENT_MTU_MOBILE", fallback or WG_CLIENT_DEFAULT_MTU)
     if d == "desktop" and p == "apple":
         return os.getenv("WG_CLIENT_MTU_MACOS", fallback or WG_CLIENT_DEFAULT_MTU)
     return fallback or WG_CLIENT_DEFAULT_MTU
@@ -1971,9 +2003,16 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
     recommended_mtu = _recommended_wg_mtu(device_type, platform, str(tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)))
     endpoint = str(tpl.get("endpoint") or "").strip()
     panel_domain = str(os.getenv("VPN_PANEL_DOMAIN", "") or "").strip()
+    server_public_ip = str(os.getenv("SERVER_PUBLIC_IP", "") or "").strip()
     wg_port = str(os.getenv("WG_PORT", "51820") or "51820").strip()
-    if panel_domain and panel_domain != "panel.example.com":
-        endpoint = f"{panel_domain}:{wg_port}"
+    endpoint_host = panel_domain if panel_domain and panel_domain != "panel.example.com" else ""
+    if server_public_ip and server_public_ip != "panel.example.com":
+        endpoint_host = server_public_ip
+    force_ipv4_endpoint = str(os.getenv("WG_CLIENT_FORCE_IPV4_ENDPOINT", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    if endpoint_host:
+        if force_ipv4_endpoint:
+            endpoint_host = _resolve_ipv4_address(endpoint_host) or endpoint_host
+        endpoint = f"{endpoint_host}:{wg_port}"
     endpoint = _normalize_endpoint_with_port(endpoint, wg_port)
     with _db_connect() as con:
         row = con.execute(
@@ -6965,6 +7004,7 @@ def user_device_config(
             "Install WireGuard from App Store using the button below.",
             "WireGuard menu: Add a tunnel -> Create from QR code (recommended) or Create from file/archive.",
             "Activate the tunnel and verify internet connectivity.",
+            "iOS network settings: for active Wi-Fi/Cellular disable 'Limit IP Address Tracking' (Private Relay), then reconnect tunnel.",
             "WireGuard menu: open tunnel details -> copy Public key.",
             "Register this public key in User cabinet -> Device setup to enable paired fallback tracking.",
             "When fallback is recommended, switch to this WireGuard tunnel and confirm active protocol in cabinet.",
@@ -7231,7 +7271,10 @@ def user_wireguard_client_config(
         return Response(content=conf_text, media_type="text/plain; charset=utf-8", headers=headers)
     import_hint = ""
     if device_type == "mobile" and platform == "apple":
-        import_hint = "WireGuard iOS: Add a tunnel -> Create from file/archive, then pick downloaded .conf."
+        import_hint = (
+            "WireGuard iOS: Add a tunnel -> Create from file/archive, then pick downloaded .conf. "
+            "If pages do not load, disable iOS 'Limit IP Address Tracking' for active Wi-Fi/Cellular and reconnect."
+        )
     elif device_type == "mobile" and platform == "android":
         import_hint = "WireGuard Android: + -> Import from file/archive, then select downloaded .conf."
     elif device_type == "desktop" and platform == "windows":

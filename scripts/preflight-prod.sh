@@ -94,6 +94,58 @@ if missing:
 PY
 }
 
+assert_wireguard_server_config() {
+  local cfg="$1"
+  [ -f "${cfg}" ] || die "WireGuard server config missing: ${cfg}"
+  local has_nat=0
+  local has_fwd_in=0
+  local has_fwd_out=0
+  local has_mss=0
+  local line trimmed
+  while IFS= read -r line || [ -n "${line}" ]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    case "${trimmed}" in
+      PostUp*MASQUERADE*) has_nat=1 ;;
+    esac
+    case "${trimmed}" in
+      PostUp*-A\ FORWARD*-i\ %i*) has_fwd_in=1 ;;
+      PostUp*-A\ FORWARD*-i\ wg0*) has_fwd_in=1 ;;
+    esac
+    case "${trimmed}" in
+      PostUp*-A\ FORWARD*-o\ %i*) has_fwd_out=1 ;;
+      PostUp*-A\ FORWARD*-o\ wg0*) has_fwd_out=1 ;;
+    esac
+    case "${trimmed}" in
+      PostUp*-t\ mangle*TCPMSS*clamp-mss-to-pmtu*) has_mss=1 ;;
+    esac
+  done < "${cfg}"
+  [ "${has_nat}" -eq 1 ] || die "wg0.conf missing NAT MASQUERADE PostUp rule."
+  [ "${has_fwd_in}" -eq 1 ] || die "wg0.conf missing FORWARD ingress PostUp rule for wg interface."
+  [ "${has_fwd_out}" -eq 1 ] || die "wg0.conf missing FORWARD egress PostUp rule for wg interface."
+  [ "${has_mss}" -eq 1 ] || die "wg0.conf missing TCPMSS clamp PostUp rule."
+}
+
+assert_wireguard_client_template() {
+  local cfg="$1"
+  [ -f "${cfg}" ] || return 0
+  local allowed=""
+  local line trimmed
+  while IFS= read -r line || [ -n "${line}" ]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    case "${trimmed}" in
+      AllowedIPs*=*)
+        allowed="${trimmed#*=}"
+        allowed="${allowed#"${allowed%%[![:space:]]*}"}"
+        ;;
+    esac
+  done < "${cfg}"
+  if [ "${WG_ENABLE_IPV6:-0}" != "1" ] && [ "${WG_ENABLE_IPV6:-0}" != "true" ]; then
+    case "${allowed}" in
+      *"::/0"*) die "wireguard client template contains ::/0 while WG_ENABLE_IPV6 is disabled." ;;
+    esac
+  fi
+}
+
 read_secret_value() {
   local raw="${1:-}"
   local file_path="${2:-}"
@@ -175,6 +227,7 @@ is_valid_port "${WG_PORT}" || die "Invalid WG_PORT=${WG_PORT}"
 
 [ "${CADDY_HTTPS_PORT}" != "${XRAY_PORT}" ] || die "CADDY_HTTPS_PORT and XRAY_PORT cannot be equal on same host."
 [ -f wireguard/conf/wg0.conf ] || die "wireguard/conf/wg0.conf is missing."
+[ -f wireguard/conf/client1.conf ] || die "wireguard/conf/client1.conf is missing."
 [ -f "caddy/${CADDYFILE_PATH}" ] || die "Caddy file is missing: caddy/${CADDYFILE_PATH}"
 
 # Auto-generate Xray REALITY artifacts for fresh servers (out-of-box bootstrap).
@@ -187,6 +240,8 @@ fi
 assert_caddy_route_present "/admin" "caddy/${CADDYFILE_PATH}"
 assert_caddy_route_present "/about" "caddy/${CADDYFILE_PATH}"
 assert_caddy_route_present "/license" "caddy/${CADDYFILE_PATH}"
+assert_wireguard_server_config "wireguard/conf/wg0.conf"
+assert_wireguard_client_template "wireguard/conf/client1.conf"
 if ! assert_xray_reality_prod_config "xray/config.json" "xray/client-connection.txt"; then
   log "xray config is invalid for production, regenerating REALITY config..."
   SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-${VPN_PANEL_DOMAIN}}" XRAY_PORT="${XRAY_PORT}" bash ./scripts/setup-xray-reality.sh
