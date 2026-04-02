@@ -206,6 +206,8 @@ export CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
 export CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}"
 export XRAY_PORT="${XRAY_PORT:-8443}"
 export WG_PORT="${WG_PORT:-51820}"
+export XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT:-${XRAY_PORT}}"
+export WG_CLIENT_PORT="${WG_CLIENT_PORT:-${WG_PORT}}"
 export ALLOW_XRAY_REGENERATE_ON_INVALID="${ALLOW_XRAY_REGENERATE_ON_INVALID:-0}"
 
 [ "${CADDYFILE_PATH}" = "Caddyfile.prod" ] || die "CADDYFILE_PATH must be Caddyfile.prod for production."
@@ -225,8 +227,11 @@ is_valid_port "${CADDY_HTTP_PORT}" || die "Invalid CADDY_HTTP_PORT=${CADDY_HTTP_
 is_valid_port "${CADDY_HTTPS_PORT}" || die "Invalid CADDY_HTTPS_PORT=${CADDY_HTTPS_PORT}"
 is_valid_port "${XRAY_PORT}" || die "Invalid XRAY_PORT=${XRAY_PORT}"
 is_valid_port "${WG_PORT}" || die "Invalid WG_PORT=${WG_PORT}"
+is_valid_port "${XRAY_CLIENT_PORT}" || die "Invalid XRAY_CLIENT_PORT=${XRAY_CLIENT_PORT}"
+is_valid_port "${WG_CLIENT_PORT}" || die "Invalid WG_CLIENT_PORT=${WG_CLIENT_PORT}"
 
 [ "${CADDY_HTTPS_PORT}" != "${XRAY_PORT}" ] || die "CADDY_HTTPS_PORT and XRAY_PORT cannot be equal on same host."
+[ "${XRAY_CLIENT_PORT}" != "${CADDY_HTTPS_PORT}" ] || [ "${XRAY_CLIENT_PORT}" = "${XRAY_PORT}" ] || die "XRAY_CLIENT_PORT cannot equal CADDY_HTTPS_PORT when XRAY runtime port differs."
 [ -f wireguard/conf/wg0.conf ] || die "wireguard/conf/wg0.conf is missing."
 [ -f wireguard/conf/client1.conf ] || die "wireguard/conf/client1.conf is missing."
 [ -f "caddy/${CADDYFILE_PATH}" ] || die "Caddy file is missing: caddy/${CADDYFILE_PATH}"
@@ -234,7 +239,7 @@ is_valid_port "${WG_PORT}" || die "Invalid WG_PORT=${WG_PORT}"
 # Auto-generate Xray REALITY artifacts for fresh servers (out-of-box bootstrap).
 if [ ! -f xray/config.json ] || [ ! -f xray/client-connection.txt ]; then
   log "xray artifacts are missing, generating REALITY config..."
-  SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-${VPN_PANEL_DOMAIN}}" XRAY_PORT="${XRAY_PORT}" bash ./scripts/setup-xray-reality.sh
+  SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-${VPN_PANEL_DOMAIN}}" XRAY_PORT="${XRAY_PORT}" XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT}" bash ./scripts/setup-xray-reality.sh
 fi
 
 # Catch UI route regressions before deployment.
@@ -246,7 +251,7 @@ assert_wireguard_client_template "wireguard/conf/client1.conf"
 if ! assert_xray_reality_prod_config "xray/config.json" "xray/client-connection.txt"; then
   if [ "${ALLOW_XRAY_REGENERATE_ON_INVALID}" = "1" ]; then
     log "xray config is invalid for production, regenerating REALITY config (ALLOW_XRAY_REGENERATE_ON_INVALID=1)..."
-    SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-${VPN_PANEL_DOMAIN}}" XRAY_PORT="${XRAY_PORT}" bash ./scripts/setup-xray-reality.sh
+    SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-${VPN_PANEL_DOMAIN}}" XRAY_PORT="${XRAY_PORT}" XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT}" bash ./scripts/setup-xray-reality.sh
     assert_xray_reality_prod_config "xray/config.json" "xray/client-connection.txt"
   else
     die "xray config is invalid. Refusing auto-regeneration to avoid rotating client connection parameters. Fix xray artifacts manually or run with ALLOW_XRAY_REGENERATE_ON_INVALID=1."
@@ -267,3 +272,4 @@ dc -f compose.yaml -f compose.prod.yaml config -q
 log "Preflight OK:"
 log "  domain=${VPN_PANEL_DOMAIN}"
 log "  caddy_http=${CADDY_HTTP_PORT} caddy_https=${CADDY_HTTPS_PORT} xray=${XRAY_PORT} wg=${WG_PORT}"
+log "  client_ports: xray=${XRAY_CLIENT_PORT} wg=${WG_CLIENT_PORT}"

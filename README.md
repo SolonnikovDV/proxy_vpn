@@ -138,6 +138,12 @@ Current external exposure model (single server):
 - `8443/tcp` -> Xray (VLESS+REALITY)
 - `51820/udp` -> WireGuard
 
+Client config stability with dynamic server port map:
+- client-facing ports are controlled by `XRAY_CLIENT_PORT` and `WG_CLIENT_PORT`
+- runtime service ports are controlled by `XRAY_PORT` and `WG_PORT`
+- when client port differs from runtime port, server applies dynamic NAT map (`scripts/apply-port-map.sh`) so old client profiles stay valid
+- default behavior is backward compatible: `XRAY_CLIENT_PORT=XRAY_PORT`, `WG_CLIENT_PORT=WG_PORT`
+
 For target scale up to `~15 active users`, keep single-node topology and avoid external L4/L7 load balancer.
 
 Recommended secrets setup on server:

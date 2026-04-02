@@ -17,6 +17,7 @@ fi
 XRAY_CONFIG_PATH="${XRAY_CONFIG_PATH:-xray/config.json}"
 XRAY_CLIENT_INFO_PATH="${XRAY_CLIENT_INFO_PATH:-xray/client-connection.txt}"
 XRAY_PORT="${XRAY_PORT:-8443}"
+XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT:-${XRAY_PORT}}"
 XRAY_REALITY_DEST="${XRAY_REALITY_DEST:-www.cloudflare.com:443}"
 XRAY_REALITY_SERVER_NAME="${XRAY_REALITY_SERVER_NAME:-}"
 XRAY_CLIENT_EMAIL="${XRAY_CLIENT_EMAIL:-}"
@@ -283,7 +284,7 @@ cat > "${XRAY_CLIENT_INFO_PATH}" <<EOF
 Xray VLESS+REALITY client connection
 ====================================
 Server address: ${SERVER_PUBLIC_IP}
-Server port: ${XRAY_PORT}
+Server port: ${XRAY_CLIENT_PORT}
 UUID: ${CLIENT_UUID}
 Flow: xtls-rprx-vision
 Security: reality
@@ -292,7 +293,7 @@ Public key: ${REALITY_PUBLIC_KEY}
 Short ID: ${SHORT_ID}
 
 Example URI (for v2rayN/NekoBox/etc):
-vless://${CLIENT_UUID}@${SERVER_PUBLIC_IP}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${XRAY_REALITY_SERVER_NAME}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#proxy-vpn-client1
+vless://${CLIENT_UUID}@${SERVER_PUBLIC_IP}:${XRAY_CLIENT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${XRAY_REALITY_SERVER_NAME}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#proxy-vpn-client1
 EOF
 
 # Xray container may run as non-root user; config must be world-readable.

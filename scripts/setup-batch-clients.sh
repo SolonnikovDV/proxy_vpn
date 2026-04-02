@@ -43,10 +43,12 @@ wg_genkey_value() {
 CLIENT_NAMES="${CLIENT_NAMES:-}"
 SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-}"
 WG_PORT="${WG_PORT:-51820}"
+WG_CLIENT_PORT="${WG_CLIENT_PORT:-${WG_PORT}}"
 WG_CLIENT_DNS="${WG_CLIENT_DNS:-1.1.1.1,1.0.0.1}"
 WG_BASE_PREFIX="${WG_BASE_PREFIX:-10.13.0}"
 WG_START_HOST="${WG_START_HOST:-20}"
 XRAY_PORT="${XRAY_PORT:-8443}"
+XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT:-${XRAY_PORT}}"
 
 [ -n "${CLIENT_NAMES}" ] || die "Set CLIENT_NAMES, e.g. CLIENT_NAMES=alice,bob,charlie"
 [ -n "${SERVER_PUBLIC_IP}" ] || die "Set SERVER_PUBLIC_IP, e.g. SERVER_PUBLIC_IP=203.0.113.10"
@@ -105,7 +107,7 @@ DNS = ${WG_CLIENT_DNS}
 [Peer]
 PublicKey = ${SERVER_PUBLIC_KEY}
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = ${SERVER_PUBLIC_IP}:${WG_PORT}
+Endpoint = ${SERVER_PUBLIC_IP}:${WG_CLIENT_PORT}
 PersistentKeepalive = 25
 EOF
 
@@ -136,7 +138,7 @@ PY
   cat > "${xray_client_file}" <<EOF
 Client: ${name}
 Server address: ${SERVER_PUBLIC_IP}
-Server port: ${XRAY_PORT}
+Server port: ${XRAY_CLIENT_PORT}
 UUID: ${client_uuid}
 Flow: xtls-rprx-vision
 Security: reality
@@ -144,7 +146,7 @@ SNI: ${XRAY_SNI}
 Public key: ${XRAY_PBK}
 Short ID: ${XRAY_SID}
 URI:
-vless://${client_uuid}@${SERVER_PUBLIC_IP}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${XRAY_SNI}&fp=chrome&pbk=${XRAY_PBK}&sid=${XRAY_SID}&type=tcp#proxy-vpn-${name}
+vless://${client_uuid}@${SERVER_PUBLIC_IP}:${XRAY_CLIENT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${XRAY_SNI}&fp=chrome&pbk=${XRAY_PBK}&sid=${XRAY_SID}&type=tcp#proxy-vpn-${name}
 EOF
 
   chmod 600 "${wg_client_conf}" "${xray_client_file}"

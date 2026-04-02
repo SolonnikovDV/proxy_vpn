@@ -113,10 +113,13 @@ export CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
 export CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}"
 export XRAY_PORT="${XRAY_PORT:-8443}"
 export WG_PORT="${WG_PORT:-51820}"
+export XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT:-${XRAY_PORT}}"
+export WG_CLIENT_PORT="${WG_CLIENT_PORT:-${WG_PORT}}"
 
 log "Deploying with:"
 log "  domain=${VPN_PANEL_DOMAIN}"
 log "  caddy_http=${CADDY_HTTP_PORT} caddy_https=${CADDY_HTTPS_PORT} xray=${XRAY_PORT} wg=${WG_PORT}"
+log "  client_ports: xray=${XRAY_CLIENT_PORT} wg=${WG_CLIENT_PORT}"
 
 prev_sha=""
 fallback_sha=""
@@ -151,6 +154,7 @@ rollback_to_prev() {
 
 report_event "started" "deploy" "Starting production deploy" "${current_sha}" "${target_sha}" "na" "${current_branch}"
 dc -f compose.yaml -f compose.prod.yaml up -d --build
+XRAY_PORT="${XRAY_PORT}" WG_PORT="${WG_PORT}" XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT}" WG_CLIENT_PORT="${WG_CLIENT_PORT}" CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT}" bash ./scripts/apply-port-map.sh
 
 log "--- docker compose ps ---"
 dc -f compose.yaml -f compose.prod.yaml ps

@@ -355,6 +355,8 @@ CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
 CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}"
 XRAY_PORT="${XRAY_PORT:-8443}"
 WG_PORT="${WG_PORT:-51820}"
+XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT:-${XRAY_PORT}}"
+WG_CLIENT_PORT="${WG_CLIENT_PORT:-${WG_PORT}}"
 CAPACITY_TARGET_ACTIVE_USERS="${CAPACITY_TARGET_ACTIVE_USERS:-15}"
 CAPACITY_CPU_WARN_P95="${CAPACITY_CPU_WARN_P95:-70}"
 CAPACITY_CPU_CRIT_P95="${CAPACITY_CPU_CRIT_P95:-80}"
@@ -452,6 +454,12 @@ if [ "${ENABLE_UFW}" = "1" ]; then
   ufw allow "${CADDY_HTTPS_PORT}/tcp"
   ufw allow "${XRAY_PORT}/tcp"
   ufw allow "${WG_PORT}/udp"
+  if [ "${XRAY_CLIENT_PORT}" != "${XRAY_PORT}" ]; then
+    ufw allow "${XRAY_CLIENT_PORT}/tcp"
+  fi
+  if [ "${WG_CLIENT_PORT}" != "${WG_PORT}" ]; then
+    ufw allow "${WG_CLIENT_PORT}/udp"
+  fi
   ufw --force enable
   ufw status verbose || true
 fi
@@ -559,14 +567,14 @@ if [ "${AUTO_GENERATE_VPN_CONFIGS}" = "1" ]; then
 
   if [ ! -f "${WG_SERVER_CONF_PATH}" ]; then
     run_with_timeout 180 "WireGuard config generation" \
-      su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && SERVER_PUBLIC_IP='${SERVER_PUBLIC_IP}' WG_PORT='${WG_PORT}' bash ./scripts/setup-wireguard.sh"
+      su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && SERVER_PUBLIC_IP='${SERVER_PUBLIC_IP}' WG_PORT='${WG_PORT}' WG_CLIENT_PORT='${WG_CLIENT_PORT}' bash ./scripts/setup-wireguard.sh"
   else
     log "WireGuard config exists, skip generation: ${WG_SERVER_CONF_PATH}"
   fi
 
   if [ ! -f "${XRAY_CONFIG_PATH_ABS}" ]; then
     run_with_timeout 180 "Xray REALITY config generation" \
-      su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && SERVER_PUBLIC_IP='${SERVER_PUBLIC_IP}' XRAY_PORT='${XRAY_PORT}' bash ./scripts/setup-xray-reality.sh"
+      su - "${TARGET_USER}" -c "cd '${DEPLOY_PATH}' && SERVER_PUBLIC_IP='${SERVER_PUBLIC_IP}' XRAY_PORT='${XRAY_PORT}' XRAY_CLIENT_PORT='${XRAY_CLIENT_PORT}' bash ./scripts/setup-xray-reality.sh"
   else
     log "Xray config exists, skip generation: ${XRAY_CONFIG_PATH_ABS}"
   fi
@@ -619,6 +627,8 @@ CADDY_HTTP_PORT=${CADDY_HTTP_PORT}
 CADDY_HTTPS_PORT=${CADDY_HTTPS_PORT}
 XRAY_PORT=${XRAY_PORT}
 WG_PORT=${WG_PORT}
+XRAY_CLIENT_PORT=${XRAY_CLIENT_PORT}
+WG_CLIENT_PORT=${WG_CLIENT_PORT}
 CAPACITY_TARGET_ACTIVE_USERS=${CAPACITY_TARGET_ACTIVE_USERS}
 CAPACITY_CPU_WARN_P95=${CAPACITY_CPU_WARN_P95}
 CAPACITY_CPU_CRIT_P95=${CAPACITY_CPU_CRIT_P95}

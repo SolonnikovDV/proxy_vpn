@@ -455,6 +455,8 @@ deploy_current() {
     log "Running production preflight"
     bash ./scripts/preflight-prod.sh
     PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
+    XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT:-${XRAY_PORT:-8443}}"
+    WG_CLIENT_PORT="${WG_CLIENT_PORT:-${WG_PORT:-51820}}"
     VPN_CORE_REBUILD_MODE="${VPN_CORE_REBUILD_MODE:-auto}" # auto | always | never
     vpn_core_rebuild="0"
     case "${VPN_CORE_REBUILD_MODE}" in
@@ -480,6 +482,12 @@ deploy_current() {
       log "Rebuilding/restarting full production stack"
       dc -f compose.yaml -f compose.prod.yaml up -d --build
     fi
+    XRAY_PORT="${XRAY_PORT:-8443}" \
+    WG_PORT="${WG_PORT:-51820}" \
+    XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT}" \
+    WG_CLIENT_PORT="${WG_CLIENT_PORT}" \
+    CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}" \
+    bash ./scripts/apply-port-map.sh
     dc -f compose.yaml -f compose.prod.yaml ps
     MODE=prod HEALTH_TIMEOUT=90 bash ./scripts/healthcheck-stack.sh
   else
@@ -496,6 +504,8 @@ rollback_to_previous() {
   git checkout -f "${LOCAL_SHA}"
   if [ "${MODE}" = "prod" ]; then
     PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
+    XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT:-${XRAY_PORT:-8443}}"
+    WG_CLIENT_PORT="${WG_CLIENT_PORT:-${WG_PORT:-51820}}"
     VPN_CORE_REBUILD_MODE="${VPN_CORE_REBUILD_MODE:-auto}" # auto | always | never
     rollback_vpn_core_rebuild="0"
     case "${VPN_CORE_REBUILD_MODE}" in
@@ -518,6 +528,12 @@ rollback_to_previous() {
     else
       dc -f compose.yaml -f compose.prod.yaml up -d --build
     fi
+    XRAY_PORT="${XRAY_PORT:-8443}" \
+    WG_PORT="${WG_PORT:-51820}" \
+    XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT}" \
+    WG_CLIENT_PORT="${WG_CLIENT_PORT}" \
+    CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}" \
+    bash ./scripts/apply-port-map.sh
     MODE=prod HEALTH_TIMEOUT=120 bash ./scripts/healthcheck-stack.sh
   else
     dc -f compose.yaml up -d --build

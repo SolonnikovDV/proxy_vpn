@@ -2126,6 +2126,21 @@ def _normalize_endpoint_with_port(endpoint: str, wg_port: str) -> str:
     return f"{raw}:{wg_port}"
 
 
+def _current_port_map() -> dict[str, str]:
+    xray_runtime_port = str(os.getenv("XRAY_PORT", "8443") or "8443").strip()
+    wg_runtime_port = str(os.getenv("WG_PORT", "51820") or "51820").strip()
+    xray_client_port = str(os.getenv("XRAY_CLIENT_PORT", xray_runtime_port) or xray_runtime_port).strip()
+    wg_client_port = str(os.getenv("WG_CLIENT_PORT", wg_runtime_port) or wg_runtime_port).strip()
+    return {
+        "xray_client_port": xray_client_port,
+        "xray_runtime_port": xray_runtime_port,
+        "wg_client_port": wg_client_port,
+        "wg_runtime_port": wg_runtime_port,
+        "xray_map": f"{xray_client_port}/tcp -> {xray_runtime_port}/tcp",
+        "wg_map": f"{wg_client_port}/udp -> {wg_runtime_port}/udp",
+    }
+
+
 def _is_ipv4_literal(value: str) -> bool:
     raw = str(value or "").strip()
     if not raw:
@@ -2224,7 +2239,7 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
     endpoint = str(tpl.get("endpoint") or "").strip()
     panel_domain = str(os.getenv("VPN_PANEL_DOMAIN", "") or "").strip()
     server_public_ip = str(os.getenv("SERVER_PUBLIC_IP", "") or "").strip()
-    wg_port = str(os.getenv("WG_PORT", "51820") or "51820").strip()
+    wg_port = str(os.getenv("WG_CLIENT_PORT", os.getenv("WG_PORT", "51820")) or "51820").strip()
     endpoint_host = panel_domain if panel_domain and panel_domain != "panel.example.com" else ""
     if server_public_ip and server_public_ip != "panel.example.com":
         endpoint_host = server_public_ip
@@ -3136,6 +3151,22 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{title}</title>
+  <script>
+    (function() {{
+      try {{
+        var theme = localStorage.getItem('proxy_vpn_theme');
+        if (theme !== 'dark' && theme !== 'light') {{
+          theme = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+        }}
+        var tone = localStorage.getItem('proxy_vpn_theme_tone') === 'soft' ? 'soft' : 'strict';
+        var root = document.documentElement;
+        root.setAttribute('data-theme', theme);
+        root.setAttribute('data-theme-tone', tone);
+      }} catch (e) {{
+        // ignore storage/theme probing errors
+      }}
+    }})();
+  </script>
   <style>
     :root {{
       --bg-1: #dbe5f5;
@@ -3159,7 +3190,7 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       --banner-text: #1e3a8a;
       --shadow: 0 20px 40px rgba(15, 23, 42, 0.16);
     }}
-    body[data-theme="dark"] {{
+    [data-theme="dark"] {{
       --bg-1: #0b1220;
       --bg-2: #111827;
       --panel: rgba(9, 15, 27, 0.78);
@@ -3189,14 +3220,14 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       min-height: 100vh;
       color-scheme: light;
     }}
-    body[data-theme="dark"] {{
+    [data-theme="dark"] {{
       color-scheme: dark;
       background:
         radial-gradient(900px 420px at 18% -22%, rgba(59,130,246,0.24) 0%, rgba(17,24,39,0) 62%),
         radial-gradient(780px 380px at 88% -24%, rgba(14,165,233,0.16) 0%, rgba(17,24,39,0) 58%),
         linear-gradient(180deg, #0b1220 0%, #0f172a 48%, #111827 100%);
     }}
-    body[data-theme="dark"][data-theme-tone="soft"] {{
+    [data-theme="dark"][data-theme-tone="soft"] {{
       --panel: rgba(18, 24, 38, 0.78);
       --panel-strong: rgba(22, 30, 46, 0.9);
       --stroke: rgba(148, 163, 184, 0.22);
@@ -3282,7 +3313,7 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       color: #1d4ed8;
       font-weight: 600;
     }}
-    body[data-theme="dark"] .nav-item.active {{
+    [data-theme="dark"] .nav-item.active {{
       color: #bfdbfe;
       background: rgba(59,130,246,0.22);
       border-color: rgba(96,165,250,0.42);
@@ -3408,11 +3439,11 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
     .status-stopped {{ background: rgba(100,116,139,0.18); color: #334155; }}
     .status-in_error {{ background: rgba(239,68,68,0.18); color: #991b1b; }}
     .status-unknown {{ background: rgba(148,163,184,0.2); color: #334155; }}
-    body[data-theme="dark"] .status-running {{ background: rgba(34,197,94,0.22); color: #86efac; }}
-    body[data-theme="dark"] .status-pending {{ background: rgba(245,158,11,0.22); color: #fcd34d; }}
-    body[data-theme="dark"] .status-stopped {{ background: rgba(148,163,184,0.24); color: #cbd5e1; }}
-    body[data-theme="dark"] .status-in_error {{ background: rgba(239,68,68,0.24); color: #fca5a5; }}
-    body[data-theme="dark"] .status-unknown {{ background: rgba(148,163,184,0.22); color: #cbd5e1; }}
+    [data-theme="dark"] .status-running {{ background: rgba(34,197,94,0.22); color: #86efac; }}
+    [data-theme="dark"] .status-pending {{ background: rgba(245,158,11,0.22); color: #fcd34d; }}
+    [data-theme="dark"] .status-stopped {{ background: rgba(148,163,184,0.24); color: #cbd5e1; }}
+    [data-theme="dark"] .status-in_error {{ background: rgba(239,68,68,0.24); color: #fca5a5; }}
+    [data-theme="dark"] .status-unknown {{ background: rgba(148,163,184,0.22); color: #cbd5e1; }}
     .btn-ghost {{
       background: var(--ghost-bg);
       color: var(--ghost-text);
@@ -3441,7 +3472,7 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       border: 1px solid rgba(50,65,90,0.16);
       background: rgba(255,255,255,0.65);
     }}
-    body[data-theme="dark"] .tab-strip {{
+    [data-theme="dark"] .tab-strip {{
       border-color: rgba(148,163,184,0.28);
       background: rgba(15,23,42,0.74);
     }}
@@ -3454,14 +3485,14 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       font-size: 13px;
       font-weight: 600;
     }}
-    body[data-theme="dark"] .tab-btn {{
+    [data-theme="dark"] .tab-btn {{
       color: #cbd5e1;
     }}
     .tab-btn:hover {{
       background: rgba(255,255,255,0.8);
       border-color: rgba(50,65,90,0.2);
     }}
-    body[data-theme="dark"] .tab-btn:hover {{
+    [data-theme="dark"] .tab-btn:hover {{
       background: rgba(30,41,59,0.76);
       border-color: rgba(148,163,184,0.28);
     }}
@@ -3470,7 +3501,7 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       color: #1d4ed8;
       border-color: rgba(37,99,235,0.34);
     }}
-    body[data-theme="dark"] .tab-btn.active {{
+    [data-theme="dark"] .tab-btn.active {{
       background: rgba(59,130,246,0.22);
       color: #bfdbfe;
       border-color: rgba(96,165,250,0.44);
@@ -3522,7 +3553,7 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       padding: 12px;
       box-shadow: 0 24px 60px rgba(2, 6, 23, 0.35);
     }}
-    body[data-theme="dark"] .modal-card {{
+    [data-theme="dark"] .modal-card {{
       background: #0b1220;
       border-color: rgba(148,163,184,0.3);
       box-shadow: 0 30px 70px rgba(2, 6, 23, 0.62);
@@ -3545,54 +3576,54 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       cursor: pointer;
       font-size: 13px;
     }}
-    body[data-theme="dark"] .label-muted {{
+    [data-theme="dark"] .label-muted {{
       color: #94a3b8;
     }}
-    body[data-theme="dark"] .user-meta-row {{
+    [data-theme="dark"] .user-meta-row {{
       border-bottom-color: rgba(148,163,184,0.26);
     }}
-    body[data-theme="dark"] .topbar {{
+    [data-theme="dark"] .topbar {{
       border-color: rgba(148,163,184,0.26);
     }}
-    body[data-theme="dark"] .card {{
+    [data-theme="dark"] .card {{
       box-shadow: 0 14px 34px rgba(2, 6, 23, 0.36);
     }}
-    body[data-theme="dark"] th,
-    body[data-theme="dark"] td {{
+    [data-theme="dark"] th,
+    [data-theme="dark"] td {{
       border-bottom-color: rgba(148,163,184,0.2);
     }}
-    body[data-theme="dark"] pre {{
+    [data-theme="dark"] pre {{
       border-color: rgba(148,163,184,0.24);
     }}
-    body[data-theme="dark"] a {{
+    [data-theme="dark"] a {{
       color: #93c5fd;
     }}
-    body[data-theme="dark"] [style*="rgba(255,255,255,0.76)"] {{
+    [data-theme="dark"] [style*="rgba(255,255,255,0.76)"] {{
       background: rgba(15,23,42,0.78) !important;
       color: #e5e7eb !important;
       border-color: rgba(148,163,184,0.28) !important;
     }}
-    body[data-theme="dark"] [style*="rgba(255,255,255,0.65)"] {{
+    [data-theme="dark"] [style*="rgba(255,255,255,0.65)"] {{
       background: rgba(15,23,42,0.74) !important;
       border-color: rgba(148,163,184,0.24) !important;
     }}
-    body[data-theme="dark"] [style*="rgba(255,255,255,0.6)"] {{
+    [data-theme="dark"] [style*="rgba(255,255,255,0.6)"] {{
       background: rgba(15,23,42,0.72) !important;
       border-color: rgba(148,163,184,0.24) !important;
     }}
-    body[data-theme="dark"] button {{
+    [data-theme="dark"] button {{
       box-shadow: 0 8px 16px rgba(30,64,175,0.24);
     }}
-    body[data-theme="dark"] button:hover {{
+    [data-theme="dark"] button:hover {{
       box-shadow: 0 10px 18px rgba(30,64,175,0.3);
       filter: brightness(1.05);
     }}
-    body[data-theme="dark"] .btn-ghost {{
+    [data-theme="dark"] .btn-ghost {{
       border-color: rgba(148,163,184,0.34);
       background: rgba(30,41,59,0.66);
       color: #dbeafe;
     }}
-    body[data-theme="dark"] .btn-ghost:hover {{
+    [data-theme="dark"] .btn-ghost:hover {{
       background: rgba(51,65,85,0.75);
       box-shadow: 0 10px 20px rgba(2,6,23,0.35);
     }}
@@ -3687,7 +3718,8 @@ async function sidebarLogout() {{
 }}
 function applyTheme(theme) {{
   const t = theme === 'dark' ? 'dark' : 'light';
-  document.body.setAttribute('data-theme', t);
+  document.documentElement.setAttribute('data-theme', t);
+  if (document.body) document.body.setAttribute('data-theme', t);
   localStorage.setItem('proxy_vpn_theme', t);
   const btn = document.getElementById('theme-toggle-btn');
   if (btn) btn.textContent = t === 'dark' ? 'Light mode' : 'Night mode';
@@ -3699,15 +3731,16 @@ function detectThemeTone() {{
 }}
 function applyThemeTone(tone) {{
   const v = tone === 'soft' ? 'soft' : 'strict';
-  document.body.setAttribute('data-theme-tone', v);
+  document.documentElement.setAttribute('data-theme-tone', v);
+  if (document.body) document.body.setAttribute('data-theme-tone', v);
   localStorage.setItem('proxy_vpn_theme_tone', v);
   refreshThemeToneButton();
 }}
 function refreshThemeToneButton() {{
   const btn = document.getElementById('theme-tone-btn');
   if (!btn) return;
-  const currentTheme = document.body.getAttribute('data-theme') || 'light';
-  const tone = document.body.getAttribute('data-theme-tone') || detectThemeTone();
+  const currentTheme = document.documentElement.getAttribute('data-theme') || 'light';
+  const tone = document.documentElement.getAttribute('data-theme-tone') || detectThemeTone();
   btn.textContent = 'Dark tone: ' + tone;
   btn.disabled = currentTheme !== 'dark';
   btn.title = currentTheme !== 'dark' ? 'Enable Night mode first' : 'Switch dark palette';
@@ -3718,11 +3751,11 @@ function detectPreferredTheme() {{
   return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }}
 function toggleTheme() {{
-  const current = document.body.getAttribute('data-theme') || detectPreferredTheme();
+  const current = document.documentElement.getAttribute('data-theme') || detectPreferredTheme();
   applyTheme(current === 'dark' ? 'light' : 'dark');
 }}
 function toggleThemeTone() {{
-  const current = document.body.getAttribute('data-theme-tone') || detectThemeTone();
+  const current = document.documentElement.getAttribute('data-theme-tone') || detectThemeTone();
   applyThemeTone(current === 'soft' ? 'strict' : 'soft');
 }}
 async function refreshGlobalReleaseState() {{
@@ -5536,6 +5569,7 @@ def admin(request: Request) -> HTMLResponse:
             f"<td><code style='font-size:12px'>{escape(row['public_key'])}</code></td>"
             f"<td>{escape(row['label'] or '')}</td>"
             f"<td>RX {row['last_rx_bytes']} / TX {row['last_tx_bytes']}</td>"
+            f"<td><code>{escape(_current_port_map()['wg_map'])}</code></td>"
             f"<td>"
             f"<button class='btn-ghost' data-action='run-wg-diagnostics-user' data-user-id='{int(row['user_id'])}' "
             f"data-username='{escape(str(row['username']))}' data-email='{escape(str(row['email']))}'>Diagnostics</button> "
@@ -5546,7 +5580,7 @@ def admin(request: Request) -> HTMLResponse:
         ]
     )
     if not wg_bindings_html:
-        wg_bindings_html = "<tr><td colspan='5' class='muted'>No WG peer bindings yet</td></tr>"
+        wg_bindings_html = "<tr><td colspan='6' class='muted'>No WG peer bindings yet</td></tr>"
 
     xray_bindings_html = "".join(
         [
@@ -5555,13 +5589,14 @@ def admin(request: Request) -> HTMLResponse:
             f"<td><code style='font-size:12px'>{escape(row['client_email'])}</code></td>"
             f"<td>{escape(row['label'] or '')}</td>"
             f"<td>RX {row['last_downlink_bytes']} / TX {row['last_uplink_bytes']}</td>"
+            f"<td><code>{escape(_current_port_map()['xray_map'])}</code></td>"
             f"<td><button data-action='remove-xray-binding' data-client-email='{escape(row['client_email'])}'>Unbind</button></td>"
             f"</tr>"
             for row in xray_bind_rows
         ]
     )
     if not xray_bindings_html:
-        xray_bindings_html = "<tr><td colspan='5' class='muted'>No Xray client bindings yet</td></tr>"
+        xray_bindings_html = "<tr><td colspan='6' class='muted'>No Xray client bindings yet</td></tr>"
 
     return _page(
         "proxy-vpn admin panel",
@@ -5896,7 +5931,7 @@ def admin(request: Request) -> HTMLResponse:
   </div>
   <table style="width:100%; border-collapse:collapse; margin-top:10px;">
     <thead>
-      <tr><th align="left">User</th><th align="left">Public key</th><th align="left">Label</th><th align="left">Last totals</th><th align="left">Action</th></tr>
+      <tr><th align="left">User</th><th align="left">Public key</th><th align="left">Label</th><th align="left">Last totals</th><th align="left">Port map</th><th align="left">Action</th></tr>
     </thead>
     <tbody id="wg-bindings-body">{wg_bindings_html}</tbody>
   </table>
@@ -5913,7 +5948,7 @@ def admin(request: Request) -> HTMLResponse:
   </div>
   <table style="width:100%; border-collapse:collapse; margin-top:10px;">
     <thead>
-      <tr><th align="left">User</th><th align="left">Client email</th><th align="left">Label</th><th align="left">Last totals</th><th align="left">Action</th></tr>
+      <tr><th align="left">User</th><th align="left">Client email</th><th align="left">Label</th><th align="left">Last totals</th><th align="left">Port map</th><th align="left">Action</th></tr>
     </thead>
     <tbody id="xray-bindings-body">{xray_bindings_html}</tbody>
   </table>
@@ -5950,9 +5985,9 @@ def admin(request: Request) -> HTMLResponse:
   <p class="muted" id="bindings-refresh-meta">bindings refresh: waiting for first live cycle...</p>
   <table style="width:100%; border-collapse:collapse;">
     <thead>
-      <tr><th align="left">User</th><th align="left">Email</th><th align="left">Role</th><th align="left">RX 24h</th><th align="left">TX 24h</th><th align="left">Total 24h</th></tr>
+      <tr><th align="left">User</th><th align="left">Email</th><th align="left">Role</th><th align="left">RX 24h</th><th align="left">TX 24h</th><th align="left">Total 24h</th><th align="left">Port map</th></tr>
     </thead>
-    <tbody id="user-traffic-body"><tr><td colspan="6" class="muted">Loading...</td></tr></tbody>
+    <tbody id="user-traffic-body"><tr><td colspan="7" class="muted">Loading...</td></tr></tbody>
   </table>
   <div style="margin-top:10px;display:grid;grid-template-columns:minmax(240px,1fr) auto;gap:8px;align-items:end;">
     <div>
@@ -5974,6 +6009,7 @@ def admin(request: Request) -> HTMLResponse:
 
 <div class="card admin-section" data-section="logs" data-subsection="admin-log">
   <h2>Admin actions log</h2>
+  <p class="muted" id="admin-out-meta">Loading latest deploy/update/service log summary...</p>
   <pre id="admin-out">Ready.</pre>
 </div>
 <div id="create-user-modal" class="modal-backdrop">
@@ -6030,6 +6066,13 @@ let serviceLogsIntervalId = null;
 let adminRefreshIntervalId = null;
 let securityEventsCache = [];
 let pairedStatusCache = [];
+let adminPortMap = null;
+let latestServices = [];
+let latestServicesReason = '';
+let latestDeployEvents = [];
+let latestDeployPath = '';
+let latestUpdateAudit = [];
+let latestUpdateAuditPath = '';
 let currentRknBlacklistItems = [];
 const bypassConflictResolution = {{}};
 const BYPASS_PRESET_CONSERVATIVE = [
@@ -6637,10 +6680,12 @@ function closeCreateUserModal(event) {{
   const modal = document.getElementById('create-user-modal');
   if (modal) modal.style.display = 'none';
 }}
-function renderUserTraffic(items) {{
+function renderUserTraffic(items, portMap) {{
   const body = document.getElementById('user-traffic-body');
+  const pm = portMap || adminPortMap || {{}};
+  const mapText = String(pm.wg_map || '-');
   if (!items || items.length === 0) {{
-    body.innerHTML = '<tr><td colspan="6" class="muted">No data</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" class="muted">No data</td></tr>';
     return;
   }}
   body.innerHTML = items.map(i => {{
@@ -6654,14 +6699,17 @@ function renderUserTraffic(items) {{
       <td>${{fmtBytes(rx)}}</td>
       <td>${{fmtBytes(tx)}}</td>
       <td>${{fmtBytes(total)}}</td>
+      <td><code>${{escHtml(mapText)}}</code></td>
     </tr>`;
   }}).join('');
 }}
-function renderWireGuardBindings(items) {{
+function renderWireGuardBindings(items, portMap) {{
   const body = document.getElementById('wg-bindings-body');
   if (!body) return;
+  const pm = portMap || adminPortMap || {{}};
+  const mapText = String(pm.wg_map || '-');
   if (!items || items.length === 0) {{
-    body.innerHTML = '<tr><td colspan="5" class="muted">No WG peer bindings yet</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" class="muted">No WG peer bindings yet</td></tr>';
     return;
   }}
   body.innerHTML = items.map((i) => {{
@@ -6671,6 +6719,7 @@ function renderWireGuardBindings(items) {{
       <td><code style="font-size:12px">${{escHtml(key)}}</code></td>
       <td>${{escHtml(i.label || '')}}</td>
       <td>RX ${{fmtBytes(Number(i.last_rx_bytes || 0))}} / TX ${{fmtBytes(Number(i.last_tx_bytes || 0))}}</td>
+      <td><code>${{escHtml(String(i.port_map || mapText))}}</code></td>
       <td>
         <button class="btn-ghost" data-action="run-wg-diagnostics-user" data-user-id="${{Number(i.user_id || 0)}}">Diagnostics</button>
         <button data-action="remove-wg-binding" data-public-key="${{escHtml(key)}}">Unbind</button>
@@ -6678,11 +6727,13 @@ function renderWireGuardBindings(items) {{
     </tr>`;
   }}).join('');
 }}
-function renderXrayBindings(items) {{
+function renderXrayBindings(items, portMap) {{
   const body = document.getElementById('xray-bindings-body');
   if (!body) return;
+  const pm = portMap || adminPortMap || {{}};
+  const mapText = String(pm.xray_map || '-');
   if (!items || items.length === 0) {{
-    body.innerHTML = '<tr><td colspan="5" class="muted">No Xray client bindings yet</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" class="muted">No Xray client bindings yet</td></tr>';
     return;
   }}
   body.innerHTML = items.map((i) => {{
@@ -6692,9 +6743,50 @@ function renderXrayBindings(items) {{
       <td><code style="font-size:12px">${{escHtml(email)}}</code></td>
       <td>${{escHtml(i.label || '')}}</td>
       <td>RX ${{fmtBytes(Number(i.last_downlink_bytes || 0))}} / TX ${{fmtBytes(Number(i.last_uplink_bytes || 0))}}</td>
+      <td><code>${{escHtml(String(i.port_map || mapText))}}</code></td>
       <td><button data-action="remove-xray-binding" data-client-email="${{escHtml(email)}}">Unbind</button></td>
     </tr>`;
   }}).join('');
+}}
+function renderAdminActionLogPanel() {{
+  const out = document.getElementById('admin-out');
+  const meta = document.getElementById('admin-out-meta');
+  if (!out) return;
+  const serviceErr = (latestServices || []).filter((s) => String(s.state || '') !== 'running');
+  const latestDeploy = (latestDeployEvents || [])[0] || null;
+  const latestUpdate = (latestUpdateAudit || [])[0] || null;
+  const lines = [];
+  lines.push('== Services ==');
+  if (latestServicesReason) lines.push('reason: ' + latestServicesReason);
+  if (serviceErr.length === 0) {{
+    lines.push('all managed containers are running');
+  }} else {{
+    serviceErr.forEach((s) => {{
+      lines.push(String(s.name || '-') + ' :: ' + String(s.state || '-') + ' / ' + String(s.raw_status || '-'));
+    }});
+  }}
+  lines.push('');
+  lines.push('== Latest deploy event ==');
+  if (latestDeploy) {{
+    lines.push('ts=' + String(latestDeploy.ts || '-') + ' status=' + String(latestDeploy.status || '-'));
+    lines.push('from=' + String(latestDeploy.from || '-') + ' to=' + String(latestDeploy.to || '-'));
+    lines.push('details=' + String(latestDeploy.details || latestDeploy.raw || '-'));
+  }} else {{
+    lines.push('no deploy events yet');
+  }}
+  lines.push('');
+  lines.push('== Latest update audit ==');
+  if (latestUpdate) {{
+    lines.push('ts=' + String(latestUpdate.ts || '-') + ' status=' + String(latestUpdate.status || '-'));
+    lines.push('branch=' + String(latestUpdate.branch || '-') + ' files=' + String(latestUpdate.file_count || 0) + ' commits=' + String(latestUpdate.commit_count || 0));
+    lines.push('message=' + String(latestUpdate.message || '-'));
+  }} else {{
+    lines.push('no update audit records yet');
+  }}
+  out.textContent = lines.join('\\n');
+  if (meta) {{
+    meta.textContent = 'Deploy file: ' + (latestDeployPath || '-') + ' | Update file: ' + (latestUpdateAuditPath || '-') + ' | Service logs: open from Overview -> Services -> Logs';
+  }}
 }}
 function renderPendingBadges(countRaw) {{
   const count = Math.max(0, Number(countRaw || 0));
@@ -7473,7 +7565,8 @@ async function refreshAdminLive() {{
   }}
   if (trafficR.ok) {{
     const t = await trafficR.json();
-    renderUserTraffic(t.items || []);
+    if (t.port_map) adminPortMap = t.port_map;
+    renderUserTraffic(t.items || [], t.port_map || adminPortMap);
     const src = document.getElementById('traffic-source');
     if (src) src.textContent = 'source: ' + (t.source || '-');
     const sel = document.getElementById('traffic-user-select');
@@ -7484,17 +7577,26 @@ async function refreshAdminLive() {{
   }}
   if (servicesR.ok) {{
     const s = await servicesR.json();
+    latestServices = Array.isArray(s.items) ? s.items : [];
+    latestServicesReason = String(s.reason || '');
     renderServices(s.items || [], s.xray_collector || null);
     const meta = document.getElementById('services-meta');
     if (meta && s.reason) meta.textContent = s.reason;
+    renderAdminActionLogPanel();
   }}
   if (deployEventsR.ok) {{
     const d = await deployEventsR.json();
+    latestDeployEvents = Array.isArray(d.items) ? d.items : [];
+    latestDeployPath = String(d.path || '');
     renderDeployEvents(d.items || [], d.path || '', d.reason || '');
+    renderAdminActionLogPanel();
   }}
   if (updateAuditR.ok) {{
     const u = await updateAuditR.json();
+    latestUpdateAudit = Array.isArray(u.items) ? u.items : [];
+    latestUpdateAuditPath = String(u.path || '');
     renderUpdateAudit(u.items || [], u.path || '', u.reason || '');
+    renderAdminActionLogPanel();
   }}
   if (capacityR.ok) {{
     const c = await capacityR.json();
@@ -7531,16 +7633,18 @@ async function refreshAdminLive() {{
   if (wgBindingsR.ok) {{
     const j = await wgBindingsR.json();
     const items = Array.isArray(j.items) ? j.items : [];
+    if (j.port_map) adminPortMap = j.port_map;
     wgRows = items.length;
     wgOk = true;
-    renderWireGuardBindings(items);
+    renderWireGuardBindings(items, j.port_map || adminPortMap);
   }}
   if (xrayBindingsR.ok) {{
     const j = await xrayBindingsR.json();
     const items = Array.isArray(j.items) ? j.items : [];
+    if (j.port_map) adminPortMap = j.port_map;
     xrayRows = items.length;
     xrayOk = true;
-    renderXrayBindings(items);
+    renderXrayBindings(items, j.port_map || adminPortMap);
   }}
   renderBindingsRefreshMeta(wgOk, xrayOk, wgRows, xrayRows);
 }}
@@ -8291,7 +8395,7 @@ def user_device_config(
     tpl = _read_xray_connection_template()
 
     host = tpl.get("server_address", "").strip() or request.url.hostname or "127.0.0.1"
-    port = tpl.get("server_port", "").strip() or os.environ.get("XRAY_PORT", "8443")
+    port = tpl.get("server_port", "").strip() or os.environ.get("XRAY_CLIENT_PORT", os.environ.get("XRAY_PORT", "8443"))
     sni = tpl.get("sni", "").strip() or host
     pbk = tpl.get("public_key", "").strip()
     sid = tpl.get("short_id", "").strip()
@@ -8336,7 +8440,7 @@ def user_device_config(
         }
     wg_server_public_key = _get_wireguard_server_public_key(str(wg_tpl.get("server_public_key", "")))
     wg_recommended_mtu = _recommended_wg_mtu(device_type, platform, str(wg_tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)))
-    wg_port = str(os.getenv("WG_PORT", "51820") or "51820").strip()
+    wg_port = str(os.getenv("WG_CLIENT_PORT", os.getenv("WG_PORT", "51820")) or "51820").strip()
     panel_domain = str(os.getenv("VPN_PANEL_DOMAIN", "") or "").strip()
     wg_endpoint = str(wg_tpl.get("endpoint", "") or "").strip()
     if panel_domain and panel_domain != "panel.example.com":
@@ -9334,11 +9438,13 @@ def admin_user_traffic_summary(request: Request, hours: int = 24) -> JSONRespons
             (f"-{hours} hours", f"-{hours} hours", f"-{hours} hours"),
         ).fetchall()
         source = "wireguard_xray_exact" if use_exact else "estimated_session_share"
+    port_map = _current_port_map()
     return JSONResponse(
         {
             "status": "ok",
             "hours": hours,
             "source": source,
+            "port_map": port_map,
             "items": [dict(r) for r in rows],
         }
     )
@@ -9462,7 +9568,7 @@ def admin_wireguard_diagnostics(
                 tpl = _parse_wireguard_client_template()
                 panel_domain = str(os.getenv("VPN_PANEL_DOMAIN", "") or "").strip()
                 server_public_ip = str(os.getenv("SERVER_PUBLIC_IP", "") or "").strip()
-                wg_port = str(os.getenv("WG_PORT", "51820") or "51820").strip()
+                wg_port = str(os.getenv("WG_CLIENT_PORT", os.getenv("WG_PORT", "51820")) or "51820").strip()
                 endpoint_host = panel_domain if panel_domain and panel_domain != "panel.example.com" else ""
                 if server_public_ip and server_public_ip != "panel.example.com":
                     endpoint_host = server_public_ip
@@ -9536,7 +9642,13 @@ def admin_wireguard_bindings(request: Request) -> JSONResponse:
             ORDER BY b.id DESC
             """
         ).fetchall()
-    return JSONResponse({"status": "ok", "items": [dict(r) for r in rows]})
+    port_map = _current_port_map()
+    items = []
+    for r in rows:
+        item = dict(r)
+        item["port_map"] = port_map["wg_map"]
+        items.append(item)
+    return JSONResponse({"status": "ok", "port_map": port_map, "items": items})
 
 
 @app.post("/api/v1/admin/wireguard-bindings")
@@ -9632,7 +9744,13 @@ def admin_xray_bindings(request: Request) -> JSONResponse:
             ORDER BY b.id DESC
             """
         ).fetchall()
-    return JSONResponse({"status": "ok", "items": [dict(r) for r in rows]})
+    port_map = _current_port_map()
+    items = []
+    for r in rows:
+        item = dict(r)
+        item["port_map"] = port_map["xray_map"]
+        items.append(item)
+    return JSONResponse({"status": "ok", "port_map": port_map, "items": items})
 
 
 @app.post("/api/v1/admin/xray-bindings")

@@ -119,6 +119,8 @@ run_prod() {
   export VPN_PANEL_DOMAIN="${VPN_PANEL_DOMAIN:-}"
   export XRAY_PORT="${XRAY_PORT:-8443}"
   export WG_PORT="${WG_PORT:-51820}"
+  export XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT:-${XRAY_PORT}}"
+  export WG_CLIENT_PORT="${WG_CLIENT_PORT:-${WG_PORT}}"
   export PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
   export VPN_CORE_REBUILD_MODE="${VPN_CORE_REBUILD_MODE:-auto}" # auto | always | never
   export PROD_DEPLOY_SHA_FILE="${PROD_DEPLOY_SHA_FILE:-logs/last-prod-up.sha}"
@@ -199,10 +201,21 @@ EOF
       git rev-parse HEAD > "${PROD_DEPLOY_SHA_FILE}" 2>/dev/null || true
     fi
   }
+  apply_dynamic_port_map() {
+    if [ -x "./scripts/apply-port-map.sh" ]; then
+      XRAY_PORT="${XRAY_PORT}" \
+      WG_PORT="${WG_PORT}" \
+      XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT}" \
+      WG_CLIENT_PORT="${WG_CLIENT_PORT}" \
+      CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}" \
+      bash ./scripts/apply-port-map.sh
+    fi
+  }
   case "${ACTION}" in
     up)
       bash ./scripts/preflight-prod.sh
       prod_up_stack
+      apply_dynamic_port_map
       dc -f compose.yaml -f compose.prod.yaml up -d --force-recreate caddy
       run_prod_smoke_checks
       dc -f compose.yaml -f compose.prod.yaml ps
@@ -212,8 +225,8 @@ EOF
       log "  https://${VPN_PANEL_DOMAIN}/login"
       log "  https://${VPN_PANEL_DOMAIN}/admin"
       log "VPN endpoints:"
-      log "  WireGuard endpoint: ${VPN_PANEL_DOMAIN}:${WG_PORT} (client: wireguard/conf/client1.conf)"
-      log "  Xray endpoint: ${VPN_PANEL_DOMAIN}:${XRAY_PORT} (client: xray/client-connection.txt)"
+      log "  WireGuard runtime: ${VPN_PANEL_DOMAIN}:${WG_PORT} | client: ${VPN_PANEL_DOMAIN}:${WG_CLIENT_PORT}"
+      log "  Xray runtime: ${VPN_PANEL_DOMAIN}:${XRAY_PORT} | client: ${VPN_PANEL_DOMAIN}:${XRAY_CLIENT_PORT}"
       ;;
     down)
       dc -f compose.yaml -f compose.prod.yaml down
@@ -224,6 +237,7 @@ EOF
       fi
       bash ./scripts/preflight-prod.sh
       prod_up_stack
+      apply_dynamic_port_map
       dc -f compose.yaml -f compose.prod.yaml up -d --force-recreate caddy
       run_prod_smoke_checks
       dc -f compose.yaml -f compose.prod.yaml ps
@@ -233,8 +247,8 @@ EOF
       log "  https://${VPN_PANEL_DOMAIN}/login"
       log "  https://${VPN_PANEL_DOMAIN}/admin"
       log "VPN endpoints:"
-      log "  WireGuard endpoint: ${VPN_PANEL_DOMAIN}:${WG_PORT} (client: wireguard/conf/client1.conf)"
-      log "  Xray endpoint: ${VPN_PANEL_DOMAIN}:${XRAY_PORT} (client: xray/client-connection.txt)"
+      log "  WireGuard runtime: ${VPN_PANEL_DOMAIN}:${WG_PORT} | client: ${VPN_PANEL_DOMAIN}:${WG_CLIENT_PORT}"
+      log "  Xray runtime: ${VPN_PANEL_DOMAIN}:${XRAY_PORT} | client: ${VPN_PANEL_DOMAIN}:${XRAY_CLIENT_PORT}"
       ;;
     logs)
       dc -f compose.yaml -f compose.prod.yaml logs -f caddy api xray wireguard
