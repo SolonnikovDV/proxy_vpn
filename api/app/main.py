@@ -1727,6 +1727,35 @@ def _ensure_xray_client_in_config(xray_uuid: str, xray_email: str) -> None:
             pass
 
 
+def _ensure_xray_binding_for_user(user_id: int, client_email: str, label: str = "auto-profile") -> None:
+    key = str(client_email or "").strip().lower()
+    if not key:
+        return
+    with _db_connect() as con:
+        exists = con.execute(
+            "SELECT id FROM xray_client_bindings WHERE client_email = ?",
+            (key,),
+        ).fetchone()
+        if exists:
+            con.execute(
+                """
+                UPDATE xray_client_bindings
+                SET user_id = ?, label = COALESCE(NULLIF(label, ''), ?)
+                WHERE client_email = ?
+                """,
+                (int(user_id), str(label or "auto-profile"), key),
+            )
+        else:
+            con.execute(
+                """
+                INSERT INTO xray_client_bindings (user_id, client_email, label, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (int(user_id), key, str(label or "auto-profile"), _now().isoformat()),
+            )
+        con.commit()
+
+
 def _collect_xray_user_traffic(con: sqlite3.Connection, ts_iso: str) -> None:
     totals = _read_xray_user_totals()
     if not totals:
@@ -2267,7 +2296,7 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       <div id="update-banner"></div>
       <div class="wrap">{body}</div>
       <div class="app-footer">
-        <div>Author: Dmitry Solodovnikov · Telegram: <a href="https://t.me/Dmitry_as_Solod" target="_blank" rel="noopener noreferrer">@Dmitry_as_Solod</a></div>
+        <div>Author: Dmitry Solonnikov · Telegram: <a href="https://t.me/Dmitry_as_Solod" target="_blank" rel="noopener noreferrer">@Dmitry_as_Solod</a></div>
         <div>License: <a href="/license">MIT</a></div>
       </div>
     </main>
@@ -2773,9 +2802,9 @@ def about_page(request: Request) -> HTMLResponse:
   </table>
   <p class="muted" id="about-history-meta"></p>
   <h3 style="margin-top:12px;">Authorship, rights and license</h3>
-  <div class="user-meta-row"><div class="label-muted">Author</div><div>Dmitry Solodovnikov</div></div>
+  <div class="user-meta-row"><div class="label-muted">Author</div><div>Dmitry Solonnikov</div></div>
   <div class="user-meta-row"><div class="label-muted">Contacts</div><div><a href="https://t.me/Dmitry_as_Solod" target="_blank" rel="noopener noreferrer">@Dmitry_as_Solod</a></div></div>
-  <div class="user-meta-row"><div class="label-muted">Copyright</div><div>Copyright (c) 2026 Dmitry Solodovnikov</div></div>
+  <div class="user-meta-row"><div class="label-muted">Copyright</div><div>Copyright (c) 2026 Dmitry Solonnikov</div></div>
   <div class="user-meta-row"><div class="label-muted">License</div><div><a href="/license">MIT License</a> · <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">opensource.org</a></div></div>
   {admin_controls}
   <pre id="about-out">Ready.</pre>
@@ -2852,7 +2881,14 @@ async function requestUpdateCheck() {{
     headers: {{'X-CSRF-Token': aboutHeaderToken()}}
   }});
   const t = await r.text();
-  if (out) out.textContent = t;
+  let j = null;
+  try {{ j = JSON.parse(t); }} catch (e) {{ j = null; }}
+  if (!r.ok) {{
+    if (out) out.textContent = j && j.detail ? String(j.detail) : t;
+    return;
+  }}
+  if (out) out.textContent = (j && j.message) ? String(j.message) : 'Update check request accepted.';
+  await loadAboutState();
 }}
 async function requestUpdateApply() {{
   const out = document.getElementById('about-out');
@@ -2862,7 +2898,14 @@ async function requestUpdateApply() {{
     headers: {{'X-CSRF-Token': aboutHeaderToken()}}
   }});
   const t = await r.text();
-  if (out) out.textContent = t;
+  let j = null;
+  try {{ j = JSON.parse(t); }} catch (e) {{ j = null; }}
+  if (!r.ok) {{
+    if (out) out.textContent = j && j.detail ? String(j.detail) : t;
+    return;
+  }}
+  if (out) out.textContent = (j && j.message) ? String(j.message) : 'Update apply request accepted.';
+  await loadAboutState();
 }}
 document.addEventListener('click', (event) => {{
   const target = event.target;
@@ -3028,6 +3071,22 @@ def cabinet(request: Request) -> HTMLResponse:
   </div>
   <div id="device-card-out" style="margin-top:12px;"></div>
 </div>
+<div class="card">
+  <h2>Traffic and resource usage</h2>
+  <p class="muted">Live counters and aggregated usage for your profile.</p>
+  <div id="cab-traffic-resources" class="muted">Resources: loading...</div>
+  <div style="overflow:auto;margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);">
+    <table style="width:100%;border-collapse:collapse;">
+      <thead>
+        <tr><th align="left">Period</th><th align="left">RX</th><th align="left">TX</th><th align="left">Total</th></tr>
+      </thead>
+      <tbody id="cab-traffic-summary-body"><tr><td colspan="4" class="muted">Loading...</td></tr></tbody>
+    </table>
+  </div>
+  <div style="margin-top:10px;">
+    <canvas id="cab-traffic-canvas" width="900" height="220" style="width:100%;max-width:100%;border:1px solid rgba(100,116,139,0.2);border-radius:10px;background:rgba(255,255,255,0.6);"></canvas>
+  </div>
+</div>
 <div id="edit-profile-modal" class="modal-backdrop">
   <div class="modal-card">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
@@ -3144,6 +3203,76 @@ function renderDeviceCard(card) {{
     </div>
   `;
 }}
+function fmtBytes(v) {{
+  const n = Number(v || 0);
+  if (!isFinite(n)) return '0 B';
+  const abs = Math.abs(n);
+  if (abs >= 1024 ** 4) return (n / (1024 ** 4)).toFixed(2) + ' TB';
+  if (abs >= 1024 ** 3) return (n / (1024 ** 3)).toFixed(2) + ' GB';
+  if (abs >= 1024 ** 2) return (n / (1024 ** 2)).toFixed(2) + ' MB';
+  if (abs >= 1024) return (n / 1024).toFixed(2) + ' KB';
+  return Math.round(n) + ' B';
+}}
+function renderCabinetTrafficSummary(summary) {{
+  const body = document.getElementById('cab-traffic-summary-body');
+  const resources = document.getElementById('cab-traffic-resources');
+  if (!body) return;
+  const periods = summary && summary.periods ? summary.periods : {{}};
+  const keys = [['day','Day'], ['week','Week'], ['month','Month'], ['year','Year']];
+  body.innerHTML = keys.map(([k, label]) => {{
+    const item = periods[k] || {{}};
+    return `<tr>
+      <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);">${{label}}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);">${{fmtBytes(item.rx_bytes || 0)}}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);">${{fmtBytes(item.tx_bytes || 0)}}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);"><b>${{fmtBytes(item.total_bytes || 0)}}</b></td>
+    </tr>`;
+  }}).join('');
+  const r = summary && summary.resources ? summary.resources : {{}};
+  if (resources) {{
+    resources.textContent = 'Resources now: CPU ' + Number(r.cpu_load_pct || 0).toFixed(1) + '% · RAM ' +
+      Number(r.memory_used_pct || 0).toFixed(1) + '% · Disk ' + Number(r.disk_used_pct || 0).toFixed(1) + '%';
+  }}
+}}
+function renderCabinetTrafficChart(points) {{
+  const canvas = document.getElementById('cab-traffic-canvas');
+  if (!canvas || !canvas.getContext) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const list = Array.isArray(points) ? points : [];
+  const values = list.map(p => Number(p.rx_rate_bps || 0) + Number(p.tx_rate_bps || 0));
+  const maxV = Math.max(1, ...values);
+  ctx.strokeStyle = 'rgba(100,116,139,0.28)';
+  for (let i = 0; i < 5; i += 1) {{
+    const y = 16 + (h - 32) * (i / 4);
+    ctx.beginPath(); ctx.moveTo(8, y); ctx.lineTo(w - 8, y); ctx.stroke();
+  }}
+  if (!values.length) return;
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#2563eb';
+  ctx.beginPath();
+  for (let i = 0; i < values.length; i += 1) {{
+    const x = 12 + (i / Math.max(1, values.length - 1)) * (w - 24);
+    const y = (h - 16) - ((values[i] / maxV) * (h - 32));
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }}
+  ctx.stroke();
+}}
+async function loadCabinetTraffic() {{
+  const [sumR, tsR] = await Promise.all([
+    fetch('/api/v1/user/traffic/summary'),
+    fetch('/api/v1/user/traffic/timeseries?minutes=1440')
+  ]);
+  if (sumR.ok) {{
+    const s = await sumR.json();
+    renderCabinetTrafficSummary(s);
+  }}
+  if (tsR.ok) {{
+    const t = await tsR.json();
+    renderCabinetTrafficChart(t.points || []);
+  }}
+}}
 async function copyConfigUri() {{
   const el = document.getElementById('cfg-uri');
   if (!el) return;
@@ -3239,6 +3368,8 @@ document.addEventListener('click', (event) => {{
 }});
 refreshPlatformOptions();
 initDeviceCard();
+loadCabinetTraffic();
+setInterval(loadCabinetTraffic, 30000);
 </script>
 """,
         active="cabinet",
@@ -3667,6 +3798,22 @@ def admin(request: Request) -> HTMLResponse:
     </thead>
     <tbody id="user-traffic-body"><tr><td colspan="6" class="muted">Loading...</td></tr></tbody>
   </table>
+  <div style="margin-top:10px;display:grid;grid-template-columns:minmax(240px,1fr) auto;gap:8px;align-items:end;">
+    <div>
+      <div class="label-muted">Selected user details</div>
+      <select id="traffic-user-select" style="width:100%;padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);">{user_options_html}</select>
+    </div>
+    <button class="btn-ghost" data-action="load-user-traffic-details">Load details</button>
+  </div>
+  <div style="overflow:auto;margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);">
+    <table style="width:100%;border-collapse:collapse;">
+      <thead>
+        <tr><th align="left">Period</th><th align="left">RX</th><th align="left">TX</th><th align="left">Total</th></tr>
+      </thead>
+      <tbody id="admin-user-traffic-periods-body"><tr><td colspan="4" class="muted">Select user and click Load details.</td></tr></tbody>
+    </table>
+  </div>
+  <canvas id="admin-user-traffic-canvas" width="900" height="220" style="margin-top:10px;width:100%;max-width:100%;border:1px solid rgba(100,116,139,0.2);border-radius:10px;background:rgba(255,255,255,0.6);"></canvas>
 </div>
 
 <div class="card admin-section" data-section="logs" data-subsection="admin-log">
@@ -4181,6 +4328,63 @@ function renderUserTraffic(items) {{
     </tr>`;
   }}).join('');
 }}
+function renderAdminUserTrafficPeriods(periods) {{
+  const body = document.getElementById('admin-user-traffic-periods-body');
+  if (!body) return;
+  const p = periods || {{}};
+  const rows = [['day','Day'], ['week','Week'], ['month','Month'], ['year','Year']];
+  body.innerHTML = rows.map(([k, label]) => {{
+    const i = p[k] || {{}};
+    return `<tr>
+      <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);">${{label}}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);">${{fmtBytes(i.rx_bytes || 0)}}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);">${{fmtBytes(i.tx_bytes || 0)}}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);"><b>${{fmtBytes(i.total_bytes || 0)}}</b></td>
+    </tr>`;
+  }}).join('');
+}}
+function drawAdminUserTraffic(points) {{
+  const canvas = document.getElementById('admin-user-traffic-canvas');
+  if (!canvas || !canvas.getContext) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const list = Array.isArray(points) ? points : [];
+  const values = list.map(p => Number(p.rx_rate_bps || 0) + Number(p.tx_rate_bps || 0));
+  const maxV = Math.max(1, ...values);
+  ctx.strokeStyle = 'rgba(100,116,139,0.28)';
+  for (let i = 0; i < 5; i += 1) {{
+    const y = 16 + (h - 32) * (i / 4);
+    ctx.beginPath(); ctx.moveTo(8, y); ctx.lineTo(w - 8, y); ctx.stroke();
+  }}
+  if (!values.length) return;
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#0f766e';
+  ctx.beginPath();
+  for (let i = 0; i < values.length; i += 1) {{
+    const x = 12 + (i / Math.max(1, values.length - 1)) * (w - 24);
+    const y = (h - 16) - ((values[i] / maxV) * (h - 32));
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }}
+  ctx.stroke();
+}}
+async function loadAdminUserTrafficDetails() {{
+  const el = document.getElementById('traffic-user-select');
+  const userId = Number((el && el.value) || 0);
+  if (!userId) return;
+  const [periodsR, tsR] = await Promise.all([
+    fetch('/api/v1/admin/user-traffic/periods?user_id=' + encodeURIComponent(String(userId))),
+    fetch('/api/v1/admin/user-traffic/timeseries?user_id=' + encodeURIComponent(String(userId)) + '&minutes=1440')
+  ]);
+  if (periodsR.ok) {{
+    const p = await periodsR.json();
+    renderAdminUserTrafficPeriods(p.periods || {{}});
+  }}
+  if (tsR.ok) {{
+    const t = await tsR.json();
+    drawAdminUserTraffic(t.points || []);
+  }}
+}}
 function drawMetrics(points) {{
   const canvas = document.getElementById('metrics-canvas');
   if (!canvas || !points || points.length < 2) return;
@@ -4512,6 +4716,11 @@ async function refreshAdminLive() {{
     renderUserTraffic(t.items || []);
     const src = document.getElementById('traffic-source');
     if (src) src.textContent = 'source: ' + (t.source || '-');
+    const sel = document.getElementById('traffic-user-select');
+    if (sel && !sel.value && sel.options && sel.options.length > 0) {{
+      sel.value = String(sel.options[0].value || '');
+    }}
+    await loadAdminUserTrafficDetails();
   }}
   if (servicesR.ok) {{
     const s = await servicesR.json();
@@ -4653,6 +4862,7 @@ document.addEventListener('change', (event) => {{
   if (!target) return;
   if (target.id === 'service-log-stderr-only') refreshServiceLogsNow();
   if (target.id === 'cfg-proxy-bypass-custom') renderProxyBypassValidation(String(target.value || ''));
+  if (target.id === 'traffic-user-select') loadAdminUserTrafficDetails();
 }});
 document.addEventListener('input', (event) => {{
   const target = event.target;
@@ -4695,6 +4905,7 @@ document.addEventListener('click', (event) => {{
     if (action === 'create-user') return void createUser();
     if (action === 'bind-wg-peer') return void bindWgPeer();
     if (action === 'bind-xray-client') return void bindXrayClient();
+    if (action === 'load-user-traffic-details') return void loadAdminUserTrafficDetails();
     if (action === 'refresh-service-logs') return void refreshServiceLogsNow();
     if (action === 'close-service-logs') return void closeServiceLogs();
     if (action === 'open-service-logs') {{
@@ -4987,6 +5198,7 @@ def user_device_config(
     profile = prefs_seed
     _set_user_device_preferences(int(user["id"]), device_type, platform, region_profile)
     _ensure_xray_client_in_config(profile["xray_uuid"], profile["xray_email"])
+    _ensure_xray_binding_for_user(int(user["id"]), profile["xray_email"], "auto-profile")
     tpl = _read_xray_connection_template()
 
     host = tpl.get("server_address", "").strip() or request.url.hostname or "127.0.0.1"
@@ -5174,10 +5386,20 @@ def user_device_config(
 @app.get("/api/v1/admin/stats")
 def admin_stats(request: Request) -> JSONResponse:
     _require_admin(request)
+    threshold = (_now() - timedelta(seconds=ONLINE_WINDOW_SECONDS)).isoformat()
     with _db_connect() as con:
         total_users = con.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
         active_users = con.execute("SELECT COUNT(*) c FROM users WHERE is_active = 1").fetchone()["c"]
-        active_sessions = con.execute("SELECT COUNT(*) c FROM sessions WHERE revoked = 0").fetchone()["c"]
+        active_sessions = con.execute(
+            """
+            SELECT COUNT(DISTINCT s.user_id) c
+            FROM sessions s
+            WHERE s.revoked = 0
+              AND s.expires_at > ?
+              AND COALESCE(s.last_seen, s.created_at) >= ?
+            """,
+            (_now().isoformat(), threshold),
+        ).fetchone()["c"]
         pending_requests = con.execute(
             "SELECT COUNT(*) c FROM registration_requests WHERE status = 'pending'"
         ).fetchone()["c"]
@@ -5464,6 +5686,156 @@ def admin_system_metrics_timeseries(request: Request, minutes: int = 60) -> JSON
     return JSONResponse({"status": "ok", "minutes": minutes, "points": points})
 
 
+def _load_user_traffic_periods(con: sqlite3.Connection, user_id: int) -> dict[str, dict[str, int]]:
+    out: dict[str, dict[str, int]] = {}
+    windows = {
+        "day": "-24 hour",
+        "week": "-7 day",
+        "month": "-30 day",
+        "year": "-365 day",
+    }
+    for key, expr in windows.items():
+        wg = con.execute(
+            """
+            SELECT COALESCE(SUM(rx_bytes), 0) rx_bytes, COALESCE(SUM(tx_bytes), 0) tx_bytes
+            FROM user_wireguard_traffic_samples
+            WHERE user_id = ? AND ts >= datetime('now', ?)
+            """,
+            (user_id, expr),
+        ).fetchone()
+        xr = con.execute(
+            """
+            SELECT COALESCE(SUM(rx_bytes), 0) rx_bytes, COALESCE(SUM(tx_bytes), 0) tx_bytes
+            FROM user_xray_traffic_samples
+            WHERE user_id = ? AND ts >= datetime('now', ?)
+            """,
+            (user_id, expr),
+        ).fetchone()
+        rx = int((wg["rx_bytes"] if wg else 0) or 0) + int((xr["rx_bytes"] if xr else 0) or 0)
+        tx = int((wg["tx_bytes"] if wg else 0) or 0) + int((xr["tx_bytes"] if xr else 0) or 0)
+        if rx == 0 and tx == 0:
+            est = con.execute(
+                """
+                SELECT COALESCE(SUM(rx_bytes), 0) rx_bytes, COALESCE(SUM(tx_bytes), 0) tx_bytes
+                FROM user_traffic_samples
+                WHERE user_id = ? AND ts >= datetime('now', ?)
+                """,
+                (user_id, expr),
+            ).fetchone()
+            rx = int((est["rx_bytes"] if est else 0) or 0)
+            tx = int((est["tx_bytes"] if est else 0) or 0)
+        out[key] = {"rx_bytes": rx, "tx_bytes": tx, "total_bytes": int(rx + tx)}
+    return out
+
+
+def _build_user_traffic_timeseries_response(user_id: int, minutes: int) -> JSONResponse:
+    minutes = max(5, min(24 * 60, int(minutes)))
+    with _db_connect() as con:
+        user = con.execute(
+            "SELECT id, username, email, role FROM users WHERE id = ?",
+            (int(user_id),),
+        ).fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        wg_rows = con.execute(
+            """
+            SELECT ts, SUM(rx_bytes) rx_bytes, SUM(tx_bytes) tx_bytes
+            FROM user_wireguard_traffic_samples
+            WHERE user_id = ? AND ts >= datetime('now', ?)
+            GROUP BY ts
+            ORDER BY ts ASC
+            """,
+            (int(user_id), f"-{minutes} minutes"),
+        ).fetchall()
+        xray_rows = con.execute(
+            """
+            SELECT ts, SUM(rx_bytes) rx_bytes, SUM(tx_bytes) tx_bytes
+            FROM user_xray_traffic_samples
+            WHERE user_id = ? AND ts >= datetime('now', ?)
+            GROUP BY ts
+            ORDER BY ts ASC
+            """,
+            (int(user_id), f"-{minutes} minutes"),
+        ).fetchall()
+        rows: list[Any] = []
+        source = "wireguard_xray_exact"
+        if wg_rows or xray_rows:
+            merged: dict[str, dict[str, float]] = {}
+            for r in wg_rows:
+                ts = str(r["ts"])
+                agg = merged.setdefault(ts, {"rx_bytes": 0.0, "tx_bytes": 0.0})
+                agg["rx_bytes"] += float(r["rx_bytes"] or 0.0)
+                agg["tx_bytes"] += float(r["tx_bytes"] or 0.0)
+            for r in xray_rows:
+                ts = str(r["ts"])
+                agg = merged.setdefault(ts, {"rx_bytes": 0.0, "tx_bytes": 0.0})
+                agg["rx_bytes"] += float(r["rx_bytes"] or 0.0)
+                agg["tx_bytes"] += float(r["tx_bytes"] or 0.0)
+            rows = [
+                {"ts": ts, "rx_bytes": int(v["rx_bytes"]), "tx_bytes": int(v["tx_bytes"])}
+                for ts, v in sorted(merged.items(), key=lambda item: item[0])
+            ]
+        else:
+            rows = con.execute(
+                """
+                SELECT ts, SUM(rx_bytes) rx_bytes, SUM(tx_bytes) tx_bytes
+                FROM user_traffic_samples
+                WHERE user_id = ? AND ts >= datetime('now', ?)
+                GROUP BY ts
+                ORDER BY ts ASC
+                """,
+                (int(user_id), f"-{minutes} minutes"),
+            ).fetchall()
+            source = "estimated_session_share"
+    points = [dict(r) for r in rows]
+    for i in range(1, len(points)):
+        prev = points[i - 1]
+        cur = points[i]
+        try:
+            dt = max(1.0, (datetime.fromisoformat(cur["ts"]) - datetime.fromisoformat(prev["ts"])).total_seconds())
+        except Exception:
+            dt = float(METRICS_SAMPLE_INTERVAL_SECONDS)
+        cur["rx_rate_bps"] = max(0.0, (float(cur["rx_bytes"]) - float(prev["rx_bytes"])) / dt)
+        cur["tx_rate_bps"] = max(0.0, (float(cur["tx_bytes"]) - float(prev["tx_bytes"])) / dt)
+    if points:
+        points[0]["rx_rate_bps"] = 0.0
+        points[0]["tx_rate_bps"] = 0.0
+    return JSONResponse({"status": "ok", "user": dict(user), "minutes": minutes, "source": source, "points": points})
+
+
+@app.get("/api/v1/user/traffic/summary")
+def user_traffic_summary(request: Request) -> JSONResponse:
+    user = _require_user(request)
+    with _db_connect() as con:
+        periods = _load_user_traffic_periods(con, int(user["id"]))
+        current = con.execute(
+            """
+            SELECT cpu_load_pct, memory_used_pct, disk_used_pct, ts
+            FROM metric_samples
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    return JSONResponse(
+        {
+            "status": "ok",
+            "periods": periods,
+            "resources": {
+                "cpu_load_pct": float(current["cpu_load_pct"]) if current else 0.0,
+                "memory_used_pct": float(current["memory_used_pct"]) if current else 0.0,
+                "disk_used_pct": float(current["disk_used_pct"]) if current else 0.0,
+                "ts": str(current["ts"]) if current else "",
+            },
+        }
+    )
+
+
+@app.get("/api/v1/user/traffic/timeseries")
+def user_traffic_timeseries(request: Request, minutes: int = 60) -> JSONResponse:
+    user = _require_user(request)
+    return _build_user_traffic_timeseries_response(user_id=int(user["id"]), minutes=minutes)
+
+
 @app.get("/api/v1/admin/user-traffic/summary")
 def admin_user_traffic_summary(request: Request, hours: int = 24) -> JSONResponse:
     _require_admin(request)
@@ -5536,10 +5908,9 @@ def admin_user_traffic_summary(request: Request, hours: int = 24) -> JSONRespons
     )
 
 
-@app.get("/api/v1/admin/user-traffic/timeseries")
-def admin_user_traffic_timeseries(request: Request, user_id: int, minutes: int = 60) -> JSONResponse:
+@app.get("/api/v1/admin/user-traffic/periods")
+def admin_user_traffic_periods(request: Request, user_id: int) -> JSONResponse:
     _require_admin(request)
-    minutes = max(5, min(24 * 60, minutes))
     with _db_connect() as con:
         user = con.execute(
             "SELECT id, username, email, role FROM users WHERE id = ?",
@@ -5547,70 +5918,14 @@ def admin_user_traffic_timeseries(request: Request, user_id: int, minutes: int =
         ).fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        wg_rows = con.execute(
-            """
-            SELECT ts, SUM(rx_bytes) rx_bytes, SUM(tx_bytes) tx_bytes
-            FROM user_wireguard_traffic_samples
-            WHERE user_id = ? AND ts >= datetime('now', ?)
-            GROUP BY ts
-            ORDER BY ts ASC
-            """,
-            (user_id, f"-{minutes} minutes"),
-        ).fetchall()
-        xray_rows = con.execute(
-            """
-            SELECT ts, SUM(rx_bytes) rx_bytes, SUM(tx_bytes) tx_bytes
-            FROM user_xray_traffic_samples
-            WHERE user_id = ? AND ts >= datetime('now', ?)
-            GROUP BY ts
-            ORDER BY ts ASC
-            """,
-            (user_id, f"-{minutes} minutes"),
-        ).fetchall()
-        rows: list[sqlite3.Row] = []
-        source = "wireguard_xray_exact"
-        if wg_rows or xray_rows:
-            merged: dict[str, dict[str, float]] = {}
-            for r in wg_rows:
-                ts = str(r["ts"])
-                agg = merged.setdefault(ts, {"rx_bytes": 0.0, "tx_bytes": 0.0})
-                agg["rx_bytes"] += float(r["rx_bytes"] or 0.0)
-                agg["tx_bytes"] += float(r["tx_bytes"] or 0.0)
-            for r in xray_rows:
-                ts = str(r["ts"])
-                agg = merged.setdefault(ts, {"rx_bytes": 0.0, "tx_bytes": 0.0})
-                agg["rx_bytes"] += float(r["rx_bytes"] or 0.0)
-                agg["tx_bytes"] += float(r["tx_bytes"] or 0.0)
-            rows = [
-                {"ts": ts, "rx_bytes": int(v["rx_bytes"]), "tx_bytes": int(v["tx_bytes"])}
-                for ts, v in sorted(merged.items(), key=lambda item: item[0])
-            ]
-        else:
-            rows = con.execute(
-                """
-                SELECT ts, SUM(rx_bytes) rx_bytes, SUM(tx_bytes) tx_bytes
-                FROM user_traffic_samples
-                WHERE user_id = ? AND ts >= datetime('now', ?)
-                GROUP BY ts
-                ORDER BY ts ASC
-                """,
-                (user_id, f"-{minutes} minutes"),
-            ).fetchall()
-            source = "estimated_session_share"
-    points = [dict(r) for r in rows]
-    for i in range(1, len(points)):
-        prev = points[i - 1]
-        cur = points[i]
-        try:
-            dt = max(1.0, (datetime.fromisoformat(cur["ts"]) - datetime.fromisoformat(prev["ts"])).total_seconds())
-        except Exception:
-            dt = float(METRICS_SAMPLE_INTERVAL_SECONDS)
-        cur["rx_rate_bps"] = max(0.0, (float(cur["rx_bytes"]) - float(prev["rx_bytes"])) / dt)
-        cur["tx_rate_bps"] = max(0.0, (float(cur["tx_bytes"]) - float(prev["tx_bytes"])) / dt)
-    if points:
-        points[0]["rx_rate_bps"] = 0.0
-        points[0]["tx_rate_bps"] = 0.0
-    return JSONResponse({"status": "ok", "user": dict(user), "minutes": minutes, "source": source, "points": points})
+        periods = _load_user_traffic_periods(con, int(user_id))
+    return JSONResponse({"status": "ok", "user": dict(user), "periods": periods})
+
+
+@app.get("/api/v1/admin/user-traffic/timeseries")
+def admin_user_traffic_timeseries(request: Request, user_id: int, minutes: int = 60) -> JSONResponse:
+    _require_admin(request)
+    return _build_user_traffic_timeseries_response(user_id=int(user_id), minutes=minutes)
 
 
 @app.get("/api/v1/admin/wireguard-bindings")
