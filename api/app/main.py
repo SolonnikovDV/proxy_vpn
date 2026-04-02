@@ -1359,6 +1359,40 @@ def _infer_current_sha_from_runtime_logs() -> str:
     return ""
 
 
+def _infer_build_from_runtime() -> str:
+    # 1) Explicit env override
+    env_build = str(os.getenv("APP_BUILD", "") or "").strip()
+    if env_build:
+        return env_build[:12]
+    env_sha = str(os.getenv("GIT_SHA", "") or "").strip()
+    if env_sha:
+        return env_sha[:12]
+    # 2) Deploy/update logs
+    sha = _infer_current_sha_from_runtime_logs()
+    if sha:
+        return sha[:12]
+    # 3) Docker runtime image id for api container
+    if docker is not None:
+        client = None
+        try:
+            client = docker.from_env()
+            c = client.containers.get("proxy-vpn-api")
+            image_id = str(getattr(getattr(c, "image", None), "id", "") or "").strip()
+            if image_id.startswith("sha256:"):
+                image_id = image_id.split(":", 1)[1]
+            if image_id:
+                return image_id[:12]
+        except Exception:
+            pass
+        finally:
+            try:
+                if client is not None:
+                    client.close()
+            except Exception:
+                pass
+    return "unknown"
+
+
 def _default_release_state() -> dict[str, Any]:
     repo_meta = _release_metadata_from_repo()
     return {
@@ -1415,8 +1449,8 @@ def _read_release_state() -> dict[str, Any]:
         cur_build = str(merged["current"].get("build", "") or "").strip()
         if cur_build and cur_build.lower() != "na":
             merged["current"]["version"] = cur_build
-    if str(merged["current"].get("build", "") or "").strip().lower() in {"", "na"}:
-        merged["current"]["build"] = "unknown"
+    if str(merged["current"].get("build", "") or "").strip().lower() in {"", "na", "unknown"}:
+        merged["current"]["build"] = _infer_build_from_runtime()
     if str(merged["current"].get("sha", "") or "").strip().lower() in {"", "na"}:
         merged["current"]["sha"] = "unknown"
     merged["available"] = available if isinstance(available, dict) else None

@@ -62,6 +62,19 @@ def infer_sha_from_logs() -> str:
             pass
     return candidates[-1] if candidates else ""
 
+def infer_build_from_docker() -> str:
+    try:
+        image_id = subprocess.check_output(
+            ["docker", "inspect", "--format", "{{.Image}}", "proxy-vpn-api"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return ""
+    if image_id.startswith("sha256:"):
+        image_id = image_id.split(":", 1)[1]
+    return (image_id or "").strip()[:12]
+
 existing = {}
 if path.exists():
     try:
@@ -95,6 +108,8 @@ if not full_sha:
     full_sha = infer_sha_from_logs()
 if full_sha and not short_sha:
     short_sha = full_sha[:7]
+if not short_sha:
+    short_sha = infer_build_from_docker()
 
 cur_existing = existing.get("current") if isinstance(existing.get("current"), dict) else {}
 version = version or str(cur_existing.get("version", "") or "")
