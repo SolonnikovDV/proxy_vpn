@@ -5441,6 +5441,25 @@ const fmtBytes = (n) => {{
   while (v >= 1024 && i < units.length - 1) {{ v /= 1024; i++; }}
   return v.toFixed(i === 0 ? 0 : 2) + ' ' + units[i];
 }};
+function wgVerdictText(verdict) {{
+  const v = String(verdict || '').trim();
+  if (v === 'traffic_flowing') return 'traffic flowing';
+  if (v === 'handshake_without_payload') return 'handshake without payload';
+  if (v === 'no_recent_handshake') return 'no recent handshake';
+  if (v === 'peer_not_applied') return 'peer not applied in wg0';
+  if (v === 'profile_binding_mismatch') return 'profile/binding key mismatch';
+  if (v === 'no_binding') return 'no registered key';
+  return v || 'unknown';
+}}
+function wgVerdictBadge(verdict) {{
+  const v = String(verdict || '').trim();
+  if (v === 'traffic_flowing') return '<span class="status-pill status-running">WG ok</span>';
+  if (v === 'handshake_without_payload') return '<span class="status-pill status-pending">WG payload missing</span>';
+  if (v === 'no_recent_handshake' || v === 'peer_not_applied' || v === 'profile_binding_mismatch' || v === 'no_binding') {{
+    return '<span class="status-pill status-in_error">WG broken</span>';
+  }}
+  return '<span class="status-pill status-pending">WG unknown</span>';
+}}
 function stateBadge(state) {{
   const cls = ['running','pending','stopped','in_error','unknown'].includes(state) ? state : 'unknown';
   return `<span class="status-pill status-${{cls}}">${{cls}}</span>`;
