@@ -1583,7 +1583,7 @@ def _collect_wireguard_user_traffic(con: sqlite3.Connection, ts_iso: str) -> Non
 
 def _read_xray_user_totals() -> dict[str, dict[str, int]]:
     totals: dict[str, dict[str, int]] = {}
-    lines: list[str] = []
+    raw_text = ""
     if docker is not None:
         client = None
         try:
@@ -1600,12 +1600,11 @@ def _read_xray_user_totals() -> dict[str, dict[str, int]]:
                 if isinstance(output, tuple):
                     # Some Docker SDK variants can return (stdout, stderr).
                     combined = b"".join(chunk for chunk in output if isinstance(chunk, (bytes, bytearray)))
-                    text = combined.decode("utf-8", errors="replace")
+                    raw_text = combined.decode("utf-8", errors="replace")
                 else:
-                    text = output.decode("utf-8", errors="replace")
-                lines = [line.strip() for line in text.splitlines() if line.strip()]
+                    raw_text = output.decode("utf-8", errors="replace")
         except Exception:
-            lines = []
+            raw_text = ""
         finally:
             try:
                 if client is not None:
@@ -1614,18 +1613,43 @@ def _read_xray_user_totals() -> dict[str, dict[str, int]]:
                 pass
 
     # Compatibility fallback: use shared file when available.
-    if not lines:
+    if not raw_text:
         try:
             with open(XRAY_STATS_PATH, "r", encoding="utf-8") as f:
-                lines = [line.strip() for line in f if line.strip()]
+                raw_text = f.read()
         except Exception:
             return totals
 
+    block_matches = list(
+        re.finditer(
+            r"user>>>(.+?)>>>traffic>>>(uplink|downlink)\".*?(?:\"value\"\s*:\s*|value\s*[:=]\s*)(\d+)",
+            raw_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    )
+    if block_matches:
+        for m in block_matches:
+            email = str(m.group(1) or "").strip().lower()
+            direction = str(m.group(2) or "").strip().lower()
+            bytes_raw = str(m.group(3) or "0").strip()
+            if not email or direction not in {"uplink", "downlink"}:
+                continue
+            current = totals.setdefault(email, {"uplink": 0, "downlink": 0})
+            try:
+                current[direction] = int(bytes_raw)
+            except ValueError:
+                continue
+        if totals:
+            return totals
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
     for line in lines:
         m = XRAY_USER_STATS_RE.search(line)
         if not m:
             continue
-        email, direction = m.group(1), m.group(2)
+        email, direction = str(m.group(1) or "").strip().lower(), str(m.group(2) or "").strip().lower()
+        if direction not in {"uplink", "downlink"}:
+            continue
         value_match = XRAY_VALUE_RE.search(line)
         if value_match:
             bytes_raw = value_match.group(1)
@@ -2949,24 +2973,24 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
     body[data-theme="dark"] {{
       --bg-1: #0b1220;
       --bg-2: #111827;
-      --panel: rgba(15, 23, 42, 0.74);
-      --panel-strong: rgba(17, 24, 39, 0.9);
-      --stroke: rgba(148, 163, 184, 0.22);
-      --text: #e5e7eb;
-      --muted: #94a3b8;
+      --panel: rgba(9, 15, 27, 0.78);
+      --panel-strong: rgba(12, 20, 34, 0.92);
+      --stroke: rgba(148, 163, 184, 0.26);
+      --text: #f1f5f9;
+      --muted: #a3b4cc;
       --blue: #3b82f6;
       --link: #93c5fd;
-      --input-bg: rgba(15, 23, 42, 0.74);
-      --soft-bg: rgba(15, 23, 42, 0.6);
-      --hover-bg: rgba(59,130,246,0.14);
-      --code-bg: rgba(2, 6, 23, 0.75);
-      --code-text: #e2e8f0;
-      --ghost-bg: rgba(148,163,184,0.2);
-      --ghost-text: #e2e8f0;
-      --banner-bg: rgba(59,130,246,0.14);
-      --banner-stroke: rgba(147,197,253,0.35);
-      --banner-text: #dbeafe;
-      --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+      --input-bg: rgba(10, 18, 30, 0.82);
+      --soft-bg: rgba(10, 18, 30, 0.72);
+      --hover-bg: rgba(59,130,246,0.16);
+      --code-bg: rgba(5, 10, 20, 0.82);
+      --code-text: #e5edf7;
+      --ghost-bg: rgba(71, 85, 105, 0.32);
+      --ghost-text: #e5edf7;
+      --banner-bg: rgba(59,130,246,0.18);
+      --banner-stroke: rgba(147,197,253,0.42);
+      --banner-text: #e2ecff;
+      --shadow: 0 18px 42px rgba(0, 0, 0, 0.52);
     }}
     body {{
       margin: 0;
@@ -2978,6 +3002,29 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
     }}
     body[data-theme="dark"] {{
       color-scheme: dark;
+      background:
+        radial-gradient(900px 420px at 18% -22%, rgba(59,130,246,0.24) 0%, rgba(17,24,39,0) 62%),
+        radial-gradient(780px 380px at 88% -24%, rgba(14,165,233,0.16) 0%, rgba(17,24,39,0) 58%),
+        linear-gradient(180deg, #0b1220 0%, #0f172a 48%, #111827 100%);
+    }}
+    body[data-theme="dark"][data-theme-tone="soft"] {{
+      --panel: rgba(18, 24, 38, 0.78);
+      --panel-strong: rgba(22, 30, 46, 0.9);
+      --stroke: rgba(148, 163, 184, 0.22);
+      --text: #e8eef8;
+      --muted: #9fb1cb;
+      --input-bg: rgba(18, 24, 38, 0.78);
+      --soft-bg: rgba(20, 28, 44, 0.72);
+      --hover-bg: rgba(59,130,246,0.13);
+      --code-bg: rgba(10, 16, 28, 0.8);
+      --ghost-bg: rgba(71, 85, 105, 0.28);
+      --banner-bg: rgba(59,130,246,0.14);
+      --banner-stroke: rgba(147,197,253,0.34);
+      --shadow: 0 14px 34px rgba(0, 0, 0, 0.46);
+      background:
+        radial-gradient(880px 380px at 16% -20%, rgba(59,130,246,0.16) 0%, rgba(17,24,39,0) 62%),
+        radial-gradient(700px 300px at 86% -22%, rgba(14,165,233,0.1) 0%, rgba(17,24,39,0) 58%),
+        linear-gradient(180deg, #0f172a 0%, #111827 52%, #131d31 100%);
     }}
     .app {{
       max-width: 1200px;
@@ -3045,6 +3092,11 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       border-color: rgba(37, 99, 235, 0.32);
       color: #1d4ed8;
       font-weight: 600;
+    }}
+    body[data-theme="dark"] .nav-item.active {{
+      color: #bfdbfe;
+      background: rgba(59,130,246,0.22);
+      border-color: rgba(96,165,250,0.42);
     }}
     .profile {{
       margin-top: auto;
@@ -3167,6 +3219,11 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
     .status-stopped {{ background: rgba(100,116,139,0.18); color: #334155; }}
     .status-in_error {{ background: rgba(239,68,68,0.18); color: #991b1b; }}
     .status-unknown {{ background: rgba(148,163,184,0.2); color: #334155; }}
+    body[data-theme="dark"] .status-running {{ background: rgba(34,197,94,0.22); color: #86efac; }}
+    body[data-theme="dark"] .status-pending {{ background: rgba(245,158,11,0.22); color: #fcd34d; }}
+    body[data-theme="dark"] .status-stopped {{ background: rgba(148,163,184,0.24); color: #cbd5e1; }}
+    body[data-theme="dark"] .status-in_error {{ background: rgba(239,68,68,0.24); color: #fca5a5; }}
+    body[data-theme="dark"] .status-unknown {{ background: rgba(148,163,184,0.22); color: #cbd5e1; }}
     .btn-ghost {{
       background: var(--ghost-bg);
       color: var(--ghost-text);
@@ -3195,6 +3252,10 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       border: 1px solid rgba(50,65,90,0.16);
       background: rgba(255,255,255,0.65);
     }}
+    body[data-theme="dark"] .tab-strip {{
+      border-color: rgba(148,163,184,0.28);
+      background: rgba(15,23,42,0.74);
+    }}
     .tab-btn {{
       background: transparent;
       color: #334155;
@@ -3204,14 +3265,26 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       font-size: 13px;
       font-weight: 600;
     }}
+    body[data-theme="dark"] .tab-btn {{
+      color: #cbd5e1;
+    }}
     .tab-btn:hover {{
       background: rgba(255,255,255,0.8);
       border-color: rgba(50,65,90,0.2);
+    }}
+    body[data-theme="dark"] .tab-btn:hover {{
+      background: rgba(30,41,59,0.76);
+      border-color: rgba(148,163,184,0.28);
     }}
     .tab-btn.active {{
       background: rgba(37,99,235,0.16);
       color: #1d4ed8;
       border-color: rgba(37,99,235,0.34);
+    }}
+    body[data-theme="dark"] .tab-btn.active {{
+      background: rgba(59,130,246,0.22);
+      color: #bfdbfe;
+      border-color: rgba(96,165,250,0.44);
     }}
     .user-card {{
       display: grid;
@@ -3260,6 +3333,11 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       padding: 12px;
       box-shadow: 0 24px 60px rgba(2, 6, 23, 0.35);
     }}
+    body[data-theme="dark"] .modal-card {{
+      background: #0b1220;
+      border-color: rgba(148,163,184,0.3);
+      box-shadow: 0 30px 70px rgba(2, 6, 23, 0.62);
+    }}
     #update-banner {{
       display: none;
       margin: 0 0 10px 0;
@@ -3277,6 +3355,57 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
       color: var(--text);
       cursor: pointer;
       font-size: 13px;
+    }}
+    body[data-theme="dark"] .label-muted {{
+      color: #94a3b8;
+    }}
+    body[data-theme="dark"] .user-meta-row {{
+      border-bottom-color: rgba(148,163,184,0.26);
+    }}
+    body[data-theme="dark"] .topbar {{
+      border-color: rgba(148,163,184,0.26);
+    }}
+    body[data-theme="dark"] .card {{
+      box-shadow: 0 14px 34px rgba(2, 6, 23, 0.36);
+    }}
+    body[data-theme="dark"] th,
+    body[data-theme="dark"] td {{
+      border-bottom-color: rgba(148,163,184,0.2);
+    }}
+    body[data-theme="dark"] pre {{
+      border-color: rgba(148,163,184,0.24);
+    }}
+    body[data-theme="dark"] a {{
+      color: #93c5fd;
+    }}
+    body[data-theme="dark"] [style*="rgba(255,255,255,0.76)"] {{
+      background: rgba(15,23,42,0.78) !important;
+      color: #e5e7eb !important;
+      border-color: rgba(148,163,184,0.28) !important;
+    }}
+    body[data-theme="dark"] [style*="rgba(255,255,255,0.65)"] {{
+      background: rgba(15,23,42,0.74) !important;
+      border-color: rgba(148,163,184,0.24) !important;
+    }}
+    body[data-theme="dark"] [style*="rgba(255,255,255,0.6)"] {{
+      background: rgba(15,23,42,0.72) !important;
+      border-color: rgba(148,163,184,0.24) !important;
+    }}
+    body[data-theme="dark"] button {{
+      box-shadow: 0 8px 16px rgba(30,64,175,0.24);
+    }}
+    body[data-theme="dark"] button:hover {{
+      box-shadow: 0 10px 18px rgba(30,64,175,0.3);
+      filter: brightness(1.05);
+    }}
+    body[data-theme="dark"] .btn-ghost {{
+      border-color: rgba(148,163,184,0.34);
+      background: rgba(30,41,59,0.66);
+      color: #dbeafe;
+    }}
+    body[data-theme="dark"] .btn-ghost:hover {{
+      background: rgba(51,65,85,0.75);
+      box-shadow: 0 10px 20px rgba(2,6,23,0.35);
     }}
     @media (max-width: 900px) {{
       .app {{
@@ -3345,6 +3474,7 @@ def _page(title: str, body: str, active: str = "dashboard", user: Optional[dict[
         <div><strong>{title}</strong></div>
         <div style="display:flex;align-items:center;gap:8px;">
           <button id="theme-toggle-btn" class="theme-toggle" data-action="toggle-theme">Night mode</button>
+          <button id="theme-tone-btn" class="theme-toggle" data-action="toggle-theme-tone">Dark tone: strict</button>
           <span id="app-version-badge" class="status-pill status-stopped">version: -</span>
         </div>
       </div>
@@ -3372,6 +3502,26 @@ function applyTheme(theme) {{
   localStorage.setItem('proxy_vpn_theme', t);
   const btn = document.getElementById('theme-toggle-btn');
   if (btn) btn.textContent = t === 'dark' ? 'Light mode' : 'Night mode';
+  refreshThemeToneButton();
+}}
+function detectThemeTone() {{
+  const saved = localStorage.getItem('proxy_vpn_theme_tone');
+  return saved === 'soft' ? 'soft' : 'strict';
+}}
+function applyThemeTone(tone) {{
+  const v = tone === 'soft' ? 'soft' : 'strict';
+  document.body.setAttribute('data-theme-tone', v);
+  localStorage.setItem('proxy_vpn_theme_tone', v);
+  refreshThemeToneButton();
+}}
+function refreshThemeToneButton() {{
+  const btn = document.getElementById('theme-tone-btn');
+  if (!btn) return;
+  const currentTheme = document.body.getAttribute('data-theme') || 'light';
+  const tone = document.body.getAttribute('data-theme-tone') || detectThemeTone();
+  btn.textContent = 'Dark tone: ' + tone;
+  btn.disabled = currentTheme !== 'dark';
+  btn.title = currentTheme !== 'dark' ? 'Enable Night mode first' : 'Switch dark palette';
 }}
 function detectPreferredTheme() {{
   const saved = localStorage.getItem('proxy_vpn_theme');
@@ -3381,6 +3531,10 @@ function detectPreferredTheme() {{
 function toggleTheme() {{
   const current = document.body.getAttribute('data-theme') || detectPreferredTheme();
   applyTheme(current === 'dark' ? 'light' : 'dark');
+}}
+function toggleThemeTone() {{
+  const current = document.body.getAttribute('data-theme-tone') || detectThemeTone();
+  applyThemeTone(current === 'soft' ? 'strict' : 'soft');
 }}
 async function refreshGlobalReleaseState() {{
   const versionEl = document.getElementById('app-version-badge');
@@ -3410,6 +3564,7 @@ async function refreshGlobalReleaseState() {{
   }}
 }}
 applyTheme(detectPreferredTheme());
+applyThemeTone(detectThemeTone());
 refreshGlobalReleaseState();
 setInterval(refreshGlobalReleaseState, 30000);
 document.addEventListener('click', (event) => {{
@@ -3420,6 +3575,7 @@ document.addEventListener('click', (event) => {{
   const action = String(btn.getAttribute('data-action') || '').trim();
   if (action === 'sidebar-logout') return void sidebarLogout();
   if (action === 'toggle-theme') return void toggleTheme();
+  if (action === 'toggle-theme-tone') return void toggleThemeTone();
 }});
 </script>
 </html>"""
@@ -4253,8 +4409,7 @@ def cabinet(request: Request) -> HTMLResponse:
 </div>
 <div class="card cab-section" data-cab-section="traffic">
   <h2>Traffic and resource usage</h2>
-  <p class="muted">Traffic activity and aggregated usage for your profile.</p>
-  <div id="cab-paired-status" class="muted" style="margin-bottom:8px;">Paired status: loading...</div>
+  <div id="cab-user-resource-usage" class="muted" style="margin-bottom:8px;">Resource usage by your profile: loading...</div>
   <div style="overflow:auto;margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);">
     <table style="width:100%;border-collapse:collapse;">
       <thead>
@@ -4506,6 +4661,7 @@ function fmtBytes(v) {{
 }}
 function renderCabinetTrafficSummary(summary) {{
   const body = document.getElementById('cab-traffic-summary-body');
+  const usage = document.getElementById('cab-user-resource-usage');
   if (!body) return;
   const periods = summary && summary.periods ? summary.periods : {{}};
   const keys = [['day','Day'], ['week','Week'], ['month','Month'], ['year','Year']];
@@ -4518,6 +4674,15 @@ function renderCabinetTrafficSummary(summary) {{
       <td style="padding:6px 8px;border-bottom:1px solid rgba(50,65,90,0.12);"><b>${{fmtBytes(item.total_bytes || 0)}}</b></td>
     </tr>`;
   }}).join('');
+  if (usage) {{
+    const u = summary && summary.user_resource_usage ? summary.user_resource_usage : {{}};
+    usage.textContent =
+      'Resource usage by your profile (estimated, 24h): CPU ' + Number(u.estimated_cpu_pct || 0).toFixed(2) +
+      '% · RAM ' + Number(u.estimated_memory_pct || 0).toFixed(2) +
+      '% · Disk ' + Number(u.estimated_disk_pct || 0).toFixed(2) +
+      '% · traffic share ' + Number(u.traffic_share_pct || 0).toFixed(2) +
+      '% · source=' + String(u.source || '-');
+  }}
 }}
 function pairedBadge(state) {{
   const s = String(state || 'incomplete');
@@ -4719,10 +4884,9 @@ function renderCabinetTrafficChart(points) {{
   ctx.stroke();
 }}
 async function loadCabinetTraffic() {{
-  const [sumR, tsR, pairedR] = await Promise.all([
+  const [sumR, tsR] = await Promise.all([
     fetch('/api/v1/user/traffic/summary'),
-    fetch('/api/v1/user/traffic/timeseries?minutes=1440'),
-    fetch('/api/v1/user/paired-status')
+    fetch('/api/v1/user/traffic/timeseries?minutes=1440')
   ]);
   if (sumR.ok) {{
     const s = await sumR.json();
@@ -4731,10 +4895,6 @@ async function loadCabinetTraffic() {{
   if (tsR.ok) {{
     const t = await tsR.json();
     renderCabinetTrafficChart(t.points || []);
-  }}
-  if (pairedR.ok) {{
-    const d = await pairedR.json();
-    renderCabinetPairedStatus(d.paired || {{}}, d.protocol_state || {{}});
   }}
 }}
 async function saveProtocolPreference() {{
@@ -8108,6 +8268,56 @@ def _load_user_traffic_periods(con: sqlite3.Connection, user_id: int) -> dict[st
     return out
 
 
+def _estimate_user_resource_usage(
+    con: sqlite3.Connection, user_id: int, current: Optional[sqlite3.Row]
+) -> dict[str, Any]:
+    total_exact = con.execute(
+        """
+        SELECT
+          COALESCE((SELECT SUM(rx_bytes + tx_bytes) FROM user_wireguard_traffic_samples WHERE ts >= datetime('now', '-24 hour')), 0) +
+          COALESCE((SELECT SUM(rx_bytes + tx_bytes) FROM user_xray_traffic_samples WHERE ts >= datetime('now', '-24 hour')), 0)
+          AS total_bytes
+        """
+    ).fetchone()
+    user_exact = con.execute(
+        """
+        SELECT
+          COALESCE((SELECT SUM(rx_bytes + tx_bytes) FROM user_wireguard_traffic_samples WHERE user_id = ? AND ts >= datetime('now', '-24 hour')), 0) +
+          COALESCE((SELECT SUM(rx_bytes + tx_bytes) FROM user_xray_traffic_samples WHERE user_id = ? AND ts >= datetime('now', '-24 hour')), 0)
+          AS total_bytes
+        """,
+        (int(user_id), int(user_id)),
+    ).fetchone()
+    total_bytes = int((total_exact["total_bytes"] if total_exact else 0) or 0)
+    user_bytes = int((user_exact["total_bytes"] if user_exact else 0) or 0)
+    source = "wireguard_xray_exact"
+    if total_bytes <= 0:
+        total_est = con.execute(
+            "SELECT COALESCE(SUM(rx_bytes + tx_bytes), 0) total_bytes FROM user_traffic_samples WHERE ts >= datetime('now', '-24 hour')"
+        ).fetchone()
+        user_est = con.execute(
+            "SELECT COALESCE(SUM(rx_bytes + tx_bytes), 0) total_bytes FROM user_traffic_samples WHERE user_id = ? AND ts >= datetime('now', '-24 hour')",
+            (int(user_id),),
+        ).fetchone()
+        total_bytes = int((total_est["total_bytes"] if total_est else 0) or 0)
+        user_bytes = int((user_est["total_bytes"] if user_est else 0) or 0)
+        source = "estimated_session_share"
+    share = (float(user_bytes) / float(total_bytes)) if total_bytes > 0 else 0.0
+    cpu = float(current["cpu_load_pct"]) if current else 0.0
+    mem = float(current["memory_used_pct"]) if current else 0.0
+    disk = float(current["disk_used_pct"]) if current else 0.0
+    return {
+        "window_hours": 24,
+        "source": source,
+        "user_traffic_24h_bytes": user_bytes,
+        "fleet_traffic_24h_bytes": total_bytes,
+        "traffic_share_pct": round(share * 100.0, 2),
+        "estimated_cpu_pct": round(cpu * share, 2),
+        "estimated_memory_pct": round(mem * share, 2),
+        "estimated_disk_pct": round(disk * share, 2),
+    }
+
+
 def _build_user_traffic_timeseries_response(user_id: int, minutes: int) -> JSONResponse:
     minutes = max(5, min(24 * 60, int(minutes)))
     _refresh_user_traffic_samples_once()
@@ -8198,10 +8408,12 @@ def user_traffic_summary(request: Request) -> JSONResponse:
             LIMIT 1
             """
         ).fetchone()
+        user_resource_usage = _estimate_user_resource_usage(con, int(user["id"]), current)
     return JSONResponse(
         {
             "status": "ok",
             "periods": periods,
+            "user_resource_usage": user_resource_usage,
             "resources": {
                 "cpu_load_pct": float(current["cpu_load_pct"]) if current else 0.0,
                 "memory_used_pct": float(current["memory_used_pct"]) if current else 0.0,

@@ -18,8 +18,8 @@ XRAY_CONFIG_PATH="${XRAY_CONFIG_PATH:-xray/config.json}"
 XRAY_CLIENT_INFO_PATH="${XRAY_CLIENT_INFO_PATH:-xray/client-connection.txt}"
 XRAY_PORT="${XRAY_PORT:-8443}"
 XRAY_REALITY_DEST="${XRAY_REALITY_DEST:-www.cloudflare.com:443}"
-XRAY_REALITY_SERVER_NAME="${XRAY_REALITY_SERVER_NAME:-www.cloudflare.com}"
-XRAY_CLIENT_EMAIL="${XRAY_CLIENT_EMAIL:-client1@proxy-vpn}"
+XRAY_REALITY_SERVER_NAME="${XRAY_REALITY_SERVER_NAME:-}"
+XRAY_CLIENT_EMAIL="${XRAY_CLIENT_EMAIL:-}"
 SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-}"
 FORCE_REGENERATE_XRAY_KEYS="${FORCE_REGENERATE_XRAY_KEYS:-0}"
 
@@ -93,20 +93,43 @@ emit("EXISTING_SNI", sni)
 PY
 )"
 
-if [ -z "${XRAY_REALITY_SERVER_NAME}" ] && [ -n "${EXISTING_SNI:-}" ]; then
-  XRAY_REALITY_SERVER_NAME="${EXISTING_SNI}"
+if [ -z "${XRAY_REALITY_SERVER_NAME}" ]; then
+  XRAY_REALITY_SERVER_NAME="${EXISTING_SNI:-www.cloudflare.com}"
 fi
-if [ -z "${XRAY_CLIENT_EMAIL}" ] && [ -n "${EXISTING_CLIENT_EMAIL:-}" ]; then
-  XRAY_CLIENT_EMAIL="${EXISTING_CLIENT_EMAIL}"
+if [ -z "${XRAY_CLIENT_EMAIL}" ]; then
+  XRAY_CLIENT_EMAIL="${EXISTING_CLIENT_EMAIL:-client1@proxy-vpn}"
 fi
 
 REALITY_PRIVATE_KEY=""
 REALITY_PUBLIC_KEY=""
-if [ "${FORCE_REGENERATE_XRAY_KEYS}" != "1" ] && [ -n "${EXISTING_PRIVATE_KEY:-}" ] && [ -n "${EXISTING_PUBLIC_KEY:-}" ]; then
-  REALITY_PRIVATE_KEY="${EXISTING_PRIVATE_KEY}"
-  REALITY_PUBLIC_KEY="${EXISTING_PUBLIC_KEY}"
-  log "Reusing existing REALITY keypair from current config."
-else
+if [ "${FORCE_REGENERATE_XRAY_KEYS}" != "1" ] && [ -n "${EXISTING_PRIVATE_KEY:-}" ]; then
+  DERIVED_OUTPUT="$(docker run --rm ghcr.io/xtls/xray-core:latest x25519 -i "${EXISTING_PRIVATE_KEY}" 2>&1 || true)"
+  DERIVED_PUBLIC_KEY="$(python3 - "${DERIVED_OUTPUT}" <<'PY'
+import re
+import sys
+
+text = sys.argv[1] if len(sys.argv) > 1 else ""
+m = re.search(r"public\s*key\s*:\s*([A-Za-z0-9+/_=-]{20,})", text, flags=re.IGNORECASE)
+if not m:
+    m = re.search(r"publickey\s*:\s*([A-Za-z0-9+/_=-]{20,})", text, flags=re.IGNORECASE)
+if not m:
+    m = re.search(r"password\s*\(\s*publickey\s*\)\s*:\s*([A-Za-z0-9+/_=-]{20,})", text, flags=re.IGNORECASE)
+if m:
+    print(m.group(1).strip())
+PY
+)"
+  if [ -n "${DERIVED_PUBLIC_KEY}" ]; then
+    REALITY_PRIVATE_KEY="${EXISTING_PRIVATE_KEY}"
+    REALITY_PUBLIC_KEY="${DERIVED_PUBLIC_KEY}"
+    log "Reusing existing REALITY private key and derived public key."
+  elif [ -n "${EXISTING_PUBLIC_KEY:-}" ]; then
+    REALITY_PRIVATE_KEY="${EXISTING_PRIVATE_KEY}"
+    REALITY_PUBLIC_KEY="${EXISTING_PUBLIC_KEY}"
+    log "Reusing existing REALITY keypair from current config metadata."
+  fi
+fi
+
+if [ -z "${REALITY_PRIVATE_KEY}" ] || [ -z "${REALITY_PUBLIC_KEY}" ]; then
   log "Generating REALITY x25519 keypair using xray image..."
   KEYS_OUTPUT="$(docker run --rm ghcr.io/xtls/xray-core:latest x25519 2>&1 || true)"
   REALITY_PRIVATE_KEY="$(python3 - "${KEYS_OUTPUT}" <<'PY'
