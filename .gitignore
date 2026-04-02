@@ -22,3 +22,4 @@ logs/update-audit.jsonl
 logs/pull-audit-*.log
 backups/
 TODO.md
+log.log

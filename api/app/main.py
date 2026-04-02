@@ -5899,6 +5899,23 @@ def admin_user_traffic_summary(request: Request, hours: int = 24) -> JSONRespons
     _refresh_user_traffic_samples_once()
     hours = max(1, min(24 * 30, hours))
     with _db_connect() as con:
+        wg_exact_rows = con.execute(
+            """
+            SELECT COUNT(*) c
+            FROM user_wireguard_traffic_samples
+            WHERE ts >= datetime('now', ?)
+            """,
+            (f"-{hours} hours",),
+        ).fetchone()
+        xray_exact_rows = con.execute(
+            """
+            SELECT COUNT(*) c
+            FROM user_xray_traffic_samples
+            WHERE ts >= datetime('now', ?)
+            """,
+            (f"-{hours} hours",),
+        ).fetchone()
+        use_exact = int(wg_exact_rows["c"] or 0) > 0 or int(xray_exact_rows["c"] or 0) > 0
         rows = con.execute(
             """
             SELECT u.id user_id, u.username, u.email, u.role,
@@ -5935,7 +5952,7 @@ def admin_user_traffic_summary(request: Request, hours: int = 24) -> JSONRespons
             """,
             (f"-{hours} hours", f"-{hours} hours", f"-{hours} hours"),
         ).fetchall()
-        source = "wireguard_xray_exact_with_estimated_fallback"
+        source = "wireguard_xray_exact" if use_exact else "estimated_session_share"
     return JSONResponse(
         {
             "status": "ok",
