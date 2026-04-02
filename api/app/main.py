@@ -2117,6 +2117,22 @@ def _render_managed_wireguard_peer_block(peers: list[dict[str, str]]) -> list[st
     return out
 
 
+def _strip_peer_blocks(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    in_peer = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped.strip("[]").strip().lower()
+            in_peer = section == "peer"
+            if in_peer:
+                continue
+        if in_peer:
+            continue
+        out.append(line)
+    return out
+
+
 def _sync_wireguard_server_peers() -> None:
     tpl = _parse_wireguard_client_template()
     with _db_connect() as con:
@@ -2143,6 +2159,8 @@ def _sync_wireguard_server_peers() -> None:
         base_lines = lines[:begin_idx] + lines[end_idx + 1 :]
     else:
         base_lines = lines[:]
+    # Keep only interface-level config, peers are fully managed below.
+    base_lines = _strip_peer_blocks(base_lines)
     while base_lines and not base_lines[-1].strip():
         base_lines.pop()
     managed_block = _render_managed_wireguard_peer_block(peers)
@@ -2158,6 +2176,13 @@ def _sync_wireguard_server_peers() -> None:
     try:
         client = docker.from_env()
         container = client.containers.get("proxy-vpn-wireguard")
+        existing_res = container.exec_run(["wg", "show", "wg0", "peers"], stdout=True, stderr=True)
+        existing_out = getattr(existing_res, "output", b"")
+        existing_text = existing_out.decode("utf-8", errors="replace").strip() if existing_out else ""
+        existing_keys = [k.strip() for k in existing_text.split() if k.strip()]
+        for key in existing_keys:
+            if key and key not in new_keys:
+                container.exec_run(["wg", "set", "wg0", "peer", key, "remove"], stdout=False, stderr=False)
         for key in sorted(old_keys - new_keys):
             container.exec_run(["wg", "set", "wg0", "peer", key, "remove"], stdout=False, stderr=False)
         for item in peers:
