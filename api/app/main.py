@@ -6350,7 +6350,7 @@ async function bindWgPeer() {{
   if (r.ok) window.location.reload();
 }}
 async function removeWgBinding(publicKey) {{
-  const r = await fetch('/api/v1/admin/wireguard-bindings/' + encodeURIComponent(publicKey), {{
+  const r = await fetch('/api/v1/admin/wireguard-bindings?public_key=' + encodeURIComponent(publicKey), {{
     method: 'DELETE',
     headers: {{'X-CSRF-Token': getCsrfToken()}}
   }});
@@ -7961,11 +7961,12 @@ def admin_wireguard_bind(request: Request, payload: AdminBindWireGuardRequest) -
     return JSONResponse({"status": "ok", "message": "wireguard peer bound"})
 
 
-@app.delete("/api/v1/admin/wireguard-bindings/{public_key}")
-def admin_wireguard_unbind(public_key: str, request: Request) -> JSONResponse:
+def _admin_wireguard_unbind_impl(public_key: str, request: Request) -> JSONResponse:
     _ensure_csrf(request)
     _require_admin(request)
     key = str(public_key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="public_key is required")
     with _db_connect() as con:
         row = con.execute("SELECT user_id FROM wg_peer_bindings WHERE public_key = ?", (key,)).fetchone()
         con.execute("DELETE FROM wg_peer_bindings WHERE public_key = ?", (key,))
@@ -7978,6 +7979,16 @@ def admin_wireguard_unbind(public_key: str, request: Request) -> JSONResponse:
         con.commit()
     _sync_wireguard_server_peers()
     return JSONResponse({"status": "ok", "message": "wireguard peer unbound"})
+
+
+@app.delete("/api/v1/admin/wireguard-bindings")
+def admin_wireguard_unbind_query(request: Request, public_key: str) -> JSONResponse:
+    return _admin_wireguard_unbind_impl(public_key=public_key, request=request)
+
+
+@app.delete("/api/v1/admin/wireguard-bindings/{public_key:path}")
+def admin_wireguard_unbind_path(public_key: str, request: Request) -> JSONResponse:
+    return _admin_wireguard_unbind_impl(public_key=public_key, request=request)
 
 
 @app.get("/api/v1/admin/xray-bindings")
