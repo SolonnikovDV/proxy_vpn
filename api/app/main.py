@@ -2381,6 +2381,8 @@ def _wireguard_diagnostics_for_user(
     handshake_age_seconds = None
     if latest_handshake_raw > 0:
         handshake_age_seconds = max(0, int(now.timestamp()) - latest_handshake_raw)
+    runtime_peer_present = bool(peer_runtime)
+    handshake_recent = bool(handshake_age_seconds is not None and handshake_age_seconds <= 300)
     recent_row = con.execute(
         """
         SELECT COALESCE(SUM(rx_bytes), 0) AS rx_bytes, COALESCE(SUM(tx_bytes), 0) AS tx_bytes
@@ -2423,7 +2425,9 @@ def _wireguard_diagnostics_for_user(
         "runtime_allowed_ips": str(peer_runtime.get("allowed_ips", "") or ""),
         "runtime_rx_total": int(peer_runtime.get("rx_total", 0) or 0),
         "runtime_tx_total": int(peer_runtime.get("tx_total", 0) or 0),
+        "runtime_peer_present": bool(runtime_peer_present),
         "handshake_age_seconds": handshake_age_seconds,
+        "handshake_recent": bool(handshake_recent),
         "recent_rx_bytes": recent_rx,
         "recent_tx_bytes": recent_tx,
         "recent_total_bytes": recent_total,
@@ -6486,6 +6490,8 @@ async function runAdminWgDiagnosticsForUser(userId, username, email) {{
       '- ' + String(item.username || '-') + ' <' + String(item.email || '-') + '>' +
       ' | verdict=' + String(d.verdict || '-') +
       ' | bound_key=' + String(d.bound_public_key || '-') +
+      ' | runtime_peer_present=' + String(!!d.runtime_peer_present) +
+      ' | handshake_recent=' + String(!!d.handshake_recent) +
       ' | handshake_age=' + String((d.handshake_age_seconds === null || d.handshake_age_seconds === undefined) ? 'n/a' : (String(d.handshake_age_seconds) + 's')) +
       ' | recent=' + fmtBytes(Number(d.recent_total_bytes || 0)) +
       ' | runtime=' + fmtBytes(Number(d.runtime_rx_total || 0)) + '/' + fmtBytes(Number(d.runtime_tx_total || 0)) +
@@ -8186,6 +8192,28 @@ def admin_wireguard_diagnostics(
                     "mtu": str(profile_row["mtu"] or ""),
                     "persistent_keepalive": str(profile_row["persistent_keepalive"] or ""),
                     "updated_at": str(profile_row["updated_at"] or ""),
+                }
+            else:
+                tpl = _parse_wireguard_client_template()
+                panel_domain = str(os.getenv("VPN_PANEL_DOMAIN", "") or "").strip()
+                server_public_ip = str(os.getenv("SERVER_PUBLIC_IP", "") or "").strip()
+                wg_port = str(os.getenv("WG_PORT", "51820") or "51820").strip()
+                endpoint_host = panel_domain if panel_domain and panel_domain != "panel.example.com" else ""
+                if server_public_ip and server_public_ip != "panel.example.com":
+                    endpoint_host = server_public_ip
+                if endpoint_host:
+                    endpoint_host = _resolve_ipv4_address(endpoint_host) or endpoint_host
+                fallback_endpoint = _normalize_endpoint_with_port(
+                    endpoint_host or str(tpl.get("endpoint", "") or "").strip(),
+                    wg_port,
+                )
+                items[-1]["profile_snapshot"] = {
+                    "endpoint": str(fallback_endpoint or "-"),
+                    "allowed_ips": _normalize_wg_allowed_ips(str(tpl.get("allowed_ips", WG_CLIENT_DEFAULT_ALLOWED_IPS))),
+                    "dns": str(tpl.get("dns", "1.1.1.1,1.0.0.1") or ""),
+                    "mtu": str(tpl.get("mtu", WG_CLIENT_DEFAULT_MTU) or ""),
+                    "persistent_keepalive": str(tpl.get("persistent_keepalive", "25") or ""),
+                    "updated_at": "fallback-template",
                 }
     active_probe: dict[str, Any] = {}
     if len(items) == 1:
