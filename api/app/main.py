@@ -59,6 +59,7 @@ DEFAULT_ACTIVE_USER_RATIO_PCT = float(os.getenv("ACTIVE_USER_RATIO_PCT", "25"))
 DEFAULT_MAX_REGISTERED_USERS = int(os.getenv("MAX_REGISTERED_USERS", "0"))
 DEFAULT_DASHBOARD_REFRESH_SECONDS = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "30"))
 DEFAULT_PROXY_BYPASS_CUSTOM = os.getenv("DEFAULT_PROXY_BYPASS_CUSTOM", "")
+DEFAULT_RKN_BLACKLIST = os.getenv("DEFAULT_RKN_BLACKLIST", "")
 WG_DUMP_PATH = "/wireguard-config/wg_dump.txt"
 WG_SERVER_CONFIG_PATH = "/wireguard-config/wg0.conf"
 XRAY_STATS_PATH = "/xray-config/stats_raw.txt"
@@ -81,6 +82,7 @@ UPDATE_APPLY_REQUEST_PATH = os.getenv("UPDATE_APPLY_REQUEST_PATH", "/logs/update
 BACKUP_STATUS_PATH = os.getenv("BACKUP_STATUS_PATH", "/logs/backup-status.json")
 UPDATE_AUDIT_PATH = os.getenv("UPDATE_AUDIT_PATH", "/logs/update-audit.jsonl")
 PROXY_BYPASS_RULES_PATH = os.getenv("PROXY_BYPASS_RULES_PATH", "config/proxy-bypass-rules.txt")
+RKN_BLACKLIST_RULES_PATH = os.getenv("RKN_BLACKLIST_RULES_PATH", "config/rkn-blacklist-rules.txt")
 SECURITY_GUARD_URL = os.getenv("SECURITY_GUARD_URL", "http://security-guard:9100").rstrip("/")
 SECURITY_HTTP_WINDOW_SECONDS = int(os.getenv("SECURITY_HTTP_WINDOW_SECONDS", "10"))
 SECURITY_HTTP_MAX_REQUESTS = int(os.getenv("SECURITY_HTTP_MAX_REQUESTS", "120"))
@@ -793,6 +795,89 @@ def _write_proxy_bypass_rules_text(raw_text: str) -> str:
 def _disabled_proxy_bypass_resources(raw_text: str) -> list[str]:
     parsed = _parse_proxy_bypass_rules_text(raw_text)
     return [str(r["resource"]) for r in parsed if not bool(r.get("use_vpn", False))]
+
+
+def _normalize_resource_token(raw: Any) -> str:
+    token = str(raw or "").strip().lower()
+    if not token:
+        return ""
+    token = re.sub(r"^https?://", "", token)
+    token = re.sub(r"^www\.", "", token)
+    token = token.split("/", 1)[0].strip()
+    token = token.split(":", 1)[0].strip()
+    token = re.sub(r"\s+", "", token)
+    return token[:255]
+
+
+def _parse_resource_list_text(text: str, limit: int = 5000) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        chunk = re.split(r"[,\t; ]+", line, maxsplit=1)[0]
+        resource = _normalize_resource_token(chunk)
+        if not resource or resource in seen:
+            continue
+        seen.add(resource)
+        items.append(resource)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _serialize_resource_list_text(items: list[str]) -> str:
+    normalized = [_normalize_resource_token(i) for i in items]
+    compact = [i for i in normalized if i]
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in compact:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return "\n".join(result)
+
+
+def _read_rkn_blacklist_rules_text(fallback_text: str = "") -> str:
+    path = Path(RKN_BLACKLIST_RULES_PATH)
+    if path.exists():
+        try:
+            return _serialize_resource_list_text(_parse_resource_list_text(path.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return _serialize_resource_list_text(_parse_resource_list_text(fallback_text))
+
+
+def _match_blacklist_resource(resource: str, blacklist_items: list[str], blacklist_set: set[str]) -> str:
+    if resource in blacklist_set:
+        return resource
+    for blocked in blacklist_items:
+        if resource.endswith("." + blocked) or blocked.endswith("." + resource):
+            return blocked
+    return ""
+
+
+def _build_proxy_bypass_blacklist_audit(proxy_bypass_text: str, blacklist_text: str) -> dict[str, Any]:
+    bypass_rows = _parse_proxy_bypass_rules_text(proxy_bypass_text)
+    direct_rows = [str(r.get("resource", "")) for r in bypass_rows if not bool(r.get("use_vpn", False))]
+    blacklist_items = _parse_resource_list_text(blacklist_text)
+    blacklist_set = set(blacklist_items)
+    conflicts: list[dict[str, str]] = []
+    for resource in direct_rows:
+        match = _match_blacklist_resource(resource, blacklist_items, blacklist_set)
+        if not match:
+            continue
+        conflicts.append({"resource": resource, "blacklist_match": match})
+        if len(conflicts) >= 500:
+            break
+    return {
+        "direct_count": len(direct_rows),
+        "blacklist_count": len(blacklist_items),
+        "conflicts_count": len(conflicts),
+        "conflicts": conflicts,
+    }
 
 
 def _recalculate_system_config(raw: dict[str, Any]) -> dict[str, Any]:
@@ -3653,6 +3738,10 @@ class AdminConfiguratorUpdateRequest(BaseModel):
     proxy_bypass_custom: str = ""
 
 
+class AdminProxyBypassUpdateRequest(BaseModel):
+    proxy_bypass_custom: str = ""
+
+
 class AdminSecurityBlockRequest(BaseModel):
     ip: str
     reason: Optional[str] = None
@@ -5300,6 +5389,7 @@ def admin(request: Request) -> HTMLResponse:
     <button class="tab-btn" data-tab="overview" data-admin-section="overview">Overview</button>
     <button class="tab-btn" data-tab="security" data-admin-section="security">Security</button>
     <button class="tab-btn" data-tab="configurator" data-admin-section="configurator">Configurator</button>
+    <button class="tab-btn" data-tab="whitelist" data-admin-section="whitelist">Whitelist</button>
     <button class="tab-btn" data-tab="approvals" data-admin-section="approvals">Approvals <span id="approvals-tab-badge" class="status-pill status-pending" style="display:{'inline-block' if len(pending_rows) > 0 else 'none'};margin-left:6px;">{len(pending_rows)}</span></button>
     <button class="tab-btn" data-tab="users" data-admin-section="users">Users</button>
     <button class="tab-btn" data-tab="traffic" data-admin-section="traffic">Traffic</button>
@@ -5367,16 +5457,72 @@ def admin(request: Request) -> HTMLResponse:
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;">
     <input id="cfg-dashboard-refresh-seconds" placeholder="Refresh interval (sec)" type="number" step="1" min="5" max="300" />
   </div>
-  <h3 style="margin-top:12px;">Proxy bypass resources (Direct/Bypass)</h3>
-  <p class="muted">Stored in <code>{PROXY_BYPASS_RULES_PATH}</code>. Format per line: <code>resource,false</code> (false = use Direct, VPN disabled).</p>
-  <textarea id="cfg-proxy-bypass-custom" placeholder="example.ru,false&#10;gosuslugi.ru,false&#10;youtube.com,true" style="width:100%;min-height:120px;padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);"></textarea>
-  <p class="muted" id="cfg-proxy-bypass-validation">Validation: -</p>
+  <h3 style="margin-top:12px;">Whitelist management</h3>
+  <p class="muted">Address list management is moved to dedicated page: open <b>Whitelist</b> tab in admin panel.</p>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <button class="btn-ghost" data-admin-section="whitelist" data-admin-subsection="rules">Open whitelist page</button>
+  </div>
   <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
     <button data-action="apply-configurator">Apply configuration</button>
     <button class="btn-ghost" data-action="reload-configurator">Reload</button>
   </div>
   <p class="muted" id="cfg-derived">derived: -</p>
   <pre id="cfg-out">Ready.</pre>
+</div>
+
+<div class="card admin-section" data-section="whitelist" data-subsection="rules">
+  <h2>Whitelist (Direct/Bypass resources)</h2>
+  <p class="muted">Stored in <code>{PROXY_BYPASS_RULES_PATH}</code>. Format per line: <code>resource,false</code> (false = use Direct, VPN disabled).</p>
+  <p class="muted">RKN blacklist source for cross-check: <code>{RKN_BLACKLIST_RULES_PATH}</code>.</p>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0;">
+    <button class="btn-ghost" data-action="bypass-preset-conservative">Load preset: conservative</button>
+    <button class="btn-ghost" data-action="bypass-preset-traffic-saving">Load preset: traffic-saving</button>
+    <span class="muted">Preset replaces current list. You can then edit manually.</span>
+  </div>
+  <div style="display:grid;grid-template-columns:2fr 1fr auto;gap:8px;align-items:end;margin:8px 0;">
+    <input id="cfg-bypass-resource" placeholder="Add resource (example.com)" />
+    <select id="cfg-bypass-flag" style="padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);">
+      <option value="false">Direct (false)</option>
+      <option value="true">Force VPN (true)</option>
+    </select>
+    <button class="btn-ghost" data-action="bypass-add-rule">Add resource</button>
+  </div>
+  <textarea id="cfg-proxy-bypass-custom" placeholder="example.ru,false&#10;gosuslugi.ru,false&#10;youtube.com,true" style="width:100%;min-height:120px;padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);"></textarea>
+  <p class="muted" id="cfg-proxy-bypass-validation">Validation: -</p>
+  <p class="muted" id="cfg-proxy-bypass-rkn-warning">RKN cross-check: -</p>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0;">
+    <select id="cfg-bypass-filter-mode" style="padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);">
+      <option value="all">All</option>
+      <option value="direct">Direct only</option>
+      <option value="conflicts">Conflicts only</option>
+    </select>
+    <span class="muted" id="cfg-bypass-filter-meta">Filter: all</span>
+  </div>
+  <div style="overflow:auto;margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);">
+    <table style="width:100%;border-collapse:collapse;min-width:420px;">
+      <thead>
+        <tr><th align="left">Resource</th><th align="left">Route mode</th><th align="left">Actions</th></tr>
+      </thead>
+      <tbody id="cfg-proxy-bypass-preview"><tr><td colspan="3" class="muted">No rules.</td></tr></tbody>
+    </table>
+  </div>
+  <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
+    <button data-action="apply-proxy-bypass">Apply whitelist</button>
+    <button class="btn-ghost" data-action="reload-proxy-bypass">Reload whitelist</button>
+  </div>
+  <pre id="cfg-bypass-out">Ready.</pre>
+</div>
+
+<div class="card admin-section" data-section="whitelist" data-subsection="resolve">
+  <h2>Whitelist: need to resolve</h2>
+  <p class="muted">Only unresolved conflicts where resource is in Direct list and matches RKN blacklist. Action is required for each row.</p>
+  <table style="width:100%; border-collapse:collapse;">
+    <thead>
+      <tr><th align="left">Resource</th><th align="left">Blacklist match</th><th align="left">Route mode</th><th align="left">Actions</th></tr>
+    </thead>
+    <tbody id="cfg-bypass-resolve-body"><tr><td colspan="4" class="muted">No unresolved conflicts.</td></tr></tbody>
+  </table>
+  <p class="muted" id="cfg-bypass-resolve-meta">Need resolve: -</p>
 </div>
 
 <div class="card admin-section" data-section="overview" data-subsection="trend">
@@ -5686,6 +5832,82 @@ let serviceLogsIntervalId = null;
 let adminRefreshIntervalId = null;
 let securityEventsCache = [];
 let pairedStatusCache = [];
+let currentRknBlacklistItems = [];
+const bypassConflictResolution = {{}};
+const BYPASS_PRESET_CONSERVATIVE = [
+  'yandex.ru,false',
+  'vk.com,false',
+  'gosuslugi.ru,false'
+].join('\\n');
+const BYPASS_PRESET_TRAFFIC_SAVING = [
+  'yandex.ru,false',
+  'ya.ru,false',
+  'yandex.com,false',
+  'vk.com,false',
+  'ok.ru,false',
+  'mail.ru,false',
+  'rambler.ru,false',
+  'avito.ru,false',
+  'ozon.ru,false',
+  'wildberries.ru,false',
+  'gosuslugi.ru,false',
+  'mos.ru,false',
+  'nalog.gov.ru,false',
+  'sber.ru,false',
+  'sberbank.ru,false',
+  'alfabank.ru,false',
+  'vtb.ru,false',
+  'tbank.ru,false',
+  'gazprombank.ru,false',
+  'raiffeisen.ru,false',
+  'qiwi.com,false',
+  'mironline.ru,false',
+  'rutube.ru,false',
+  'kinopoisk.ru,false',
+  'ivi.ru,false',
+  'okko.tv,false',
+  'wink.ru,false',
+  'premier.one,false',
+  'smotrim.ru,false',
+  'ria.ru,false',
+  'tass.ru,false',
+  'lenta.ru,false',
+  'rbc.ru,false',
+  'kommersant.ru,false',
+  'telegram.org,false',
+  't.me,false',
+  'whatsapp.com,false',
+  'web.whatsapp.com,false',
+  'viber.com,false',
+  'apple.com,false',
+  'appstore.com,false',
+  'apps.apple.com,false',
+  'icloud.com,false',
+  'mzstatic.com,false',
+  'cdn-apple.com,false',
+  'googleapis.com,false',
+  'gstatic.com,false',
+  'play.google.com,false',
+  'android.com,false',
+  'microsoft.com,false',
+  'windowsupdate.com,false',
+  'update.microsoft.com,false',
+  'office.com,false',
+  'officecdn.microsoft.com,false',
+  'github.com,false',
+  'githubusercontent.com,false',
+  'gitlab.com,false',
+  'docker.com,false',
+  'docker.io,false',
+  'pypi.org,false',
+  'npmjs.com,false',
+  'cloudflare.com,false',
+  'one.one.one.one,false',
+  'akamai.net,false',
+  'fastly.net,false',
+  'jsdelivr.net,false',
+  'cdnjs.com,false'
+].join('\\n');
 let currentAdminSection = 'overview';
 const currentAdminSubsection = {{}};
 const ADMIN_SECTION_STORAGE_KEY = 'proxy_vpn_admin_section';
@@ -5706,6 +5928,7 @@ const sectionSubsections = {{
     ['blocked', 'Blocked IPs'],
   ],
   configurator: [['settings', 'Settings']],
+  whitelist: [['rules', 'Bypass list'], ['resolve', 'Need resolve']],
   approvals: [['requests', 'Requests']],
   users: [['management', 'Management'], ['recent', 'Recent users']],
   traffic: [['wg-bindings', 'WG bindings'], ['xray-bindings', 'Xray bindings'], ['paired', 'Paired mode'], ['per-user', 'Per-user']],
@@ -6544,9 +6767,248 @@ function validateProxyBypassRulesText(rawText) {{
   return {{
     ok: invalid.length === 0,
     normalized_text: normalized.join('\\n'),
+    normalized_items: normalized.map((row) => {{
+      const parts = row.split(',');
+      return {{ resource: String(parts[0] || ''), flag: String(parts[1] || 'false') }};
+    }}),
     valid_count: normalized.length,
     errors: invalid
   }};
+}}
+function parseResourceListText(rawText) {{
+  const lines = String(rawText || '').split('\\n');
+  const out = [];
+  const seen = {{}};
+  for (let i = 0; i < lines.length; i += 1) {{
+    const line = String(lines[i] || '').trim();
+    if (!line || line.indexOf('#') === 0) continue;
+    const first = String(line.split(/[\\s,;\\t]+/)[0] || '').trim();
+    const norm = normalizeBypassResourceInput(first);
+    if (!norm || seen[norm]) continue;
+    seen[norm] = true;
+    out.push(norm);
+  }}
+  return out;
+}}
+function matchBlacklistResource(resource, blacklistItems) {{
+  const r = String(resource || '').trim().toLowerCase();
+  if (!r) return '';
+  const set = {{}};
+  blacklistItems.forEach((b) => {{ set[String(b || '')] = true; }});
+  if (set[r]) return r;
+  for (let i = 0; i < blacklistItems.length; i += 1) {{
+    const b = String(blacklistItems[i] || '').trim().toLowerCase();
+    if (!b) continue;
+    if (r.endsWith('.' + b) || b.endsWith('.' + r)) return b;
+  }}
+  return '';
+}}
+function buildBypassBlacklistConflicts(check) {{
+  const conflicts = [];
+  const items = Array.isArray(check && check.normalized_items) ? check.normalized_items : [];
+  let directCount = 0;
+  for (let i = 0; i < items.length; i += 1) {{
+    const item = items[i] || {{}};
+    const resource = String(item.resource || '').trim().toLowerCase();
+    const flag = String(item.flag || 'false').trim().toLowerCase();
+    if (flag === 'true') continue;
+    directCount += 1;
+    const match = matchBlacklistResource(resource, currentRknBlacklistItems || []);
+    if (!match) continue;
+    const resolution = String(bypassConflictResolution[resource] || '');
+    conflicts.push({{
+      resource,
+      blacklist_match: match,
+      resolution,
+      unresolved: resolution !== 'keep'
+    }});
+  }}
+  return {{
+    direct_count: directCount,
+    conflicts,
+    conflicts_count: conflicts.length,
+    conflicts_unresolved: conflicts.filter((c) => c.unresolved).length,
+  }};
+}}
+function renderBypassBlacklistWarning(meta) {{
+  const el = document.getElementById('cfg-proxy-bypass-rkn-warning');
+  if (!el) return;
+  const conflicts = Array.isArray(meta && meta.conflicts) ? meta.conflicts : [];
+  const unresolved = Number(meta && meta.conflicts_unresolved || 0);
+  const total = Number(meta && meta.conflicts_count || 0);
+  const blacklistCount = Array.isArray(currentRknBlacklistItems) ? currentRknBlacklistItems.length : 0;
+  if (!conflicts.length) {{
+    el.innerHTML = `RKN cross-check: <span class="status-pill status-running">0 warnings</span> · blacklist entries: ${{blacklistCount}} · direct rules: ${{Number(meta && meta.direct_count || 0)}}`;
+    return;
+  }}
+  const cls = unresolved > 0 ? 'in_error' : 'pending';
+  const note = unresolved > 0
+    ? 'Need resolve: choose Keep or Exclude for each warning.'
+    : 'All warnings acknowledged (Keep).';
+  el.innerHTML = `RKN cross-check: <span class="status-pill status-${{cls}}">${{unresolved}} unresolved</span> · total warnings: ${{total}} · blacklist entries: ${{blacklistCount}}. ${{note}}`;
+}}
+function renderBypassResolveTable(meta) {{
+  const body = document.getElementById('cfg-bypass-resolve-body');
+  const metaEl = document.getElementById('cfg-bypass-resolve-meta');
+  if (!body) return;
+  const conflicts = Array.isArray(meta && meta.conflicts) ? meta.conflicts : [];
+  const unresolved = conflicts.filter((c) => !!c && c.unresolved);
+  if (!unresolved.length) {{
+    body.innerHTML = '<tr><td colspan="4" class="muted">No unresolved conflicts.</td></tr>';
+    if (metaEl) metaEl.textContent = 'Need resolve: 0';
+    return;
+  }}
+  body.innerHTML = unresolved.map((c) => {{
+    const resource = String(c.resource || '');
+    const match = String(c.blacklist_match || '');
+    const keepBtn = `<button class="btn-ghost" data-action="bypass-resolve-keep" data-resource="${{escHtml(resource)}}">Keep</button>`;
+    const excludeBtn = `<button class="btn-ghost" data-action="bypass-resolve-exclude" data-resource="${{escHtml(resource)}}">Exclude</button>`;
+    return `<tr>
+      <td><code>${{escHtml(resource)}}</code></td>
+      <td><code>${{escHtml(match)}}</code></td>
+      <td><span class="status-pill status-running">DIRECT</span></td>
+      <td>${{keepBtn}} ${{excludeBtn}}</td>
+    </tr>`;
+  }}).join('');
+  if (metaEl) {{
+    metaEl.textContent = `Need resolve: ${{unresolved.length}} · total conflicts: ${{conflicts.length}}`;
+  }}
+}}
+function getBypassOutEl() {{
+  return document.getElementById('cfg-bypass-out') || document.getElementById('cfg-out');
+}}
+function setBypassRulesFromItems(items) {{
+  const input = document.getElementById('cfg-proxy-bypass-custom');
+  if (!input) return;
+  const uniq = {{}};
+  (Array.isArray(items) ? items : []).forEach((item) => {{
+    const resource = normalizeBypassResourceInput(item.resource || '');
+    const flag = String(item.flag || 'false').trim().toLowerCase() === 'true' ? 'true' : 'false';
+    if (!resource) return;
+    uniq[resource] = flag;
+  }});
+  const text = Object.keys(uniq).sort().map((k) => k + ',' + uniq[k]).join('\\n');
+  input.value = text;
+  renderProxyBypassValidation(text);
+}}
+function removeBypassResource(resource) {{
+  const input = document.getElementById('cfg-proxy-bypass-custom');
+  const out = getBypassOutEl();
+  if (!input) return;
+  const target = normalizeBypassResourceInput(resource);
+  const check = validateProxyBypassRulesText(input.value || '');
+  const next = (check.normalized_items || []).filter((item) => String(item.resource || '') !== target);
+  delete bypassConflictResolution[target];
+  setBypassRulesFromItems(next);
+  if (out) out.textContent = 'Removed from bypass list: ' + target;
+}}
+function resolveBypassConflict(resource, resolution) {{
+  const out = getBypassOutEl();
+  const target = normalizeBypassResourceInput(resource);
+  if (!target) return;
+  if (resolution === 'exclude') {{
+    removeBypassResource(target);
+    if (out) out.textContent = 'Conflict resolved by exclusion: ' + target;
+    return;
+  }}
+  bypassConflictResolution[target] = 'keep';
+  const input = document.getElementById('cfg-proxy-bypass-custom');
+  renderProxyBypassValidation(String((input && input.value) || ''));
+  if (out) out.textContent = 'Conflict acknowledged as Keep (manual override): ' + target;
+}}
+function renderProxyBypassPreview(check, metaOverride = null) {{
+  const body = document.getElementById('cfg-proxy-bypass-preview');
+  const filterEl = document.getElementById('cfg-bypass-filter-mode');
+  const filterMetaEl = document.getElementById('cfg-bypass-filter-meta');
+  if (!body) return;
+  const items = Array.isArray(check && check.normalized_items) ? check.normalized_items : [];
+  const meta = metaOverride || buildBypassBlacklistConflicts(check);
+  const conflictMap = {{}};
+  (meta.conflicts || []).forEach((c) => {{
+    conflictMap[String(c.resource || '')] = c;
+  }});
+  renderBypassBlacklistWarning(meta);
+  renderBypassResolveTable(meta);
+  const mode = String((filterEl && filterEl.value) || 'all').trim().toLowerCase();
+  const visible = items.filter((item) => {{
+    const resource = String(item.resource || '');
+    const isDirect = String(item.flag || 'false') === 'false';
+    const hasConflict = !!conflictMap[resource];
+    if (mode === 'direct') return isDirect;
+    if (mode === 'conflicts') return hasConflict;
+    return true;
+  }});
+  if (filterMetaEl) {{
+    filterMetaEl.textContent = `Filter: ${{mode}} · visible ${{visible.length}} / ${{items.length}}`;
+  }}
+  if (!visible.length) {{
+    body.innerHTML = '<tr><td colspan="3" class="muted">No rules.</td></tr>';
+    return;
+  }}
+  const preview = visible.slice(0, 120);
+  body.innerHTML = preview.map((item) => {{
+    const resource = String(item.resource || '');
+    const route = String(item.flag || 'false') === 'true'
+      ? '<span class="status-pill status-pending">VPN</span>'
+      : '<span class="status-pill status-running">DIRECT</span>';
+    const conflict = conflictMap[resource] || null;
+    let warning = '';
+    if (conflict && String(item.flag || 'false') === 'false') {{
+      const resolved = String(conflict.resolution || '') === 'keep';
+      warning = resolved
+        ? ` <span class="status-pill status-pending" title="Matched blacklist: ${{escHtml(conflict.blacklist_match || '')}}">RKN match (kept)</span>`
+        : ` <span class="status-pill status-in_error" title="Matched blacklist: ${{escHtml(conflict.blacklist_match || '')}}">RKN match</span>`;
+    }}
+    const removeBtn = `<button class="btn-ghost" data-action="bypass-remove-rule" data-resource="${{escHtml(resource)}}">Remove</button>`;
+    let resolveBtns = '';
+    if (conflict && String(item.flag || 'false') === 'false' && String(conflict.resolution || '') !== 'keep') {{
+      resolveBtns = ` <button class="btn-ghost" data-action="bypass-resolve-keep" data-resource="${{escHtml(resource)}}">Keep</button>` +
+        ` <button class="btn-ghost" data-action="bypass-resolve-exclude" data-resource="${{escHtml(resource)}}">Exclude</button>`;
+    }}
+    return `<tr><td><code>${{escHtml(resource || '-')}}</code>${{warning}}</td><td>${{route}}</td><td>${{removeBtn}}${{resolveBtns}}</td></tr>`;
+  }}).join('');
+  if (visible.length > preview.length) {{
+    body.innerHTML += `<tr><td colspan="3" class="muted">... and ${{visible.length - preview.length}} more rules</td></tr>`;
+  }}
+}}
+function normalizeBypassResourceInput(raw) {{
+  let v = String(raw || '').trim().toLowerCase();
+  if (!v) return '';
+  v = v.replace(/^https?:\\/\\//, '');
+  v = v.replace(/^www\\./, '');
+  const slash = v.indexOf('/');
+  if (slash >= 0) v = v.slice(0, slash);
+  return v.replace(/\\s+/g, '');
+}}
+function applyBypassPreset(text) {{
+  const input = document.getElementById('cfg-proxy-bypass-custom');
+  if (!input) return;
+  input.value = String(text || '').trim();
+  renderProxyBypassValidation(input.value);
+}}
+function addBypassRuleFromControls() {{
+  const input = document.getElementById('cfg-proxy-bypass-custom');
+  const resourceEl = document.getElementById('cfg-bypass-resource');
+  const flagEl = document.getElementById('cfg-bypass-flag');
+  const out = getBypassOutEl();
+  if (!input || !resourceEl || !flagEl) return;
+  const resource = normalizeBypassResourceInput(resourceEl.value);
+  const flag = String(flagEl.value || 'false').trim().toLowerCase() === 'true' ? 'true' : 'false';
+  if (!resource) {{
+    if (out) out.textContent = 'Resource is empty.';
+    return;
+  }}
+  const check = validateProxyBypassRulesText(input.value || '');
+  const map = {{}};
+  (check.normalized_items || []).forEach((i) => {{
+    map[String(i.resource || '')] = String(i.flag || 'false');
+  }});
+  map[resource] = flag;
+  const next = Object.keys(map).sort().map((k) => k + ',' + map[k]).join('\\n');
+  input.value = next;
+  renderProxyBypassValidation(next);
+  resourceEl.value = '';
+  if (out) out.textContent = 'Resource added/updated in bypass list: ' + resource;
 }}
 function renderProxyBypassValidation(rawText) {{
   const input = document.getElementById('cfg-proxy-bypass-custom');
@@ -6563,6 +7025,10 @@ function renderProxyBypassValidation(rawText) {{
       ? '1px solid rgba(22,101,52,0.45)'
       : '1px solid rgba(185,28,28,0.65)';
   }}
+  const blacklistMeta = buildBypassBlacklistConflicts(check);
+  check.blacklist_meta = blacklistMeta;
+  check.conflicts_unresolved = Number(blacklistMeta.conflicts_unresolved || 0);
+  renderProxyBypassPreview(check, blacklistMeta);
   return check;
 }}
 function renderConfigurator(config) {{
@@ -6582,6 +7048,7 @@ function renderConfigurator(config) {{
   setConfigField('cfg-disk-warn-p95', config.disk_warn_p95);
   setConfigField('cfg-disk-crit-p95', config.disk_crit_p95);
   setConfigField('cfg-dashboard-refresh-seconds', config.dashboard_refresh_seconds || 30);
+  currentRknBlacklistItems = parseResourceListText(config.rkn_blacklist || '');
   setConfigField('cfg-proxy-bypass-custom', config.proxy_bypass_custom || '');
   renderProxyBypassValidation(config.proxy_bypass_custom || '');
   const derived = document.getElementById('cfg-derived');
@@ -6615,13 +7082,6 @@ async function loadConfigurator() {{
 }}
 async function applyConfigurator() {{
   const out = document.getElementById('cfg-out');
-  const bypassInput = document.getElementById('cfg-proxy-bypass-custom');
-  const bypassRaw = String((bypassInput && bypassInput.value) || '');
-  const bypassCheck = renderProxyBypassValidation(bypassRaw);
-  if (!bypassCheck.ok) {{
-    if (out) out.textContent = 'Invalid bypass rules format. Fix lines: ' + bypassCheck.errors.slice(0, 8).join('; ');
-    return;
-  }}
   const payload = {{
     server_cpu_cores: readConfigNumber('cfg-server-cpu-cores'),
     server_ram_gb: readConfigNumber('cfg-server-ram-gb'),
@@ -6638,7 +7098,7 @@ async function applyConfigurator() {{
     disk_warn_p95: readConfigNumber('cfg-disk-warn-p95'),
     disk_crit_p95: readConfigNumber('cfg-disk-crit-p95'),
     dashboard_refresh_seconds: Math.trunc(readConfigNumber('cfg-dashboard-refresh-seconds')),
-    proxy_bypass_custom: bypassCheck.normalized_text,
+    proxy_bypass_custom: String((document.getElementById('cfg-proxy-bypass-custom') || {{value: ''}}).value || ''),
   }};
   if (out) out.textContent = 'Applying...';
   const r = await fetch('/api/v1/admin/configurator', {{
@@ -6655,6 +7115,54 @@ async function applyConfigurator() {{
   try {{ j = JSON.parse(txt); }} catch (e) {{ j = null; }}
   if (j && j.config) renderConfigurator(j.config);
   if (j && j.capacity) renderCapacityStatus(j.capacity);
+  if (out) out.textContent = (j && j.message) ? j.message : txt;
+  await refreshAdminLive();
+}}
+async function loadProxyBypass() {{
+  const out = getBypassOutEl();
+  if (out) out.textContent = 'Loading whitelist...';
+  const r = await fetch('/api/v1/admin/configurator/proxy-bypass');
+  const txt = await r.text();
+  if (!r.ok) {{
+    if (out) out.textContent = txt;
+    return;
+  }}
+  let j = null;
+  try {{ j = JSON.parse(txt); }} catch (e) {{ j = null; }}
+  if (!j || !j.config) {{
+    if (out) out.textContent = txt;
+    return;
+  }}
+  renderConfigurator(j.config);
+  if (out) out.textContent = 'Whitelist loaded.';
+}}
+async function applyProxyBypass() {{
+  const out = getBypassOutEl();
+  const bypassInput = document.getElementById('cfg-proxy-bypass-custom');
+  const bypassRaw = String((bypassInput && bypassInput.value) || '');
+  const bypassCheck = renderProxyBypassValidation(bypassRaw);
+  if (!bypassCheck.ok) {{
+    if (out) out.textContent = 'Invalid whitelist format. Fix lines: ' + bypassCheck.errors.slice(0, 8).join('; ');
+    return;
+  }}
+  if (Number(bypassCheck.conflicts_unresolved || 0) > 0) {{
+    if (out) out.textContent = 'RKN blacklist conflicts detected. Resolve each warning with Keep or Exclude before Apply.';
+    return;
+  }}
+  if (out) out.textContent = 'Applying whitelist...';
+  const r = await fetch('/api/v1/admin/configurator/proxy-bypass', {{
+    method: 'POST',
+    headers: {{'Content-Type':'application/json', 'X-CSRF-Token': getCsrfToken()}},
+    body: JSON.stringify({{proxy_bypass_custom: bypassCheck.normalized_text}})
+  }});
+  const txt = await r.text();
+  if (!r.ok) {{
+    if (out) out.textContent = txt;
+    return;
+  }}
+  let j = null;
+  try {{ j = JSON.parse(txt); }} catch (e) {{ j = null; }}
+  if (j && j.config) renderConfigurator(j.config);
   if (out) out.textContent = (j && j.message) ? j.message : txt;
   await refreshAdminLive();
 }}
@@ -7010,6 +7518,7 @@ document.addEventListener('change', (event) => {{
   if (!target) return;
   if (target.id === 'service-log-stderr-only') refreshServiceLogsNow();
   if (target.id === 'cfg-proxy-bypass-custom') renderProxyBypassValidation(String(target.value || ''));
+  if (target.id === 'cfg-bypass-filter-mode') renderProxyBypassValidation(String((document.getElementById('cfg-proxy-bypass-custom') || {{value: ''}}).value || ''));
   if (target.id === 'traffic-user-select') loadAdminUserTrafficDetails();
   if (target.id === 'paired-wg-verdict-filter') renderAdminPairedStatus(pairedStatusCache);
 }});
@@ -7045,8 +7554,16 @@ document.addEventListener('click', (event) => {{
   const actionBtn = target.closest('[data-action]');
   if (actionBtn) {{
     const action = String(actionBtn.getAttribute('data-action') || '').trim();
+    if (action === 'bypass-preset-conservative') return void applyBypassPreset(BYPASS_PRESET_CONSERVATIVE);
+    if (action === 'bypass-preset-traffic-saving') return void applyBypassPreset(BYPASS_PRESET_TRAFFIC_SAVING);
+    if (action === 'bypass-add-rule') return void addBypassRuleFromControls();
+    if (action === 'bypass-remove-rule') return void removeBypassResource(String(actionBtn.getAttribute('data-resource') || ''));
+    if (action === 'bypass-resolve-keep') return void resolveBypassConflict(String(actionBtn.getAttribute('data-resource') || ''), 'keep');
+    if (action === 'bypass-resolve-exclude') return void resolveBypassConflict(String(actionBtn.getAttribute('data-resource') || ''), 'exclude');
     if (action === 'apply-configurator') return void applyConfigurator();
     if (action === 'reload-configurator') return void loadConfigurator();
+    if (action === 'apply-proxy-bypass') return void applyProxyBypass();
+    if (action === 'reload-proxy-bypass') return void loadProxyBypass();
     if (action === 'apply-update-filters') return void applyUpdateAuditFilters();
     if (action === 'reset-update-filters') return void resetUpdateAuditFilters();
     if (action === 'apply-security-filters') return void applySecurityFilters();
@@ -8045,6 +8562,25 @@ def admin_security_unblock(request: Request, payload: AdminSecurityUnblockReques
 def admin_configurator(request: Request) -> JSONResponse:
     _require_admin(request)
     cfg = _load_system_config()
+    blacklist_text = _read_rkn_blacklist_rules_text(DEFAULT_RKN_BLACKLIST)
+    cfg["rkn_blacklist"] = blacklist_text
+    cfg["proxy_bypass_blacklist_audit"] = _build_proxy_bypass_blacklist_audit(
+        str(cfg.get("proxy_bypass_custom", "")),
+        blacklist_text,
+    )
+    return JSONResponse({"status": "ok", "config": cfg})
+
+
+@app.get("/api/v1/admin/configurator/proxy-bypass")
+def admin_proxy_bypass_config(request: Request) -> JSONResponse:
+    _require_admin(request)
+    cfg = _load_system_config()
+    blacklist_text = _read_rkn_blacklist_rules_text(DEFAULT_RKN_BLACKLIST)
+    cfg["rkn_blacklist"] = blacklist_text
+    cfg["proxy_bypass_blacklist_audit"] = _build_proxy_bypass_blacklist_audit(
+        str(cfg.get("proxy_bypass_custom", "")),
+        blacklist_text,
+    )
     return JSONResponse({"status": "ok", "config": cfg})
 
 
@@ -8053,6 +8589,12 @@ def admin_configurator_apply(request: Request, payload: AdminConfiguratorUpdateR
     _require_admin(request)
     _ensure_csrf(request)
     cfg = _persist_system_config(payload.model_dump())
+    blacklist_text = _read_rkn_blacklist_rules_text(DEFAULT_RKN_BLACKLIST)
+    cfg["rkn_blacklist"] = blacklist_text
+    cfg["proxy_bypass_blacklist_audit"] = _build_proxy_bypass_blacklist_audit(
+        str(cfg.get("proxy_bypass_custom", "")),
+        blacklist_text,
+    )
     capacity = _read_capacity_status(window_minutes=60)
     return JSONResponse(
         {
@@ -8060,6 +8602,28 @@ def admin_configurator_apply(request: Request, payload: AdminConfiguratorUpdateR
             "message": "Configuration applied. Dependent capacity limits recalculated.",
             "config": cfg,
             "capacity": capacity,
+        }
+    )
+
+
+@app.post("/api/v1/admin/configurator/proxy-bypass")
+def admin_proxy_bypass_apply(request: Request, payload: AdminProxyBypassUpdateRequest) -> JSONResponse:
+    _require_admin(request)
+    _ensure_csrf(request)
+    cfg = _load_system_config()
+    cfg["proxy_bypass_custom"] = str(payload.proxy_bypass_custom or "")
+    cfg = _persist_system_config(cfg)
+    blacklist_text = _read_rkn_blacklist_rules_text(DEFAULT_RKN_BLACKLIST)
+    cfg["rkn_blacklist"] = blacklist_text
+    cfg["proxy_bypass_blacklist_audit"] = _build_proxy_bypass_blacklist_audit(
+        str(cfg.get("proxy_bypass_custom", "")),
+        blacklist_text,
+    )
+    return JSONResponse(
+        {
+            "status": "ok",
+            "message": "Whitelist updated.",
+            "config": cfg,
         }
     )
 

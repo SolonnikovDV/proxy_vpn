@@ -1,6 +1,87 @@
 # resource,use_vpn
 # false = Direct (VPN bypass for this resource)
 # true  = keep VPN route for this resource
+#
+# Traffic-saving baseline (DIRECT):
+# - major RU services and public portals
+# - banking/marketplaces/media/social in RU segment
+# - app stores and OS/vendor updates/CDN
+#
+# RU ecosystem
 yandex.ru,false
+ya.ru,false
+yandex.com,false
 vk.com,false
+ok.ru,false
+mail.ru,false
+rambler.ru,false
+avito.ru,false
+ozon.ru,false
+wildberries.ru,false
 gosuslugi.ru,false
+mos.ru,false
+nalog.gov.ru,false
+gosuslugi.com,false
+sber.ru,false
+sberbank.ru,false
+alfabank.ru,false
+vtb.ru,false
+tbank.ru,false
+gazprombank.ru,false
+raiffeisen.ru,false
+qiwi.com,false
+mironline.ru,false
+xn--90aivcdt6dxbc.xn--p1ai,false
+
+# RU content/services
+rutube.ru,false
+kinopoisk.ru,false
+ivi.ru,false
+okko.tv,false
+wink.ru,false
+premier.one,false
+smotrim.ru,false
+ria.ru,false
+tass.ru,false
+lenta.ru,false
+rbc.ru,false
+kommersant.ru,false
+
+# Messaging/social (non-blocked routes you may keep direct)
+telegram.org,false
+t.me,false
+whatsapp.com,false
+web.whatsapp.com,false
+viber.com,false
+
+# App stores / vendor update channels
+apple.com,false
+appstore.com,false
+apps.apple.com,false
+icloud.com,false
+mzstatic.com,false
+cdn-apple.com,false
+googleapis.com,false
+gstatic.com,false
+play.google.com,false
+android.com,false
+microsoft.com,false
+windowsupdate.com,false
+update.microsoft.com,false
+office.com,false
+officecdn.microsoft.com,false
+github.com,false
+githubusercontent.com,false
+gitlab.com,false
+docker.com,false
+docker.io,false
+pypi.org,false
+npmjs.com,false
+
+# Common infra/CDN often used by direct traffic
+cloudflare.com,false
+one.one.one.one,false
+akamai.net,false
+fastly.net,false
+jsdelivr.net,false
+cdnjs.com,false

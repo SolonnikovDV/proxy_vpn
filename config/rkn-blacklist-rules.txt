@@ -1,0 +1,14 @@
+# RKN blacklist reference set for cross-check with Direct/Bypass whitelist.
+# One resource per line. Comments and empty lines are ignored.
+# Update this file as needed; admin UI uses it for conflict warnings.
+
+instagram.com
+facebook.com
+fbcdn.net
+twitter.com
+x.com
+tiktok.com
+discord.com
+linkedin.com
+medium.com
+pastebin.com

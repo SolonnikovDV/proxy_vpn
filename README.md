@@ -77,7 +77,17 @@ Proxy bypass whitelist (traffic saving):
   - `false` = Direct/Bypass (VPN disabled for this resource)
   - `true` = keep VPN route
 - examples: `yandex.ru,false`, `vk.com,false`, `gosuslugi.ru,false`
-- admin UI editing: `Admin -> Configurator -> Proxy bypass resources (Direct/Bypass)` (writes back to the same file)
+- admin UI editing: `Admin -> Whitelist -> Bypass list` (separate page with table + controls; writes back to the same file)
+- admin UI quick actions:
+  - `Load preset: conservative` (minimal DIRECT baseline)
+  - `Load preset: traffic-saving` (extended DIRECT baseline)
+  - `Add resource` controls to append/update one rule without manual text editing
+  - `Remove` button per resource row in preview table
+- RKN blacklist cross-check:
+  - source file: `config/rkn-blacklist-rules.txt` (used for whitelist conflict detection)
+  - if Direct resource overlaps blacklist, UI shows warning badge and requires explicit resolve action:
+    - `Keep` (acknowledge override)
+    - `Exclude` (remove from Direct list)
 
 Unified launcher commands:
 - `bash ./scripts/run.sh local up`
