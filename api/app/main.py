@@ -3697,7 +3697,7 @@ function renderDeviceCard(card) {{
         <span class="status-pill status-stopped" style="margin-left:8px;">${{wgSource}}</span>
       </div>
       ${{wgFallbackHtml}}
-      <details style="margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);padding:8px 10px;">
+      <details data-accordion="device-card" style="margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);padding:8px 10px;">
         <summary style="cursor:pointer;font-weight:600;">WireGuard instructions${{wgPlatformTag ? (' (' + wgPlatformTag + ')') : ''}}</summary>
         <ul style="margin:8px 0 4px 14px;padding:0;">${{wgInstructionRows || '<li class="muted">No WireGuard instructions.</li>'}}</ul>
       </details>
@@ -3712,7 +3712,7 @@ function renderDeviceCard(card) {{
       <div style="margin-top:8px;">
         <button class="btn-ghost" data-action="copy-config-uri">Copy URI</button>
       </div>
-      <details style="margin-top:12px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);padding:8px 10px;">
+      <details data-accordion="device-card" style="margin-top:12px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);padding:8px 10px;">
         <summary style="cursor:pointer;font-weight:600;">Manual fields (client menu)</summary>
         <div style="overflow:auto;margin-top:8px;">
           <table style="width:100%;border-collapse:collapse;">
@@ -3732,13 +3732,22 @@ function renderDeviceCard(card) {{
         <span class="status-pill status-stopped" style="margin-left:8px;">${{source}}</span>
       </div>
       ${{fallbackHtml}}
-      <details open style="margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);padding:8px 10px;">
+      <details data-accordion="device-card" style="margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);padding:8px 10px;">
         <summary style="cursor:pointer;font-weight:600;">Instructions</summary>
         <ul style="margin:8px 0 4px 14px;padding:0;">${{lines}}</ul>
       </details>
       ${{wgClientHtml}}
     </div>
   `;
+  const accordionItems = out.querySelectorAll('details[data-accordion="device-card"]');
+  accordionItems.forEach((item) => {{
+    item.addEventListener('toggle', () => {{
+      if (!item.open) return;
+      accordionItems.forEach((other) => {{
+        if (other !== item) other.open = false;
+      }});
+    }});
+  }});
 }}
 function fmtBytes(v) {{
   const n = Number(v || 0);
