@@ -1964,8 +1964,23 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
                 ),
             )
         label = f"auto-{device_type}-{platform}"
-        _set_user_wg_public_key(user_id, profile["public_key"])
-        _ensure_wg_binding_for_user(user_id, profile["public_key"], label)
+        con.execute(
+            """
+            UPDATE user_access_profiles
+            SET wg_public_key = ?, updated_at = ?
+            WHERE user_id = ?
+            """,
+            (profile["public_key"], now_iso, user_id),
+        )
+        con.execute(
+            """
+            INSERT INTO wg_peer_bindings (user_id, public_key, label, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(public_key)
+            DO UPDATE SET user_id = excluded.user_id, label = excluded.label
+            """,
+            (user_id, profile["public_key"], label, now_iso),
+        )
         _evaluate_user_protocol_state(con, user_id)
         con.commit()
     return profile
