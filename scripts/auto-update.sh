@@ -435,8 +435,15 @@ deploy_current() {
     bash ./scripts/sync-env.sh prod
     log "Running production preflight"
     bash ./scripts/preflight-prod.sh
-    log "Rebuilding/restarting production stack"
-    dc -f compose.yaml -f compose.prod.yaml up -d --build
+    PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
+    if [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ]; then
+      log "Rebuilding app edge only (safe mode, preserves active VPN tunnels)"
+      dc -f compose.yaml -f compose.prod.yaml up -d --build api security-guard caddy
+      dc -f compose.yaml -f compose.prod.yaml up -d xray wireguard
+    else
+      log "Rebuilding/restarting full production stack"
+      dc -f compose.yaml -f compose.prod.yaml up -d --build
+    fi
     dc -f compose.yaml -f compose.prod.yaml ps
     MODE=prod HEALTH_TIMEOUT=90 bash ./scripts/healthcheck-stack.sh
   else
@@ -452,7 +459,13 @@ rollback_to_previous() {
   log "Rolling back to previous commit: ${LOCAL_SHA}"
   git checkout -f "${LOCAL_SHA}"
   if [ "${MODE}" = "prod" ]; then
-    dc -f compose.yaml -f compose.prod.yaml up -d --build
+    PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
+    if [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ]; then
+      dc -f compose.yaml -f compose.prod.yaml up -d --build api security-guard caddy
+      dc -f compose.yaml -f compose.prod.yaml up -d xray wireguard
+    else
+      dc -f compose.yaml -f compose.prod.yaml up -d --build
+    fi
     MODE=prod HEALTH_TIMEOUT=120 bash ./scripts/healthcheck-stack.sh
   else
     dc -f compose.yaml up -d --build

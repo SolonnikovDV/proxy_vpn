@@ -119,10 +119,21 @@ run_prod() {
   export VPN_PANEL_DOMAIN="${VPN_PANEL_DOMAIN:-}"
   export XRAY_PORT="${XRAY_PORT:-8443}"
   export WG_PORT="${WG_PORT:-51820}"
+  export PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
+  prod_up_stack() {
+    if [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ]; then
+      log "Safe rebuild mode: preserving active VPN tunnels (xray/wireguard are not rebuilt by default)."
+      dc -f compose.yaml -f compose.prod.yaml up -d --build api security-guard caddy
+      dc -f compose.yaml -f compose.prod.yaml up -d xray wireguard
+    else
+      log "Full rebuild mode: rebuilding all services including VPN core."
+      dc -f compose.yaml -f compose.prod.yaml up -d --build
+    fi
+  }
   case "${ACTION}" in
     up)
       bash ./scripts/preflight-prod.sh
-      dc -f compose.yaml -f compose.prod.yaml up -d --build
+      prod_up_stack
       dc -f compose.yaml -f compose.prod.yaml up -d --force-recreate caddy
       run_prod_smoke_checks
       dc -f compose.yaml -f compose.prod.yaml ps
@@ -138,9 +149,11 @@ run_prod() {
       dc -f compose.yaml -f compose.prod.yaml down
       ;;
     restart)
-      dc -f compose.yaml -f compose.prod.yaml down
+      if [ "${PRESERVE_VPN_CORE_ON_REBUILD}" != "1" ]; then
+        dc -f compose.yaml -f compose.prod.yaml down
+      fi
       bash ./scripts/preflight-prod.sh
-      dc -f compose.yaml -f compose.prod.yaml up -d --build
+      prod_up_stack
       dc -f compose.yaml -f compose.prod.yaml up -d --force-recreate caddy
       run_prod_smoke_checks
       dc -f compose.yaml -f compose.prod.yaml ps

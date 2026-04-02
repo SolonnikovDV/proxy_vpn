@@ -224,6 +224,10 @@ Or via unified launcher:
 bash ./scripts/run.sh prod up
 ```
 
+By default, production rebuild uses safe mode to preserve active VPN tunnels:
+- `PRESERVE_VPN_CORE_ON_REBUILD=1` (default): rebuilds `api/caddy/security-guard`, keeps `xray/wireguard` running.
+- `PRESERVE_VPN_CORE_ON_REBUILD=0`: full rebuild of all services (may interrupt active VPN sessions).
+
 ## GitHub Secrets/Variables deploy
 
 Default recommended mode keeps app secrets on server in root-only files (not in repository).

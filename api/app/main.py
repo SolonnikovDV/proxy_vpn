@@ -4120,6 +4120,11 @@ def startup() -> None:
             )
         con.commit()
     _start_metrics_sampler_once()
+    # Re-apply managed WG peers on API startup so tunnel state survives service rebuilds.
+    try:
+        _sync_wireguard_server_peers()
+    except Exception as e:
+        print(f"[startup] WARN: cannot sync WireGuard peers on startup: {e}")
 
 
 @app.get("/", response_class=HTMLResponse)
