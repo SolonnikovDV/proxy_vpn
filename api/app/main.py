@@ -74,6 +74,7 @@ SECURITY_SERVER_CHECK_INTERVAL_SECONDS = int(os.getenv("SECURITY_SERVER_CHECK_IN
 SECURITY_SERVER_EVENT_COOLDOWN_SECONDS = int(os.getenv("SECURITY_SERVER_EVENT_COOLDOWN_SECONDS", "300"))
 SECURITY_GUARD_UNAVAILABLE_REASON = "security guard unavailable"
 XRAY_USER_STATS_RE = re.compile(r"user>>>(.+?)>>>traffic>>>(uplink|downlink)")
+XRAY_VALUE_RE = re.compile(r"(?:\"value\"\\s*:\\s*|value\\s*[:=]\\s*)(\\d+)")
 XRAY_CONTAINER_NAME = "proxy-vpn-xray"
 STACK_CONTAINERS = [
     "proxy-vpn-caddy",
@@ -1593,14 +1594,44 @@ def _read_xray_user_totals() -> dict[str, dict[str, int]]:
         if not m:
             continue
         email, direction = m.group(1), m.group(2)
-        parts = line.replace("\t", " ").split()
-        bytes_raw = parts[-1] if parts else "0"
+        value_match = XRAY_VALUE_RE.search(line)
+        if value_match:
+            bytes_raw = value_match.group(1)
+        else:
+            parts = line.replace("\t", " ").split()
+            bytes_raw = parts[-1] if parts else "0"
+            if ":" in bytes_raw:
+                bytes_raw = bytes_raw.rsplit(":", 1)[-1]
         current = totals.setdefault(email, {"uplink": 0, "downlink": 0})
         try:
             current[direction] = int(bytes_raw)
         except ValueError:
             continue
     return totals
+
+
+def _sync_xray_bindings_from_profiles(con: sqlite3.Connection) -> None:
+    rows = con.execute(
+        """
+        SELECT user_id, xray_email
+        FROM user_access_profiles
+        WHERE xray_email IS NOT NULL AND xray_email != ''
+        """
+    ).fetchall()
+    for row in rows:
+        user_id = int(row["user_id"])
+        email = str(row["xray_email"]).strip().lower()
+        if not email:
+            continue
+        con.execute(
+            """
+            INSERT INTO xray_client_bindings (user_id, client_email, label, created_at)
+            VALUES (?, ?, 'auto-profile', ?)
+            ON CONFLICT(client_email)
+            DO UPDATE SET user_id = excluded.user_id
+            """,
+            (user_id, email, _now().isoformat()),
+        )
 
 
 def _read_xray_connection_template() -> dict[str, str]:
@@ -1811,6 +1842,7 @@ def _collect_xray_user_traffic(con: sqlite3.Connection, ts_iso: str) -> None:
 def _refresh_user_traffic_samples_once() -> None:
     ts_iso = _now().isoformat()
     with _db_connect() as con:
+        _sync_xray_bindings_from_profiles(con)
         _collect_wireguard_user_traffic(con, ts_iso)
         _collect_xray_user_traffic(con, ts_iso)
         con.commit()
