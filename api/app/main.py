@@ -2237,7 +2237,11 @@ def _ensure_wg_binding_for_user(user_id: int, public_key: str, label: str = "aut
         con.commit()
 
 
-def _paired_status_for_user(con: sqlite3.Connection, user_id: int) -> dict[str, Any]:
+def _paired_status_for_user(
+    con: sqlite3.Connection,
+    user_id: int,
+    wg_runtime_totals: Optional[dict[str, dict[str, Any]]] = None,
+) -> dict[str, Any]:
     uid = int(user_id)
     threshold = (_now() - timedelta(seconds=PAIRED_ACTIVITY_WINDOW_SECONDS)).isoformat()
     wg_bound_row = con.execute(
@@ -2264,11 +2268,17 @@ def _paired_status_for_user(con: sqlite3.Connection, user_id: int) -> dict[str, 
         """,
         (uid, threshold),
     ).fetchone()
+    wg_diag = _wireguard_diagnostics_for_user(
+        con,
+        uid,
+        window_seconds=PAIRED_ACTIVITY_WINDOW_SECONDS,
+        wg_runtime_totals=wg_runtime_totals,
+    )
     wg_recent_bytes = int((wg_recent_row["total_bytes"] if wg_recent_row else 0) or 0)
     xray_recent_bytes = int((xray_recent_row["total_bytes"] if xray_recent_row else 0) or 0)
     wg_bound = bool(wg_bound_row)
     xray_bound = bool(xray_bound_row)
-    wg_active = wg_recent_bytes > 0
+    wg_active = str(wg_diag.get("verdict", "")) == "traffic_flowing"
     xray_active = xray_recent_bytes > 0
     if wg_bound and xray_bound and wg_active and xray_active:
         status = "active"
@@ -2284,6 +2294,7 @@ def _paired_status_for_user(con: sqlite3.Connection, user_id: int) -> dict[str, 
             "public_key": str(wg_bound_row["public_key"]) if wg_bound_row else "",
             "active": wg_active,
             "recent_bytes": wg_recent_bytes,
+            "diagnostics": wg_diag,
         },
         "xray": {
             "bound": xray_bound,
@@ -2294,7 +2305,81 @@ def _paired_status_for_user(con: sqlite3.Connection, user_id: int) -> dict[str, 
     }
 
 
+def _wireguard_diagnostics_for_user(
+    con: sqlite3.Connection,
+    user_id: int,
+    window_seconds: int = 120,
+    wg_runtime_totals: Optional[dict[str, dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    uid = int(user_id)
+    window_seconds = max(30, min(900, int(window_seconds)))
+    now = _now()
+    threshold = (now - timedelta(seconds=window_seconds)).isoformat()
+    bound_row = con.execute(
+        "SELECT public_key, label FROM wg_peer_bindings WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        (uid,),
+    ).fetchone()
+    profile_row = con.execute(
+        "SELECT wg_public_key FROM user_access_profiles WHERE user_id = ?",
+        (uid,),
+    ).fetchone()
+    profile_key = str((profile_row["wg_public_key"] if profile_row else "") or "").strip()
+    bound_key = str((bound_row["public_key"] if bound_row else "") or "").strip()
+    label = str((bound_row["label"] if bound_row else "") or "").strip()
+    dump = wg_runtime_totals if isinstance(wg_runtime_totals, dict) else _read_wg_dump_totals()
+    peer_runtime = dump.get(bound_key, {}) if bound_key else {}
+    latest_handshake_raw = int(peer_runtime.get("latest_handshake", 0) or 0)
+    handshake_age_seconds = None
+    if latest_handshake_raw > 0:
+        handshake_age_seconds = max(0, int(now.timestamp()) - latest_handshake_raw)
+    recent_row = con.execute(
+        """
+        SELECT COALESCE(SUM(rx_bytes), 0) AS rx_bytes, COALESCE(SUM(tx_bytes), 0) AS tx_bytes
+        FROM user_wireguard_traffic_samples
+        WHERE user_id = ? AND ts >= ?
+        """,
+        (uid, threshold),
+    ).fetchone()
+    recent_rx = int((recent_row["rx_bytes"] if recent_row else 0) or 0)
+    recent_tx = int((recent_row["tx_bytes"] if recent_row else 0) or 0)
+    recent_total = recent_rx + recent_tx
+    verdict = "traffic_flowing"
+    recommendation = "WireGuard tunnel is healthy."
+    if not bound_key:
+        verdict = "no_binding"
+        recommendation = "Register your current WireGuard public key from the client app."
+    elif profile_key and bound_key != profile_key:
+        verdict = "profile_binding_mismatch"
+        recommendation = "Re-register WireGuard key to sync profile and binding."
+    elif not peer_runtime:
+        verdict = "peer_not_applied"
+        recommendation = "Peer is not active in wg0 runtime. Re-register key and reconnect tunnel."
+    elif handshake_age_seconds is None or handshake_age_seconds > 300:
+        verdict = "no_recent_handshake"
+        recommendation = "Reconnect tunnel on device and verify endpoint/network path."
+    elif recent_total <= 0:
+        verdict = "handshake_without_payload"
+        recommendation = "Handshake exists but no payload traffic. Recreate tunnel and verify client routing."
+    return {
+        "status": "ok",
+        "window_seconds": window_seconds,
+        "bound_public_key": bound_key,
+        "profile_public_key": profile_key,
+        "binding_label": label,
+        "runtime_allowed_ips": str(peer_runtime.get("allowed_ips", "") or ""),
+        "runtime_rx_total": int(peer_runtime.get("rx_total", 0) or 0),
+        "runtime_tx_total": int(peer_runtime.get("tx_total", 0) or 0),
+        "handshake_age_seconds": handshake_age_seconds,
+        "recent_rx_bytes": recent_rx,
+        "recent_tx_bytes": recent_tx,
+        "recent_total_bytes": recent_total,
+        "verdict": verdict,
+        "recommendation": recommendation,
+    }
+
+
 def _paired_coverage_summary(con: sqlite3.Connection) -> dict[str, Any]:
+    wg_runtime_totals = _read_wg_dump_totals()
     rows = con.execute(
         """
         SELECT id
@@ -2308,7 +2393,7 @@ def _paired_coverage_summary(con: sqlite3.Connection) -> dict[str, Any]:
     degraded = 0
     incomplete = 0
     for row in rows:
-        paired = _paired_status_for_user(con, int(row["id"]))
+        paired = _paired_status_for_user(con, int(row["id"]), wg_runtime_totals=wg_runtime_totals)
         status = str(paired.get("status", "incomplete"))
         if status == "active":
             active += 1
@@ -2403,6 +2488,9 @@ def _evaluate_user_protocol_state(con: sqlite3.Connection, user_id: int) -> dict
     bindings = _protocol_binding_flags(con, uid)
     recent = _protocol_recent_bytes(con, uid)
     active_flags = {k: int(v) > 0 for k, v in recent.items()}
+    wg_diag = _wireguard_diagnostics_for_user(con, uid, window_seconds=PROTOCOL_ACTIVITY_WINDOW_SECONDS)
+    if bindings.get("wireguard", False):
+        active_flags["wireguard"] = str(wg_diag.get("verdict", "")) == "traffic_flowing"
     mode = "dual" if bindings["xray"] and bindings["wireguard"] else (
         "single_xray" if bindings["xray"] else ("single_wireguard" if bindings["wireguard"] else "unconfigured")
     )
@@ -2487,6 +2575,7 @@ def _evaluate_user_protocol_state(con: sqlite3.Connection, user_id: int) -> dict
         "bound": bindings,
         "recent_bytes": recent,
         "active": active_flags,
+        "wireguard_diagnostics": wg_diag,
     }
 
 
@@ -4053,6 +4142,7 @@ function renderDeviceCard(card) {{
   const wgQuick = card.wireguard_quick_setup || {{}};
   const wgQuickJsonUrl = escHtml(wgQuick.json_url || '');
   const wgQuickDownloadUrl = escHtml(wgQuick.download_url || '');
+  const wgDiagnosticsUrl = escHtml(wgQuick.diagnostics_url || '');
   const fields = card.config_fields || {{}};
   const wgFields = card.wireguard_manual_fields || {{}};
   const xrayFieldPairs = [
@@ -4131,8 +4221,10 @@ function renderDeviceCard(card) {{
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
         <button class="btn-ghost" data-action="show-wg-quick-config" data-url="${{wgQuickJsonUrl}}">Show WireGuard config</button>
         <a href="${{wgQuickDownloadUrl}}" target="_blank" rel="noopener noreferrer"><button class="btn-ghost">Download .conf</button></a>
+        <button class="btn-ghost" data-action="show-wg-diagnostics" data-url="${{wgDiagnosticsUrl}}">Validate WG tunnel</button>
       </div>
       <pre id="wg-quick-out" style="margin-top:8px;">WireGuard quick setup: press "Show WireGuard config".</pre>
+      <pre id="wg-diag-out" style="margin-top:8px;">WG diagnostics: press "Validate WG tunnel".</pre>
       <details data-accordion="device-card" style="margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);padding:8px 10px;">
         <summary style="cursor:pointer;font-weight:600;">WireGuard instructions${{wgPlatformTag ? (' (' + wgPlatformTag + ')') : ''}}</summary>
         <ul style="margin:8px 0 4px 14px;padding:0;">${{wgInstructionRows || '<li class="muted">No WireGuard instructions.</li>'}}</ul>
@@ -4221,6 +4313,25 @@ function pairedBadge(state) {{
   if (s === 'active') return '<span class="status-pill status-running">active</span>';
   if (s === 'degraded') return '<span class="status-pill status-pending">degraded</span>';
   return '<span class="status-pill status-in_error">incomplete</span>';
+}}
+function wgVerdictText(verdict) {{
+  const v = String(verdict || '').trim();
+  if (v === 'traffic_flowing') return 'traffic flowing';
+  if (v === 'handshake_without_payload') return 'handshake without payload';
+  if (v === 'no_recent_handshake') return 'no recent handshake';
+  if (v === 'peer_not_applied') return 'peer not applied in wg0';
+  if (v === 'profile_binding_mismatch') return 'profile/binding key mismatch';
+  if (v === 'no_binding') return 'no registered key';
+  return v || 'unknown';
+}}
+function wgVerdictBadge(verdict) {{
+  const v = String(verdict || '').trim();
+  if (v === 'traffic_flowing') return '<span class="status-pill status-running">WG ok</span>';
+  if (v === 'handshake_without_payload') return '<span class="status-pill status-pending">WG payload missing</span>';
+  if (v === 'no_recent_handshake' || v === 'peer_not_applied' || v === 'profile_binding_mismatch' || v === 'no_binding') {{
+    return '<span class="status-pill status-in_error">WG broken</span>';
+  }}
+  return '<span class="status-pill status-pending">WG unknown</span>';
 }}
 function getPlatformContext() {{
   const typeEl = document.getElementById('dev-type');
@@ -4333,9 +4444,12 @@ function renderCabinetPairedStatus(paired, protocolState) {{
   const root = document.getElementById('cab-paired-status');
   if (!root) return;
   const p = paired || {{}};
-  const wg = p.wg || {{}};
-  const xray = p.xray || {{}};
   const st = protocolState || {{}};
+  const wg = p.wg || {{}};
+  const wgDiag = wg.diagnostics || (st.wireguard_diagnostics || {{}});
+  const wgVerdict = String(wgDiag.verdict || '');
+  const wgVerdictLabel = wgVerdictText(wgVerdict);
+  const xray = p.xray || {{}};
   const protoPrimary = String(st.primary_protocol || '');
   const protoFallback = String(st.fallback_protocol || '');
   const protoCurrent = String(st.current_protocol || '');
@@ -4343,6 +4457,7 @@ function renderCabinetPairedStatus(paired, protocolState) {{
   const switchReason = String(st.switch_reason || '');
   root.innerHTML = 'Paired status: ' + pairedBadge(p.status) +
     ' · WG: ' + (wg.bound ? 'bound' : 'not bound') + ', ' + (wg.active ? 'active' : 'idle') +
+    (wgVerdict ? (' (' + escHtml(wgVerdictLabel) + ')') : '') +
     ' · Xray: ' + (xray.bound ? 'bound' : 'not bound') + ', ' + (xray.active ? 'active' : 'idle') +
     ' · policy: primary=' + (protoPrimary || '-') + ', fallback=' + (protoFallback || 'none') + ', current=' + (protoCurrent || '-') +
     (switchRecommended ? (' · switch recommended: ' + escHtml(switchReason || 'check protocol state')) : '');
@@ -4353,6 +4468,7 @@ function renderCabinetPairedStatus(paired, protocolState) {{
       ' | fallback=' + (protoFallback || 'none') +
       ' | current=' + (protoCurrent || '-') +
       ' | T_fail=' + String(st.fail_threshold_seconds || '-') + 's' +
+      (wgVerdict ? (' | WG verdict=' + wgVerdictLabel) : '') +
       (switchRecommended ? (' | SWITCH: ' + (switchReason || 'recommended')) : '');
   }}
   const primaryEl = document.getElementById('proto-primary');
@@ -4485,7 +4601,12 @@ async function registerWireGuardKey() {{
   }});
   const t = await r.text();
   if (out) out.textContent = t;
-  if (r.ok) await loadCabinetTraffic();
+  if (r.ok) {{
+    await loadCabinetTraffic();
+    const diagBtn = document.querySelector('[data-action="show-wg-diagnostics"]');
+    const diagUrl = String((diagBtn && diagBtn.getAttribute('data-url')) || '');
+    if (diagUrl) await showWireGuardDiagnostics(diagUrl);
+  }}
 }}
 async function copyConfigUri() {{
   const el = document.getElementById('cfg-uri');
@@ -4517,6 +4638,41 @@ async function showWireGuardQuickConfig(url) {{
   const hint = String(j.import_hint || '');
   const cfg = String(j.config || '');
   if (out) out.textContent = (hint ? ('Import hint: ' + hint + '\\n\\n') : '') + cfg;
+}}
+async function showWireGuardDiagnostics(url) {{
+  const out = document.getElementById('wg-diag-out');
+  const target = String(url || '').trim();
+  if (!target) {{
+    if (out) out.textContent = 'WG diagnostics endpoint is unavailable.';
+    return;
+  }}
+  if (out) out.textContent = 'Running WG diagnostics...';
+  const r = await fetch(target);
+  const t = await r.text();
+  if (!r.ok) {{
+    if (out) out.textContent = t;
+    return;
+  }}
+  let j = null;
+  try {{ j = JSON.parse(t); }} catch (e) {{ j = null; }}
+  if (!j) {{
+    if (out) out.textContent = t;
+    return;
+  }}
+  const verdict = String(j.verdict || 'unknown');
+  const hand = j.handshake_age_seconds;
+  const handText = (hand === null || hand === undefined) ? 'n/a' : (String(hand) + ' sec');
+  const msg = [
+    'Verdict: ' + verdict,
+    'Bound key: ' + String(j.bound_public_key || '-'),
+    'Profile key: ' + String(j.profile_public_key || '-'),
+    'Handshake age: ' + handText,
+    'Recent window: ' + String(j.window_seconds || 0) + ' sec',
+    'Recent RX/TX: ' + fmtBytes(j.recent_rx_bytes || 0) + ' / ' + fmtBytes(j.recent_tx_bytes || 0),
+    'Runtime totals RX/TX: ' + fmtBytes(j.runtime_rx_total || 0) + ' / ' + fmtBytes(j.runtime_tx_total || 0),
+    'Recommendation: ' + String(j.recommendation || ''),
+  ].join('\\n');
+  if (out) out.textContent = msg;
 }}
 async function loadDeviceCard() {{
   const type = document.getElementById('dev-type').value;
@@ -4627,6 +4783,7 @@ document.addEventListener('click', (event) => {{
   if (action === 'confirm-protocol-switch') return void confirmProtocolSwitch();
   if (action === 'show-switch-guide') return void showSwitchGuideNow();
   if (action === 'show-wg-quick-config') return void showWireGuardQuickConfig(btn.getAttribute('data-url') || '');
+  if (action === 'show-wg-diagnostics') return void showWireGuardDiagnostics(btn.getAttribute('data-url') || '');
   if (action === 'copy-config-uri') return void copyConfigUri();
   if (action === 'copy-value') {{
     const encoded = String(btn.getAttribute('data-copy-value') || '');
@@ -5072,6 +5229,19 @@ def admin(request: Request) -> HTMLResponse:
 <div class="card admin-section" data-section="traffic" data-subsection="paired">
   <h2>Paired mode status (WireGuard + Xray)</h2>
   <p class="muted">Each user should have both bindings and recent traffic on both transports in the activity window.</p>
+  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+    <div class="label-muted">WG verdict filter</div>
+    <select id="paired-wg-verdict-filter" style="padding:8px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);min-width:260px;">
+      <option value="all">all</option>
+      <option value="traffic_flowing">traffic_flowing</option>
+      <option value="handshake_without_payload">handshake_without_payload</option>
+      <option value="no_recent_handshake">no_recent_handshake</option>
+      <option value="peer_not_applied">peer_not_applied</option>
+      <option value="profile_binding_mismatch">profile_binding_mismatch</option>
+      <option value="no_binding">no_binding</option>
+    </select>
+    <span id="paired-filter-meta" class="muted">showing: all</span>
+  </div>
   <table style="width:100%; border-collapse:collapse;">
     <thead>
       <tr><th align="left">User</th><th align="left">Role</th><th align="left">Pair status</th><th align="left">Protocol policy</th><th align="left">WG</th><th align="left">Xray</th></tr>
@@ -5153,6 +5323,7 @@ let currentServiceLogContainer = '';
 let serviceLogsIntervalId = null;
 let adminRefreshIntervalId = null;
 let securityEventsCache = [];
+let pairedStatusCache = [];
 let currentAdminSection = 'overview';
 const currentAdminSubsection = {{}};
 const sectionSubsections = {{
@@ -5622,9 +5793,13 @@ function renderUserTraffic(items) {{
 }}
 function renderAdminPairedStatus(items) {{
   const body = document.getElementById('paired-status-body');
+  const filterEl = document.getElementById('paired-wg-verdict-filter');
+  const filterMeta = document.getElementById('paired-filter-meta');
+  const verdictFilter = String((filterEl && filterEl.value) || 'all').trim();
   if (!body) return;
   if (!items || items.length === 0) {{
     body.innerHTML = '<tr><td colspan="6" class="muted">No users.</td></tr>';
+    if (filterMeta) filterMeta.textContent = 'showing: 0 / 0';
     return;
   }}
   const badge = (s) => {{
@@ -5633,24 +5808,41 @@ function renderAdminPairedStatus(items) {{
     if (st === 'degraded') return '<span class="status-pill status-pending">degraded</span>';
     return '<span class="status-pill status-in_error">incomplete</span>';
   }};
-  body.innerHTML = items.map((i) => {{
+  const filtered = items.filter((i) => {{
+    if (verdictFilter === 'all') return true;
     const p = i.paired || {{}};
     const ps = i.protocol_state || {{}};
     const wg = p.wg || {{}};
+    const wgDiag = wg.diagnostics || (ps.wireguard_diagnostics || {{}});
+    const wgVerdict = String(wgDiag.verdict || '');
+    return wgVerdict === verdictFilter;
+  }});
+  if (filterMeta) filterMeta.textContent = 'showing: ' + String(filtered.length) + ' / ' + String(items.length);
+  if (!filtered.length) {{
+    body.innerHTML = '<tr><td colspan="6" class="muted">No users match selected WG verdict filter.</td></tr>';
+    return;
+  }}
+  body.innerHTML = filtered.map((i) => {{
+    const p = i.paired || {{}};
+    const ps = i.protocol_state || {{}};
+    const wg = p.wg || {{}};
+    const wgDiag = wg.diagnostics || (ps.wireguard_diagnostics || {{}});
+    const wgVerdict = String(wgDiag.verdict || '');
     const xray = p.xray || {{}};
     const policy = 'mode=' + String(ps.mode || 'unconfigured') +
       ' · primary=' + String(ps.primary_protocol || '-') +
       ' · fallback=' + String(ps.fallback_protocol || 'none') +
       ' · current=' + String(ps.current_protocol || '-') +
       (ps.switch_recommended ? (' · SWITCH: ' + String(ps.switch_reason || 'recommended')) : '');
-    const wgText = (wg.bound ? 'bound' : 'missing') + ' · ' + (wg.active ? 'active' : 'idle') + ' · ' + fmtBytes(wg.recent_bytes || 0);
+    const wgText = (wg.bound ? 'bound' : 'missing') + ' · ' + (wg.active ? 'active' : 'idle') + ' · ' +
+      wgVerdictText(wgVerdict) + ' · ' + fmtBytes(wg.recent_bytes || 0);
     const xText = (xray.bound ? 'bound' : 'missing') + ' · ' + (xray.active ? 'active' : 'idle') + ' · ' + fmtBytes(xray.recent_bytes || 0);
     return `<tr>
       <td>${{escHtml(i.username || '-')}}<br><span class="muted">${{escHtml(i.email || '-')}}</span></td>
       <td>${{escHtml(i.role || '-')}}</td>
       <td>${{badge(p.status)}}</td>
       <td>${{escHtml(policy)}}</td>
-      <td>${{escHtml(wgText)}}</td>
+      <td>${{wgVerdictBadge(wgVerdict)}}<br><span>${{escHtml(wgText)}}</span></td>
       <td>${{escHtml(xText)}}</td>
     </tr>`;
   }}).join('');
@@ -6102,7 +6294,8 @@ async function refreshAdminLive() {{
   }}
   if (pairedR.ok) {{
     const p = await pairedR.json();
-    renderAdminPairedStatus(p.items || []);
+    pairedStatusCache = Array.isArray(p.items) ? p.items : [];
+    renderAdminPairedStatus(pairedStatusCache);
   }}
 }}
 async function bindWgPeer() {{
@@ -6212,6 +6405,7 @@ document.addEventListener('change', (event) => {{
   if (target.id === 'service-log-stderr-only') refreshServiceLogsNow();
   if (target.id === 'cfg-proxy-bypass-custom') renderProxyBypassValidation(String(target.value || ''));
   if (target.id === 'traffic-user-select') loadAdminUserTrafficDetails();
+  if (target.id === 'paired-wg-verdict-filter') renderAdminPairedStatus(pairedStatusCache);
 }});
 document.addEventListener('input', (event) => {{
   const target = event.target;
@@ -6638,7 +6832,8 @@ def user_paired_status(request: Request) -> JSONResponse:
     user = _require_user(request)
     _refresh_user_traffic_samples_once()
     with _db_connect() as con:
-        paired = _paired_status_for_user(con, int(user["id"]))
+        wg_runtime_totals = _read_wg_dump_totals()
+        paired = _paired_status_for_user(con, int(user["id"]), wg_runtime_totals=wg_runtime_totals)
         protocol_state = _get_user_protocol_state(con, int(user["id"]))
     return JSONResponse({"status": "ok", "paired": paired, "protocol_state": protocol_state})
 
@@ -7005,6 +7200,7 @@ def user_device_config(
                 "wireguard_quick_setup": {
                     "json_url": f"/api/v1/user/wireguard/client-config?device_type={device_type}&platform={platform}",
                     "download_url": f"/api/v1/user/wireguard/client-config?device_type={device_type}&platform={platform}&format=conf",
+                    "diagnostics_url": "/api/v1/user/wireguard/diagnostics?window_seconds=120",
                 },
             },
         }
@@ -7060,6 +7256,18 @@ def user_wireguard_client_config(
             "download_url": f"/api/v1/user/wireguard/client-config?device_type={device_type}&platform={platform}&format=conf",
         }
     )
+
+
+@app.get("/api/v1/user/wireguard/diagnostics")
+def user_wireguard_diagnostics(
+    request: Request,
+    window_seconds: int = 120,
+) -> JSONResponse:
+    user = _require_user(request)
+    _refresh_user_traffic_samples_once()
+    with _db_connect() as con:
+        data = _wireguard_diagnostics_for_user(con, int(user["id"]), window_seconds=window_seconds)
+    return JSONResponse(data)
 
 
 @app.get("/api/v1/admin/stats")
@@ -7619,6 +7827,7 @@ def admin_paired_status(request: Request) -> JSONResponse:
     _require_admin(request)
     _refresh_user_traffic_samples_once()
     with _db_connect() as con:
+        wg_runtime_totals = _read_wg_dump_totals()
         users = con.execute(
             """
             SELECT id, username, email, role
@@ -7628,7 +7837,7 @@ def admin_paired_status(request: Request) -> JSONResponse:
         ).fetchall()
         items: list[dict[str, Any]] = []
         for u in users:
-            paired = _paired_status_for_user(con, int(u["id"]))
+            paired = _paired_status_for_user(con, int(u["id"]), wg_runtime_totals=wg_runtime_totals)
             protocol_state = _get_user_protocol_state(con, int(u["id"]))
             items.append(
                 {
