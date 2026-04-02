@@ -6492,6 +6492,19 @@ async function runAdminWgDiagnosticsForUser(userId, username, email) {{
     );
   }}
   lines.push('');
+  lines.push('=== Profile snapshot ===');
+  const profile = (item && item.profile_snapshot) ? item.profile_snapshot : null;
+  if (!profile) {{
+    lines.push('- no profile snapshot found');
+  }} else {{
+    lines.push('endpoint=' + String(profile.endpoint || '-'));
+    lines.push('allowed_ips=' + String(profile.allowed_ips || '-'));
+    lines.push('dns=' + String(profile.dns || '-'));
+    lines.push('mtu=' + String(profile.mtu || '-'));
+    lines.push('persistent_keepalive=' + String(profile.persistent_keepalive || '-'));
+    lines.push('updated_at=' + String(profile.updated_at || '-'));
+  }}
+  lines.push('');
   lines.push('=== Active data-path probe ===');
   const probe = j.active_probe || {{}};
   if (!probe || !probe.status) {{
@@ -6509,6 +6522,13 @@ async function runAdminWgDiagnosticsForUser(userId, username, email) {{
     );
     lines.push('note: ' + String(probe.note || '-'));
   }}
+  lines.push('');
+  lines.push('=== Client-routing suspicion ===');
+  const suspicion = j.client_routing_suspicion || {{}};
+  lines.push('server_path_ok=' + String(!!suspicion.server_path_ok));
+  lines.push('payload_from_client=' + String(!!suspicion.payload_from_client));
+  lines.push('likely_client_routing_issue=' + String(!!suspicion.likely_client_routing_issue));
+  lines.push('note: ' + String(suspicion.note || '-'));
   lines.push('');
   lines.push('=== Runtime debug snapshot ===');
   const debug = j.debug || {{}};
@@ -8143,12 +8163,37 @@ def admin_wireguard_diagnostics(
                     "public_key": str(row["public_key"]),
                     "label": str(row["label"] or ""),
                     "diagnostics": diag,
+                    "profile_snapshot": {},
                 }
             )
+            profile_row = con.execute(
+                """
+                SELECT endpoint, allowed_ips, dns, mtu, persistent_keepalive, updated_at
+                FROM user_wireguard_profiles
+                WHERE user_id = ?
+                """,
+                (uid,),
+            ).fetchone()
+            if profile_row:
+                items[-1]["profile_snapshot"] = {
+                    "endpoint": str(profile_row["endpoint"] or ""),
+                    "allowed_ips": str(profile_row["allowed_ips"] or ""),
+                    "dns": str(profile_row["dns"] or ""),
+                    "mtu": str(profile_row["mtu"] or ""),
+                    "persistent_keepalive": str(profile_row["persistent_keepalive"] or ""),
+                    "updated_at": str(profile_row["updated_at"] or ""),
+                }
     active_probe: dict[str, Any] = {}
     if len(items) == 1:
         active_probe = _wireguard_active_probe_for_public_key(str(items[0].get("public_key", "")))
     debug = _wireguard_runtime_debug_snapshot()
+    server_path_ok = all(bool((debug.get(k) or {}).get("ok")) for k in ["ip_forward", "wg_show", "nat_postrouting", "forward_chain", "mangle_forward"])
+    probe_verdict = str(active_probe.get("verdict", ""))
+    payload_from_client = probe_verdict in {"data_path_confirmed", "data_path_low_delta"}
+    likely_client_routing_issue = bool(server_path_ok) and probe_verdict in {"data_path_not_confirmed", "data_path_low_delta"}
+    suspicion_note = "No strong client-routing suspicion."
+    if likely_client_routing_issue:
+        suspicion_note = "Server path is healthy, but meaningful payload is not entering tunnel from client side."
     return JSONResponse(
         {
             "status": "ok",
@@ -8156,6 +8201,12 @@ def admin_wireguard_diagnostics(
             "items": items,
             "runtime_peer_count": len(runtime_totals),
             "active_probe": active_probe,
+            "client_routing_suspicion": {
+                "server_path_ok": bool(server_path_ok),
+                "payload_from_client": bool(payload_from_client),
+                "likely_client_routing_issue": bool(likely_client_routing_issue),
+                "note": suspicion_note,
+            },
             "debug": debug,
             "generated_at": _now().isoformat(),
         }
