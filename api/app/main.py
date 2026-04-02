@@ -1350,9 +1350,16 @@ def _read_capacity_status(window_minutes: int = 60) -> dict[str, Any]:
             """,
             (month_threshold,),
         ).fetchall()
+        online_threshold = (_now() - timedelta(seconds=ONLINE_WINDOW_SECONDS)).isoformat()
         active_sessions_row = con.execute(
-            "SELECT COUNT(*) c FROM sessions WHERE revoked = 0 AND expires_at > ?",
-            (_now().isoformat(),),
+            """
+            SELECT COUNT(DISTINCT user_id) c
+            FROM sessions
+            WHERE revoked = 0
+              AND expires_at > ?
+              AND COALESCE(last_seen, created_at) >= ?
+            """,
+            (_now().isoformat(), online_threshold),
         ).fetchone()
     if not rows:
         return {
@@ -1799,6 +1806,14 @@ def _collect_xray_user_traffic(con: sqlite3.Connection, ts_iso: str) -> None:
             """,
             (email, up_total, down_total, ts_iso),
         )
+
+
+def _refresh_user_traffic_samples_once() -> None:
+    ts_iso = _now().isoformat()
+    with _db_connect() as con:
+        _collect_wireguard_user_traffic(con, ts_iso)
+        _collect_xray_user_traffic(con, ts_iso)
+        con.commit()
 
 
 def _metrics_sampler_loop() -> None:
@@ -3031,6 +3046,13 @@ def cabinet(request: Request) -> HTMLResponse:
         "proxy-vpn user cabinet",
         f"""
 <div class="card">
+  <div class="tab-strip" id="cab-tabs">
+    <button class="tab-btn" data-cab-section-btn="profile">User card</button>
+    <button class="tab-btn" data-cab-section-btn="device">Device setup</button>
+    <button class="tab-btn" data-cab-section-btn="traffic">Traffic and resources</button>
+  </div>
+</div>
+<div class="card cab-section" data-cab-section="profile">
   <div class="user-card">
     <div class="user-avatar">{escape(initials)}</div>
     <div>
@@ -3045,7 +3067,7 @@ def cabinet(request: Request) -> HTMLResponse:
     </div>
   </div>
 </div>
-<div class="card">
+<div class="card cab-section" data-cab-section="device">
   <h2>Device setup</h2>
   <p class="muted">Choose your device and get ready-to-use proxy/vpn config + install instructions.</p>
   <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;align-items:end;">
@@ -3071,7 +3093,7 @@ def cabinet(request: Request) -> HTMLResponse:
   </div>
   <div id="device-card-out" style="margin-top:12px;"></div>
 </div>
-<div class="card">
+<div class="card cab-section" data-cab-section="traffic">
   <h2>Traffic and resource usage</h2>
   <p class="muted">Live counters and aggregated usage for your profile.</p>
   <div id="cab-traffic-resources" class="muted">Resources: loading...</div>
@@ -3109,6 +3131,17 @@ function getCsrfToken() {{
   const m = document.cookie.match(/(?:^|; )proxy_vpn_csrf=([^;]+)/);
   if (m && m[1]) return decodeURIComponent(m[1]);
   return csrfToken;
+}}
+function showCabSection(section) {{
+  const s = String(section || 'profile');
+  document.querySelectorAll('#cab-tabs .tab-btn').forEach((btn) => {{
+    const key = String(btn.getAttribute('data-cab-section-btn') || '').trim();
+    btn.classList.toggle('active', key === s);
+  }});
+  document.querySelectorAll('.cab-section').forEach((el) => {{
+    const key = String(el.getAttribute('data-cab-section') || '').trim();
+    el.style.display = (key === s) ? '' : 'none';
+  }});
 }}
 function openEditProfileModal() {{
   const modal = document.getElementById('edit-profile-modal');
@@ -3353,6 +3386,14 @@ document.addEventListener('click', (event) => {{
     closeEditProfileModal();
     return;
   }}
+  const cabTab = target.closest('[data-cab-section-btn]');
+  if (cabTab) {{
+    const section = String(cabTab.getAttribute('data-cab-section-btn') || '').trim();
+    if (section) {{
+      showCabSection(section);
+      return;
+    }}
+  }}
   const btn = target.closest('[data-action]');
   if (!btn) return;
   const action = String(btn.getAttribute('data-action') || '').trim();
@@ -3367,6 +3408,7 @@ document.addEventListener('click', (event) => {{
   }}
 }});
 refreshPlatformOptions();
+showCabSection('profile');
 initDeviceCard();
 loadCabinetTraffic();
 setInterval(loadCabinetTraffic, 30000);
@@ -3384,7 +3426,9 @@ def admin(request: Request) -> HTMLResponse:
         return RedirectResponse(url="/login", status_code=307)
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
+    _refresh_user_traffic_samples_once()
     with _db_connect() as con:
+        online_user_ids = set(_online_user_ids(con))
         pending_rows = con.execute(
             """
             SELECT id, username, email, requested_at
@@ -3442,29 +3486,37 @@ def admin(request: Request) -> HTMLResponse:
 
     users_html = "".join(
         [
-            f"<tr>"
-            f"<td>{escape(row['username'])}</td>"
-            f"<td>{escape(row['email'])}</td>"
-            f"<td>{escape(row['role'])}</td>"
-            f"<td>{'active' if int(row['is_active']) == 1 else 'blocked'}</td>"
-            f"<td>{escape(row['created_at'])}</td>"
-            f"<td>"
-            + (
-                "<span class='muted'>self</span>"
-                if int(row["id"]) == int(user["id"])
-                else (
-                    f"<button class='btn-ghost' data-action='block-user' data-user-id='{int(row['id'])}'>Block</button> "
-                    if int(row["is_active"]) == 1
-                    else f"<button class='btn-ghost' data-action='unblock-user' data-user-id='{int(row['id'])}'>Unblock</button> "
+            (
+                f"<tr>"
+                f"<td>{escape(row['username'])}</td>"
+                f"<td>{escape(row['email'])}</td>"
+                f"<td>{escape(row['role'])}</td>"
+                f"<td>{'active' if int(row['is_active']) == 1 else 'blocked'} · "
+                + (
+                    "<span class='status-pill status-running'>Online</span>"
+                    if int(row["id"]) in online_user_ids
+                    else "<span class='status-pill status-in_error'>Offline</span>"
                 )
+                + "</td>"
+                f"<td>{escape(row['created_at'])}</td>"
+                f"<td>"
+                + (
+                    "<span class='muted'>self</span>"
+                    if int(row["id"]) == int(user["id"])
+                    else (
+                        f"<button class='btn-ghost' data-action='block-user' data-user-id='{int(row['id'])}'>Block</button> "
+                        if int(row["is_active"]) == 1
+                        else f"<button class='btn-ghost' data-action='unblock-user' data-user-id='{int(row['id'])}'>Unblock</button> "
+                    )
+                )
+                + (
+                    ""
+                    if int(row["id"]) == int(user["id"])
+                    else f"<button class='btn-ghost js-delete-user' data-user-id='{int(row['id'])}' data-username='{escape(str(row['username']))}'>Delete</button>"
+                )
+                + "</td>"
+                f"</tr>"
             )
-            + (
-                ""
-                if int(row["id"]) == int(user["id"])
-                else f"<button class='btn-ghost js-delete-user' data-user-id='{int(row['id'])}' data-username='{escape(str(row['username']))}'>Delete</button>"
-            )
-            + "</td>"
-            f"</tr>"
             for row in users_rows
         ]
     )
@@ -5099,6 +5151,9 @@ def login(request: Request, payload: LoginRequest) -> JSONResponse:
     _reset_failed_login(username, ip)
     _revoke_session(request)
     user = {k: row[k] for k in ["id", "username", "email", "role", "is_active"]}
+    profile = _ensure_user_xray_profile(user)
+    _ensure_xray_client_in_config(profile["xray_uuid"], profile["xray_email"])
+    _ensure_xray_binding_for_user(int(user["id"]), profile["xray_email"], "auto-profile")
     resp = JSONResponse({"status": "ok", "user": {"username": user["username"], "role": user["role"]}})
     _issue_session_cookie(resp, request, user)
     return resp
@@ -5730,6 +5785,7 @@ def _load_user_traffic_periods(con: sqlite3.Connection, user_id: int) -> dict[st
 
 def _build_user_traffic_timeseries_response(user_id: int, minutes: int) -> JSONResponse:
     minutes = max(5, min(24 * 60, int(minutes)))
+    _refresh_user_traffic_samples_once()
     with _db_connect() as con:
         user = con.execute(
             "SELECT id, username, email, role FROM users WHERE id = ?",
@@ -5806,6 +5862,7 @@ def _build_user_traffic_timeseries_response(user_id: int, minutes: int) -> JSONR
 @app.get("/api/v1/user/traffic/summary")
 def user_traffic_summary(request: Request) -> JSONResponse:
     user = _require_user(request)
+    _refresh_user_traffic_samples_once()
     with _db_connect() as con:
         periods = _load_user_traffic_periods(con, int(user["id"]))
         current = con.execute(
@@ -5839,65 +5896,46 @@ def user_traffic_timeseries(request: Request, minutes: int = 60) -> JSONResponse
 @app.get("/api/v1/admin/user-traffic/summary")
 def admin_user_traffic_summary(request: Request, hours: int = 24) -> JSONResponse:
     _require_admin(request)
+    _refresh_user_traffic_samples_once()
     hours = max(1, min(24 * 30, hours))
     with _db_connect() as con:
-        wg_exact_rows = con.execute(
+        rows = con.execute(
             """
-            SELECT COUNT(*) c
-            FROM user_wireguard_traffic_samples
-            WHERE ts >= datetime('now', ?)
+            SELECT u.id user_id, u.username, u.email, u.role,
+                   CASE
+                     WHEN (COALESCE(w.rx_bytes, 0) + COALESCE(x.rx_bytes, 0) + COALESCE(w.tx_bytes, 0) + COALESCE(x.tx_bytes, 0)) > 0
+                     THEN (COALESCE(w.rx_bytes, 0) + COALESCE(x.rx_bytes, 0))
+                     ELSE COALESCE(e.rx_bytes, 0)
+                   END rx_bytes,
+                   CASE
+                     WHEN (COALESCE(w.rx_bytes, 0) + COALESCE(x.rx_bytes, 0) + COALESCE(w.tx_bytes, 0) + COALESCE(x.tx_bytes, 0)) > 0
+                     THEN (COALESCE(w.tx_bytes, 0) + COALESCE(x.tx_bytes, 0))
+                     ELSE COALESCE(e.tx_bytes, 0)
+                   END tx_bytes
+            FROM users u
+            LEFT JOIN (
+              SELECT user_id, SUM(rx_bytes) rx_bytes, SUM(tx_bytes) tx_bytes
+              FROM user_wireguard_traffic_samples
+              WHERE ts >= datetime('now', ?)
+              GROUP BY user_id
+            ) w ON w.user_id = u.id
+            LEFT JOIN (
+              SELECT user_id, SUM(rx_bytes) rx_bytes, SUM(tx_bytes) tx_bytes
+              FROM user_xray_traffic_samples
+              WHERE ts >= datetime('now', ?)
+              GROUP BY user_id
+            ) x ON x.user_id = u.id
+            LEFT JOIN (
+              SELECT user_id, SUM(rx_bytes) rx_bytes, SUM(tx_bytes) tx_bytes
+              FROM user_traffic_samples
+              WHERE ts >= datetime('now', ?)
+              GROUP BY user_id
+            ) e ON e.user_id = u.id
+            ORDER BY (rx_bytes + tx_bytes) DESC, u.username ASC
             """,
-            (f"-{hours} hours",),
-        ).fetchone()
-        xray_exact_rows = con.execute(
-            """
-            SELECT COUNT(*) c
-            FROM user_xray_traffic_samples
-            WHERE ts >= datetime('now', ?)
-            """,
-            (f"-{hours} hours",),
-        ).fetchone()
-        use_exact = int(wg_exact_rows["c"] or 0) > 0 or int(xray_exact_rows["c"] or 0) > 0
-        if use_exact:
-            rows = con.execute(
-                """
-                SELECT u.id user_id, u.username, u.email, u.role,
-                       COALESCE(w.rx_bytes, 0) + COALESCE(x.rx_bytes, 0) rx_bytes,
-                       COALESCE(w.tx_bytes, 0) + COALESCE(x.tx_bytes, 0) tx_bytes
-                FROM users u
-                LEFT JOIN (
-                  SELECT user_id, SUM(rx_bytes) rx_bytes, SUM(tx_bytes) tx_bytes
-                  FROM user_wireguard_traffic_samples
-                  WHERE ts >= datetime('now', ?)
-                  GROUP BY user_id
-                ) w ON w.user_id = u.id
-                LEFT JOIN (
-                  SELECT user_id, SUM(rx_bytes) rx_bytes, SUM(tx_bytes) tx_bytes
-                  FROM user_xray_traffic_samples
-                  WHERE ts >= datetime('now', ?)
-                  GROUP BY user_id
-                ) x ON x.user_id = u.id
-                ORDER BY (COALESCE(w.rx_bytes, 0) + COALESCE(x.rx_bytes, 0) + COALESCE(w.tx_bytes, 0) + COALESCE(x.tx_bytes, 0)) DESC, u.username ASC
-                """,
-                (f"-{hours} hours", f"-{hours} hours"),
-            ).fetchall()
-        else:
-            rows = con.execute(
-                """
-                SELECT u.id user_id, u.username, u.email, u.role,
-                       COALESCE(SUM(t.rx_bytes), 0) rx_bytes,
-                       COALESCE(SUM(t.tx_bytes), 0) tx_bytes
-                FROM users u
-                LEFT JOIN user_traffic_samples t ON t.user_id = u.id AND t.ts >= datetime('now', ?)
-                GROUP BY u.id, u.username, u.email, u.role
-                ORDER BY (rx_bytes + tx_bytes) DESC, u.username ASC
-                """,
-                (f"-{hours} hours",),
-            ).fetchall()
-        if use_exact:
-            source = "wireguard_xray_exact"
-        else:
-            source = "estimated_session_share"
+            (f"-{hours} hours", f"-{hours} hours", f"-{hours} hours"),
+        ).fetchall()
+        source = "wireguard_xray_exact_with_estimated_fallback"
     return JSONResponse(
         {
             "status": "ok",
@@ -5931,6 +5969,7 @@ def admin_user_traffic_timeseries(request: Request, user_id: int, minutes: int =
 @app.get("/api/v1/admin/wireguard-bindings")
 def admin_wireguard_bindings(request: Request) -> JSONResponse:
     _require_admin(request)
+    _refresh_user_traffic_samples_once()
     with _db_connect() as con:
         rows = con.execute(
             """
@@ -5983,6 +6022,7 @@ def admin_wireguard_unbind(public_key: str, request: Request) -> JSONResponse:
 @app.get("/api/v1/admin/xray-bindings")
 def admin_xray_bindings(request: Request) -> JSONResponse:
     _require_admin(request)
+    _refresh_user_traffic_samples_once()
     with _db_connect() as con:
         rows = con.execute(
             """
