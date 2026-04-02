@@ -65,6 +65,8 @@ XRAY_CONFIG_PATH = "/xray-config/config.json"
 XRAY_CLIENT_INFO_PATH = "/xray-config/client-connection.txt"
 WG_CLIENT_TEMPLATE_PATH = "/wireguard-config/client1.conf"
 WG_CLIENT_DEFAULT_MTU = os.getenv("WG_CLIENT_DEFAULT_MTU", "1280")
+WG_ENABLE_IPV6 = os.getenv("WG_ENABLE_IPV6", "0").strip() in {"1", "true", "yes", "on"}
+WG_CLIENT_DEFAULT_ALLOWED_IPS = "0.0.0.0/0, ::/0" if WG_ENABLE_IPV6 else "0.0.0.0/0"
 WG_MANAGED_BEGIN = "# BEGIN PROXY_VPN_MANAGED_PEERS"
 WG_MANAGED_END = "# END PROXY_VPN_MANAGED_PEERS"
 DEPLOY_HISTORY_PATH = os.getenv("DEPLOY_HISTORY_PATH", "/logs/deploy-history.log")
@@ -1849,7 +1851,7 @@ def _parse_wireguard_client_template(path: str = WG_CLIENT_TEMPLATE_PATH) -> dic
     return {
         "dns": data.get("interface.dns", "1.1.1.1,1.0.0.1"),
         "server_public_key": data.get("peer.publickey", ""),
-        "allowed_ips": data.get("peer.allowedips", "0.0.0.0/0, ::/0"),
+        "allowed_ips": _normalize_wg_allowed_ips(data.get("peer.allowedips", WG_CLIENT_DEFAULT_ALLOWED_IPS)),
         "endpoint": data.get("peer.endpoint", ""),
         "mtu": data.get("interface.mtu", WG_CLIENT_DEFAULT_MTU),
         "preshared_key": data.get("peer.presharedkey", ""),
@@ -1901,6 +1903,18 @@ def _normalize_endpoint_with_port(endpoint: str, wg_port: str) -> str:
     if ":" in raw:
         return raw
     return f"{raw}:{wg_port}"
+
+
+def _normalize_wg_allowed_ips(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return WG_CLIENT_DEFAULT_ALLOWED_IPS
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not WG_ENABLE_IPV6:
+        parts = [p for p in parts if ":" not in p]
+    if not parts:
+        return WG_CLIENT_DEFAULT_ALLOWED_IPS
+    return ", ".join(parts)
 
 
 def _generate_wireguard_keypair() -> tuple[str, str]:
@@ -1961,6 +1975,7 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
             (user_id,),
         ).fetchone()
         if row:
+            norm_allowed = _normalize_wg_allowed_ips(str(row["allowed_ips"] or tpl.get("allowed_ips", WG_CLIENT_DEFAULT_ALLOWED_IPS)))
             profile = {
                 "private_key": str(row["private_key"] or ""),
                 "public_key": str(row["public_key"] or ""),
@@ -1968,7 +1983,7 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
                 "dns": str(row["dns"] or ""),
                 "endpoint": str(row["endpoint"] or endpoint),
                 "server_public_key": server_public_key,
-                "allowed_ips": str(row["allowed_ips"] or tpl.get("allowed_ips", "0.0.0.0/0, ::/0")),
+                "allowed_ips": norm_allowed,
                 "persistent_keepalive": str(row["persistent_keepalive"] or tpl.get("persistent_keepalive", "25")),
                 "mtu": str(row["mtu"] or tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)),
                 "preshared_key": str(row["preshared_key"] or tpl.get("preshared_key", "")),
@@ -2001,7 +2016,7 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
                 "dns": str(tpl.get("dns", "1.1.1.1,1.0.0.1")),
                 "endpoint": endpoint,
                 "server_public_key": server_public_key,
-                "allowed_ips": str(tpl.get("allowed_ips", "0.0.0.0/0, ::/0")),
+                "allowed_ips": _normalize_wg_allowed_ips(str(tpl.get("allowed_ips", WG_CLIENT_DEFAULT_ALLOWED_IPS))),
                 "persistent_keepalive": str(tpl.get("persistent_keepalive", "25")),
                 "mtu": str(tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)),
                 "preshared_key": str(tpl.get("preshared_key", "")),
@@ -6945,7 +6960,7 @@ def user_device_config(
                     "endpoint": wg_endpoint,
                     "server_public_key": wg_server_public_key,
                     "preshared_key": str(wg_tpl.get("preshared_key", "")),
-                    "allowed_ips": str(wg_tpl.get("allowed_ips", "0.0.0.0/0, ::/0")),
+                    "allowed_ips": _normalize_wg_allowed_ips(str(wg_tpl.get("allowed_ips", WG_CLIENT_DEFAULT_ALLOWED_IPS))),
                     "persistent_keepalive": str(wg_tpl.get("persistent_keepalive", "25")),
                     "mtu": str(wg_tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)),
                     "dns": str(wg_tpl.get("dns", "1.1.1.1,1.0.0.1")),
