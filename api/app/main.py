@@ -62,6 +62,7 @@ WG_DUMP_PATH = "/wireguard-config/wg_dump.txt"
 XRAY_STATS_PATH = "/xray-config/stats_raw.txt"
 XRAY_CONFIG_PATH = "/xray-config/config.json"
 XRAY_CLIENT_INFO_PATH = "/xray-config/client-connection.txt"
+WG_CLIENT_TEMPLATE_PATH = "/wireguard-config/client1.conf"
 DEPLOY_HISTORY_PATH = os.getenv("DEPLOY_HISTORY_PATH", "/logs/deploy-history.log")
 APP_RELEASE_STATE_PATH = os.getenv("APP_RELEASE_STATE_PATH", "/logs/app-release-state.json")
 UPDATE_CHECK_REQUEST_PATH = os.getenv("UPDATE_CHECK_REQUEST_PATH", "/logs/update-check-request.json")
@@ -1820,6 +1821,170 @@ def _normalize_wg_public_key(public_key: str) -> str:
     return key
 
 
+def _parse_wireguard_client_template(path: str = WG_CLIENT_TEMPLATE_PATH) -> dict[str, str]:
+    p = Path(path)
+    if not p.exists():
+        raise HTTPException(status_code=503, detail=f"WireGuard template is missing: {path}")
+    section = ""
+    data: dict[str, str] = {}
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    section = line.strip("[]").lower()
+                    continue
+                if "=" not in line:
+                    continue
+                key, value = [x.strip() for x in line.split("=", 1)]
+                data[f"{section}.{key.lower()}"] = value
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to read WireGuard template: {e}")
+    return {
+        "dns": data.get("interface.dns", "1.1.1.1,1.0.0.1"),
+        "server_public_key": data.get("peer.publickey", ""),
+        "allowed_ips": data.get("peer.allowedips", "0.0.0.0/0, ::/0"),
+        "endpoint": data.get("peer.endpoint", ""),
+        "persistent_keepalive": data.get("peer.persistentkeepalive", "25"),
+        "template_address": data.get("interface.address", "10.13.0.2/32"),
+    }
+
+
+def _allocate_wireguard_client_address(user_id: int, template_address: str) -> str:
+    raw = str(template_address or "10.13.0.2/32").strip()
+    if "/" not in raw:
+        raw = f"{raw}/32"
+    ip_part, mask = raw.split("/", 1)
+    octets = ip_part.split(".")
+    if len(octets) != 4:
+        return "10.13.0.2/32"
+    host = 2 + (int(user_id) % 200)
+    return f"{octets[0]}.{octets[1]}.{octets[2]}.{host}/{mask}"
+
+
+def _generate_wireguard_keypair() -> tuple[str, str]:
+    if docker is None:
+        raise HTTPException(status_code=503, detail="docker SDK unavailable in api container")
+    client = None
+    try:
+        client = docker.from_env()
+        container = client.containers.get("proxy-vpn-wireguard")
+        result = container.exec_run(
+            [
+                "sh",
+                "-lc",
+                "set -e; priv=$(wg genkey); pub=$(printf '%s' \"$priv\" | wg pubkey); printf '%s\\n%s' \"$priv\" \"$pub\"",
+            ],
+            stdout=True,
+            stderr=True,
+        )
+        output = getattr(result, "output", b"")
+        text = output.decode("utf-8", errors="replace").strip() if output else ""
+        if int(getattr(result, "exit_code", 1)) != 0:
+            raise HTTPException(status_code=503, detail=f"Failed to generate WireGuard keys: {text or 'unknown error'}")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if len(lines) < 2:
+            raise HTTPException(status_code=503, detail="Failed to parse generated WireGuard keypair")
+        return lines[-2], lines[-1]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"WireGuard key generation error: {e}")
+    finally:
+        try:
+            if client is not None:
+                client.close()
+        except Exception:
+            pass
+
+
+def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: str, platform: str) -> dict[str, str]:
+    user_id = int(user["id"])
+    now_iso = _now().isoformat()
+    tpl = _parse_wireguard_client_template()
+    endpoint = str(tpl.get("endpoint") or "").strip()
+    panel_domain = str(os.getenv("VPN_PANEL_DOMAIN", "") or "").strip()
+    wg_port = str(os.getenv("WG_PORT", "51820") or "51820").strip()
+    if panel_domain and panel_domain != "panel.example.com":
+        endpoint = f"{panel_domain}:{wg_port}"
+    if not endpoint:
+        endpoint = f"127.0.0.1:{wg_port}"
+    with _db_connect() as con:
+        row = con.execute(
+            """
+            SELECT private_key, public_key, client_address, dns, endpoint, server_public_key, allowed_ips, persistent_keepalive
+            FROM user_wireguard_profiles
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+        if row:
+            profile = {
+                "private_key": str(row["private_key"] or ""),
+                "public_key": str(row["public_key"] or ""),
+                "client_address": str(row["client_address"] or ""),
+                "dns": str(row["dns"] or ""),
+                "endpoint": str(row["endpoint"] or endpoint),
+                "server_public_key": str(row["server_public_key"] or tpl.get("server_public_key", "")),
+                "allowed_ips": str(row["allowed_ips"] or tpl.get("allowed_ips", "0.0.0.0/0, ::/0")),
+                "persistent_keepalive": str(row["persistent_keepalive"] or tpl.get("persistent_keepalive", "25")),
+            }
+        else:
+            private_key, public_key = _generate_wireguard_keypair()
+            profile = {
+                "private_key": private_key,
+                "public_key": public_key,
+                "client_address": _allocate_wireguard_client_address(user_id, tpl.get("template_address", "10.13.0.2/32")),
+                "dns": str(tpl.get("dns", "1.1.1.1,1.0.0.1")),
+                "endpoint": endpoint,
+                "server_public_key": str(tpl.get("server_public_key", "")),
+                "allowed_ips": str(tpl.get("allowed_ips", "0.0.0.0/0, ::/0")),
+                "persistent_keepalive": str(tpl.get("persistent_keepalive", "25")),
+            }
+            con.execute(
+                """
+                INSERT INTO user_wireguard_profiles (
+                    user_id, private_key, public_key, client_address, dns, endpoint, server_public_key,
+                    allowed_ips, persistent_keepalive, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    profile["private_key"],
+                    profile["public_key"],
+                    profile["client_address"],
+                    profile["dns"],
+                    profile["endpoint"],
+                    profile["server_public_key"],
+                    profile["allowed_ips"],
+                    profile["persistent_keepalive"],
+                    now_iso,
+                ),
+            )
+        label = f"auto-{device_type}-{platform}"
+        _set_user_wg_public_key(user_id, profile["public_key"])
+        _ensure_wg_binding_for_user(user_id, profile["public_key"], label)
+        _evaluate_user_protocol_state(con, user_id)
+        con.commit()
+    return profile
+
+
+def _wireguard_profile_to_conf(profile: dict[str, str]) -> str:
+    return (
+        "[Interface]\n"
+        f"PrivateKey = {profile['private_key']}\n"
+        f"Address = {profile['client_address']}\n"
+        f"DNS = {profile['dns']}\n\n"
+        "[Peer]\n"
+        f"PublicKey = {profile['server_public_key']}\n"
+        f"AllowedIPs = {profile['allowed_ips']}\n"
+        f"Endpoint = {profile['endpoint']}\n"
+        f"PersistentKeepalive = {profile['persistent_keepalive']}\n"
+    )
+
+
 def _set_user_wg_public_key(user_id: int, public_key: str) -> None:
     with _db_connect() as con:
         con.execute(
@@ -2925,6 +3090,22 @@ def startup() -> None:
         )
         con.execute(
             """
+            CREATE TABLE IF NOT EXISTS user_wireguard_profiles (
+                user_id INTEGER PRIMARY KEY,
+                private_key TEXT NOT NULL,
+                public_key TEXT NOT NULL,
+                client_address TEXT NOT NULL,
+                dns TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                server_public_key TEXT NOT NULL,
+                allowed_ips TEXT NOT NULL,
+                persistent_keepalive TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        con.execute(
+            """
             CREATE TABLE IF NOT EXISTS xray_client_bindings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -3641,6 +3822,9 @@ function renderDeviceCard(card) {{
   const wgAbout = escHtml(card.wireguard_about || 'Install WireGuard client for paired mode fallback.');
   const wgPlatformTag = escHtml(card.wireguard_platform_tag || '');
   const wgInstructionRows = (card.wireguard_instructions || []).map((s, i) => `<li>${{i + 1}}. ${{escHtml(s)}}</li>`).join('');
+  const wgQuick = card.wireguard_quick_setup || {{}};
+  const wgQuickJsonUrl = escHtml(wgQuick.json_url || '');
+  const wgQuickDownloadUrl = escHtml(wgQuick.download_url || '');
   const fields = card.config_fields || {{}};
   const fieldRows = [
     ['Address', fields.server],
@@ -3697,6 +3881,11 @@ function renderDeviceCard(card) {{
         <span class="status-pill status-stopped" style="margin-left:8px;">${{wgSource}}</span>
       </div>
       ${{wgFallbackHtml}}
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <button class="btn-ghost" data-action="show-wg-quick-config" data-url="${{wgQuickJsonUrl}}">Show WireGuard config</button>
+        <a href="${{wgQuickDownloadUrl}}" target="_blank" rel="noopener noreferrer"><button class="btn-ghost">Download .conf</button></a>
+      </div>
+      <pre id="wg-quick-out" style="margin-top:8px;">WireGuard quick setup: press "Show WireGuard config".</pre>
       <details data-accordion="device-card" style="margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);padding:8px 10px;">
         <summary style="cursor:pointer;font-weight:600;">WireGuard instructions${{wgPlatformTag ? (' (' + wgPlatformTag + ')') : ''}}</summary>
         <ul style="margin:8px 0 4px 14px;padding:0;">${{wgInstructionRows || '<li class="muted">No WireGuard instructions.</li>'}}</ul>
@@ -4056,6 +4245,32 @@ async function copyConfigUri() {{
   if (!el) return;
   await navigator.clipboard.writeText(el.textContent || '');
 }}
+async function showWireGuardQuickConfig(url) {{
+  const out = document.getElementById('wg-quick-out');
+  const target = String(url || '').trim();
+  if (!target) {{
+    if (out) out.textContent = 'WireGuard quick setup endpoint is unavailable.';
+    return;
+  }}
+  if (out) out.textContent = 'Generating WireGuard config...';
+  const r = await fetch(target);
+  const t = await r.text();
+  if (!r.ok) {{
+    if (out) out.textContent = t;
+    return;
+  }}
+  let j = null;
+  try {{ j = JSON.parse(t); }} catch (e) {{ j = null; }}
+  if (!j) {{
+    if (out) out.textContent = t;
+    return;
+  }}
+  const wgInput = document.getElementById('wg-public-key');
+  if (wgInput && j.public_key) wgInput.value = String(j.public_key || '');
+  const hint = String(j.import_hint || '');
+  const cfg = String(j.config || '');
+  if (out) out.textContent = (hint ? ('Import hint: ' + hint + '\\n\\n') : '') + cfg;
+}}
 async function loadDeviceCard() {{
   const type = document.getElementById('dev-type').value;
   const platform = document.getElementById('dev-platform').value;
@@ -4164,6 +4379,7 @@ document.addEventListener('click', (event) => {{
   if (action === 'save-protocol-preference') return void saveProtocolPreference();
   if (action === 'confirm-protocol-switch') return void confirmProtocolSwitch();
   if (action === 'show-switch-guide') return void showSwitchGuideNow();
+  if (action === 'show-wg-quick-config') return void showWireGuardQuickConfig(btn.getAttribute('data-url') || '');
   if (action === 'copy-config-uri') return void copyConfigUri();
   if (action === 'copy-value') {{
     const encoded = String(btn.getAttribute('data-copy-value') || '');
@@ -6076,13 +6292,42 @@ def user_register_wireguard_key(request: Request, payload: UserWireGuardKeyReque
     _ensure_csrf(request)
     user = _require_user(request)
     _ensure_user_xray_profile(user)
+    user_id = int(user["id"])
     key = _normalize_wg_public_key(payload.public_key)
-    _set_user_wg_public_key(int(user["id"]), key)
-    _ensure_wg_binding_for_user(int(user["id"]), key, payload.label or "self-registered")
     with _db_connect() as con:
-        _evaluate_user_protocol_state(con, int(user["id"]))
+        # Replace user's WG key binding (do not keep stale keys for the same user).
+        con.execute(
+            """
+            UPDATE user_access_profiles
+            SET wg_public_key = ?, updated_at = ?
+            WHERE user_id = ?
+            """,
+            (key, _now().isoformat(), user_id),
+        )
+        con.execute(
+            "DELETE FROM wg_peer_bindings WHERE user_id = ? AND public_key != ?",
+            (user_id, key),
+        )
+        con.execute(
+            """
+            INSERT INTO wg_peer_bindings (user_id, public_key, label, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(public_key)
+            DO UPDATE SET user_id = excluded.user_id, label = excluded.label
+            """,
+            (user_id, key, str(payload.label or "self-registered"), _now().isoformat()),
+        )
+        # If user switched to a manually provided key, drop stale auto-generated profile.
+        con.execute(
+            "DELETE FROM user_wireguard_profiles WHERE user_id = ? AND public_key != ?",
+            (user_id, key),
+        )
+        con.execute(
+            "DELETE FROM wg_peer_counters WHERE public_key NOT IN (SELECT public_key FROM wg_peer_bindings)"
+        )
+        _evaluate_user_protocol_state(con, user_id)
         con.commit()
-    return JSONResponse({"status": "ok", "message": "WireGuard public key registered and bound"})
+    return JSONResponse({"status": "ok", "message": "WireGuard public key registered and replaced"})
 
 
 @app.post("/api/v1/user/protocol/preference")
@@ -6479,7 +6724,57 @@ def user_device_config(
                 "wireguard_about": wg_about,
                 "wireguard_platform_tag": wg_platform_tag,
                 "wireguard_instructions": wg_instructions,
+                "wireguard_quick_setup": {
+                    "json_url": f"/api/v1/user/wireguard/client-config?device_type={device_type}&platform={platform}",
+                    "download_url": f"/api/v1/user/wireguard/client-config?device_type={device_type}&platform={platform}&format=conf",
+                },
             },
+        }
+    )
+
+
+@app.get("/api/v1/user/wireguard/client-config")
+def user_wireguard_client_config(
+    request: Request,
+    device_type: Optional[str] = None,
+    platform: Optional[str] = None,
+    format: Optional[str] = None,
+) -> Response:
+    user = _require_user(request)
+    prefs = _get_user_device_preferences(int(user["id"]))
+    device_type = (device_type or prefs["device_type"]).strip().lower()
+    platform = (platform or prefs["platform"]).strip().lower()
+    allowed = {"mobile": {"apple", "android"}, "desktop": {"apple", "linux", "windows"}}
+    if device_type not in allowed:
+        device_type = "mobile"
+    if platform not in allowed[device_type]:
+        platform = "apple" if device_type == "mobile" else "windows"
+    profile = _load_or_create_user_wireguard_profile(user, device_type, platform)
+    conf_text = _wireguard_profile_to_conf(profile)
+    if str(format or "").strip().lower() == "conf":
+        filename = f"proxy-vpn-{str(user['username'])}-{device_type}-{platform}.conf"
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return Response(content=conf_text, media_type="text/plain; charset=utf-8", headers=headers)
+    import_hint = ""
+    if device_type == "mobile" and platform == "apple":
+        import_hint = "WireGuard iOS: Add a tunnel -> Create from file/archive, then pick downloaded .conf."
+    elif device_type == "mobile" and platform == "android":
+        import_hint = "WireGuard Android: + -> Import from file/archive, then select downloaded .conf."
+    elif device_type == "desktop" and platform == "windows":
+        import_hint = "WireGuard Windows: Add Tunnel -> Import tunnel(s) from file."
+    elif device_type == "desktop" and platform == "apple":
+        import_hint = "WireGuard macOS: Add Tunnel -> Import tunnel(s) from file."
+    elif device_type == "desktop" and platform == "linux":
+        import_hint = "WireGuard Linux: import .conf into NetworkManager or use wg-quick up <file>."
+    return JSONResponse(
+        {
+            "status": "ok",
+            "device_type": device_type,
+            "platform": platform,
+            "public_key": profile["public_key"],
+            "config": conf_text,
+            "import_hint": import_hint,
+            "download_url": f"/api/v1/user/wireguard/client-config?device_type={device_type}&platform={platform}&format=conf",
         }
     )
 
@@ -7367,6 +7662,7 @@ def admin_delete_user(request: Request, user_id: int) -> JSONResponse:
         con.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         con.execute("DELETE FROM user_traffic_samples WHERE user_id = ?", (user_id,))
         con.execute("DELETE FROM user_wireguard_traffic_samples WHERE user_id = ?", (user_id,))
+        con.execute("DELETE FROM user_wireguard_profiles WHERE user_id = ?", (user_id,))
         con.execute("DELETE FROM user_xray_traffic_samples WHERE user_id = ?", (user_id,))
         con.execute("DELETE FROM user_access_profiles WHERE user_id = ?", (user_id,))
         con.execute("DELETE FROM wg_peer_bindings WHERE user_id = ?", (user_id,))
