@@ -42,6 +42,8 @@ LOGIN_WINDOW_MINUTES = int(os.getenv("LOGIN_WINDOW_MINUTES", "10"))
 LOGIN_LOCK_MINUTES = int(os.getenv("LOGIN_LOCK_MINUTES", "15"))
 ONLINE_WINDOW_SECONDS = 300
 PAIRED_ACTIVITY_WINDOW_SECONDS = int(os.getenv("PAIRED_ACTIVITY_WINDOW_SECONDS", "900"))
+PROTOCOL_ACTIVITY_WINDOW_SECONDS = int(os.getenv("PROTOCOL_ACTIVITY_WINDOW_SECONDS", "180"))
+DEFAULT_PROTOCOL_FAIL_THRESHOLD_SECONDS = int(os.getenv("DEFAULT_PROTOCOL_FAIL_THRESHOLD_SECONDS", "120"))
 METRICS_SAMPLE_INTERVAL_SECONDS = 10
 CAPACITY_TARGET_ACTIVE_USERS = int(os.getenv("CAPACITY_TARGET_ACTIVE_USERS", "15"))
 CAPACITY_CPU_WARN_P95 = float(os.getenv("CAPACITY_CPU_WARN_P95", "70"))
@@ -1938,6 +1940,173 @@ def _paired_coverage_summary(con: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+def _normalize_protocol_name(value: str) -> str:
+    v = str(value or "").strip().lower()
+    if v in {"xray", "wireguard"}:
+        return v
+    return ""
+
+
+def _protocol_recent_bytes(con: sqlite3.Connection, user_id: int) -> dict[str, int]:
+    threshold = (_now() - timedelta(seconds=PROTOCOL_ACTIVITY_WINDOW_SECONDS)).isoformat()
+    wg_row = con.execute(
+        """
+        SELECT COALESCE(SUM(rx_bytes + tx_bytes), 0) AS total_bytes
+        FROM user_wireguard_traffic_samples
+        WHERE user_id = ? AND ts >= ?
+        """,
+        (int(user_id), threshold),
+    ).fetchone()
+    xray_row = con.execute(
+        """
+        SELECT COALESCE(SUM(rx_bytes + tx_bytes), 0) AS total_bytes
+        FROM user_xray_traffic_samples
+        WHERE user_id = ? AND ts >= ?
+        """,
+        (int(user_id), threshold),
+    ).fetchone()
+    return {
+        "wireguard": int((wg_row["total_bytes"] if wg_row else 0) or 0),
+        "xray": int((xray_row["total_bytes"] if xray_row else 0) or 0),
+    }
+
+
+def _protocol_binding_flags(con: sqlite3.Connection, user_id: int) -> dict[str, bool]:
+    wg = con.execute("SELECT 1 FROM wg_peer_bindings WHERE user_id = ? LIMIT 1", (int(user_id),)).fetchone()
+    xr = con.execute("SELECT 1 FROM xray_client_bindings WHERE user_id = ? LIMIT 1", (int(user_id),)).fetchone()
+    return {"wireguard": bool(wg), "xray": bool(xr)}
+
+
+def _ensure_user_protocol_state_row(con: sqlite3.Connection, user_id: int) -> None:
+    bindings = _protocol_binding_flags(con, int(user_id))
+    default_primary = "xray" if bindings["xray"] else ("wireguard" if bindings["wireguard"] else "xray")
+    default_fallback = ""
+    if bindings["xray"] and bindings["wireguard"]:
+        default_fallback = "wireguard" if default_primary == "xray" else "xray"
+    con.execute(
+        """
+        INSERT INTO user_protocol_state (
+            user_id, primary_protocol, fallback_protocol, current_protocol, switch_recommended,
+            switch_reason, primary_failed_since, fail_threshold_seconds, last_switch_at, last_switch_note, last_evaluated_at, updated_at
+        )
+        VALUES (?, ?, ?, '', 0, '', '', ?, '', '', '', ?)
+        ON CONFLICT(user_id) DO NOTHING
+        """,
+        (
+            int(user_id),
+            default_primary,
+            default_fallback,
+            int(DEFAULT_PROTOCOL_FAIL_THRESHOLD_SECONDS),
+            _now().isoformat(),
+        ),
+    )
+
+
+def _evaluate_user_protocol_state(con: sqlite3.Connection, user_id: int) -> dict[str, Any]:
+    uid = int(user_id)
+    _ensure_user_protocol_state_row(con, uid)
+    row = con.execute("SELECT * FROM user_protocol_state WHERE user_id = ?", (uid,)).fetchone()
+    if not row:
+        return {}
+    primary = _normalize_protocol_name(str(row["primary_protocol"] or "")) or "xray"
+    fallback = _normalize_protocol_name(str(row["fallback_protocol"] or ""))
+    if fallback == primary:
+        fallback = ""
+    fail_threshold_seconds = max(30, int(row["fail_threshold_seconds"] or DEFAULT_PROTOCOL_FAIL_THRESHOLD_SECONDS))
+    bindings = _protocol_binding_flags(con, uid)
+    recent = _protocol_recent_bytes(con, uid)
+    active_flags = {k: int(v) > 0 for k, v in recent.items()}
+    mode = "dual" if bindings["xray"] and bindings["wireguard"] else (
+        "single_xray" if bindings["xray"] else ("single_wireguard" if bindings["wireguard"] else "unconfigured")
+    )
+    now_iso = _now().isoformat()
+    primary_bound = bool(bindings.get(primary, False))
+    primary_active = bool(active_flags.get(primary, False))
+    fallback_bound = bool(bindings.get(fallback, False)) if fallback else False
+    fallback_active = bool(active_flags.get(fallback, False)) if fallback else False
+    failed_since = str(row["primary_failed_since"] or "")
+    switch_recommended = 0
+    switch_reason = ""
+    current_protocol = _normalize_protocol_name(str(row["current_protocol"] or ""))
+    if mode.startswith("single_"):
+        current_protocol = "xray" if mode == "single_xray" else "wireguard"
+    elif mode == "dual":
+        if active_flags["xray"] and not active_flags["wireguard"]:
+            current_protocol = "xray"
+        elif active_flags["wireguard"] and not active_flags["xray"]:
+            current_protocol = "wireguard"
+        elif active_flags["wireguard"] and active_flags["xray"]:
+            current_protocol = current_protocol or primary
+    if mode == "dual":
+        if not primary_bound:
+            switch_recommended = 1
+            switch_reason = f"Primary {primary} is not bound for user"
+            failed_since = failed_since or now_iso
+        elif not primary_active:
+            if not failed_since:
+                failed_since = now_iso
+            try:
+                failed_dt = datetime.fromisoformat(failed_since)
+                fail_age = (_now() - failed_dt).total_seconds()
+            except Exception:
+                fail_age = float(fail_threshold_seconds)
+            if fail_age >= float(fail_threshold_seconds):
+                if fallback and fallback_bound:
+                    switch_recommended = 1
+                    switch_reason = (
+                        f"Primary {primary} inactive for {int(fail_age)}s; switch to {fallback}"
+                        if fallback_active
+                        else f"Primary {primary} inactive for {int(fail_age)}s; fallback {fallback} ready"
+                    )
+                else:
+                    switch_recommended = 1
+                    switch_reason = f"Primary {primary} inactive and fallback is not configured"
+        else:
+            failed_since = ""
+    else:
+        failed_since = ""
+        switch_recommended = 0
+    con.execute(
+        """
+        UPDATE user_protocol_state
+        SET primary_protocol = ?, fallback_protocol = ?, current_protocol = ?, switch_recommended = ?,
+            switch_reason = ?, primary_failed_since = ?, fail_threshold_seconds = ?, last_evaluated_at = ?, updated_at = ?
+        WHERE user_id = ?
+        """,
+        (
+            primary,
+            fallback,
+            current_protocol,
+            int(switch_recommended),
+            switch_reason,
+            failed_since,
+            int(fail_threshold_seconds),
+            now_iso,
+            now_iso,
+            uid,
+        ),
+    )
+    return {
+        "user_id": uid,
+        "mode": mode,
+        "primary_protocol": primary,
+        "fallback_protocol": fallback,
+        "current_protocol": current_protocol,
+        "switch_recommended": bool(switch_recommended),
+        "switch_reason": switch_reason,
+        "primary_failed_since": failed_since,
+        "fail_threshold_seconds": int(fail_threshold_seconds),
+        "activity_window_seconds": PROTOCOL_ACTIVITY_WINDOW_SECONDS,
+        "bound": bindings,
+        "recent_bytes": recent,
+        "active": active_flags,
+    }
+
+
+def _get_user_protocol_state(con: sqlite3.Connection, user_id: int) -> dict[str, Any]:
+    return _evaluate_user_protocol_state(con, int(user_id))
+
+
 def _collect_xray_user_traffic(con: sqlite3.Connection, ts_iso: str) -> None:
     totals = _read_xray_user_totals()
     if not totals:
@@ -1989,6 +2158,9 @@ def _refresh_user_traffic_samples_once() -> None:
         _sync_xray_bindings_from_profiles(con)
         _collect_wireguard_user_traffic(con, ts_iso)
         _collect_xray_user_traffic(con, ts_iso)
+        user_rows = con.execute("SELECT id FROM users WHERE role = 'user'").fetchall()
+        for row in user_rows:
+            _evaluate_user_protocol_state(con, int(row["id"]))
         con.commit()
 
 
@@ -2597,6 +2769,17 @@ class UserWireGuardKeyRequest(BaseModel):
     label: str = "self-registered"
 
 
+class UserProtocolPreferenceRequest(BaseModel):
+    primary_protocol: str
+    fallback_protocol: str = ""
+    fail_threshold_seconds: int = DEFAULT_PROTOCOL_FAIL_THRESHOLD_SECONDS
+
+
+class UserProtocolSwitchConfirmRequest(BaseModel):
+    active_protocol: str
+    note: str = ""
+
+
 class UserProfileUpdateRequest(BaseModel):
     username: str
     email: str
@@ -2789,12 +2972,63 @@ def startup() -> None:
             )
             """
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_protocol_state (
+                user_id INTEGER PRIMARY KEY,
+                primary_protocol TEXT NOT NULL DEFAULT 'xray',
+                fallback_protocol TEXT NOT NULL DEFAULT '',
+                current_protocol TEXT NOT NULL DEFAULT '',
+                switch_recommended INTEGER NOT NULL DEFAULT 0,
+                switch_reason TEXT NOT NULL DEFAULT '',
+                primary_failed_since TEXT NOT NULL DEFAULT '',
+                fail_threshold_seconds INTEGER NOT NULL DEFAULT 120,
+                last_switch_at TEXT NOT NULL DEFAULT '',
+                last_switch_note TEXT NOT NULL DEFAULT '',
+                last_evaluated_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         _ensure_column(con, "user_access_profiles", "last_device_type", "last_device_type TEXT NOT NULL DEFAULT 'mobile'")
         _ensure_column(con, "user_access_profiles", "last_platform", "last_platform TEXT NOT NULL DEFAULT 'apple'")
         _ensure_column(
             con, "user_access_profiles", "last_region_profile", "last_region_profile TEXT NOT NULL DEFAULT 'ru'"
         )
         _ensure_column(con, "user_access_profiles", "wg_public_key", "wg_public_key TEXT NOT NULL DEFAULT ''")
+        _ensure_column(
+            con, "user_protocol_state", "primary_protocol", "primary_protocol TEXT NOT NULL DEFAULT 'xray'"
+        )
+        _ensure_column(
+            con, "user_protocol_state", "fallback_protocol", "fallback_protocol TEXT NOT NULL DEFAULT ''"
+        )
+        _ensure_column(
+            con, "user_protocol_state", "current_protocol", "current_protocol TEXT NOT NULL DEFAULT ''"
+        )
+        _ensure_column(
+            con, "user_protocol_state", "switch_recommended", "switch_recommended INTEGER NOT NULL DEFAULT 0"
+        )
+        _ensure_column(
+            con, "user_protocol_state", "switch_reason", "switch_reason TEXT NOT NULL DEFAULT ''"
+        )
+        _ensure_column(
+            con, "user_protocol_state", "primary_failed_since", "primary_failed_since TEXT NOT NULL DEFAULT ''"
+        )
+        _ensure_column(
+            con,
+            "user_protocol_state",
+            "fail_threshold_seconds",
+            f"fail_threshold_seconds INTEGER NOT NULL DEFAULT {DEFAULT_PROTOCOL_FAIL_THRESHOLD_SECONDS}",
+        )
+        _ensure_column(
+            con, "user_protocol_state", "last_switch_at", "last_switch_at TEXT NOT NULL DEFAULT ''"
+        )
+        _ensure_column(
+            con, "user_protocol_state", "last_switch_note", "last_switch_note TEXT NOT NULL DEFAULT ''"
+        )
+        _ensure_column(
+            con, "user_protocol_state", "last_evaluated_at", "last_evaluated_at TEXT NOT NULL DEFAULT ''"
+        )
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS registration_requests (
@@ -3273,24 +3507,42 @@ def cabinet(request: Request) -> HTMLResponse:
     </div>
     <button data-action="load-device-card">Load card</button>
   </div>
-  <div style="margin-top:10px;display:grid;grid-template-columns:2fr 1fr auto;gap:8px;align-items:end;">
-    <div>
-      <div class="label-muted">WireGuard public key (paired mode)</div>
-      <input id="wg-public-key" placeholder="Paste device WG public key (base64, 44 chars)" />
-    </div>
-    <div>
-      <div class="label-muted">Label</div>
-      <input id="wg-public-key-label" placeholder="phone / laptop" />
-    </div>
-    <button data-action="register-wg-key">Register key</button>
-  </div>
-  <pre id="wg-register-out" style="margin-top:8px;">WG key: not registered</pre>
   <div id="device-card-out" style="margin-top:12px;"></div>
 </div>
 <div class="card cab-section" data-cab-section="traffic">
   <h2>Traffic and resource usage</h2>
   <p class="muted">Live counters and aggregated usage for your profile.</p>
   <div id="cab-paired-status" class="muted" style="margin-bottom:8px;">Paired status: loading...</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto auto;gap:8px;align-items:end;margin-bottom:8px;">
+    <div>
+      <div class="label-muted">Primary protocol</div>
+      <select id="proto-primary" style="width:100%;padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);">
+        <option value="xray">xray</option>
+        <option value="wireguard">wireguard</option>
+      </select>
+    </div>
+    <div>
+      <div class="label-muted">Fallback protocol</div>
+      <select id="proto-fallback" style="width:100%;padding:10px;border-radius:8px;background:rgba(255,255,255,0.76);color:#1f2937;border:1px solid rgba(50,65,90,0.18);">
+        <option value="">none</option>
+        <option value="xray">xray</option>
+        <option value="wireguard">wireguard</option>
+      </select>
+    </div>
+    <div>
+      <div class="label-muted">T_fail (sec)</div>
+      <input id="proto-tfail" type="number" min="30" step="10" value="120" />
+    </div>
+    <button class="btn-ghost" data-action="save-protocol-preference">Save protocol policy</button>
+    <button class="btn-ghost" data-action="confirm-protocol-switch">Confirm active protocol</button>
+  </div>
+  <pre id="proto-state-out" style="margin-top:0;">Protocol policy: loading...</pre>
+  <div id="proto-switch-alert" style="display:none;margin:8px 0;padding:10px 12px;border-radius:10px;border:1px solid rgba(245,158,11,0.35);background:rgba(245,158,11,0.12);color:#78350f;"></div>
+  <div style="display:flex;gap:8px;align-items:center;margin:8px 0;">
+    <button class="btn-ghost" data-action="show-switch-guide">Show switch guide</button>
+    <span class="muted">Personalized fallback instructions for your current state.</span>
+  </div>
+  <pre id="proto-switch-guide" style="margin-top:0;">Switch guide: loading...</pre>
   <div id="cab-traffic-resources" class="muted">Resources: loading...</div>
   <div style="overflow:auto;margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);">
     <table style="width:100%;border-collapse:collapse;">
@@ -3353,6 +3605,19 @@ function refreshPlatformOptions() {{
   const options = type === 'mobile' ? ['apple', 'android'] : ['apple', 'linux', 'windows'];
   platformEl.innerHTML = options.map(o => `<option value="${{o}}">${{o}}</option>`).join('');
 }}
+function defaultWireGuardLabel() {{
+  const type = String((document.getElementById('dev-type') || {{}}).value || 'mobile').toLowerCase();
+  const platform = String((document.getElementById('dev-platform') || {{}}).value || 'apple').toLowerCase();
+  return 'auto-' + type + '-' + platform;
+}}
+function ensureWireGuardLabel(force = false) {{
+  const labelEl = document.getElementById('wg-public-key-label');
+  if (!labelEl) return;
+  const current = String(labelEl.value || '').trim();
+  if (force || !current || current === 'self-registered' || current.startsWith('auto-')) {{
+    labelEl.value = defaultWireGuardLabel();
+  }}
+}}
 function renderDeviceCard(card) {{
   const out = document.getElementById('device-card-out');
   if (!out) return;
@@ -3367,6 +3632,15 @@ function renderDeviceCard(card) {{
   const fallbackLabel = escHtml(primary.fallback_label || 'mirror');
   const source = escHtml(primary.source || 'source');
   const clientName = escHtml(primary.name || card.client_app || 'Client');
+  const wgClient = card.wireguard_client || {{}};
+  const wgClientName = escHtml(wgClient.name || 'WireGuard');
+  const wgInstallUrl = escHtml(wgClient.install_url || '');
+  const wgSource = escHtml(wgClient.source || 'source');
+  const wgFallbackUrl = escHtml(wgClient.fallback_url || '');
+  const wgFallbackLabel = escHtml(wgClient.fallback_label || 'mirror');
+  const wgAbout = escHtml(card.wireguard_about || 'Install WireGuard client for paired mode fallback.');
+  const wgPlatformTag = escHtml(card.wireguard_platform_tag || '');
+  const wgInstructionRows = (card.wireguard_instructions || []).map((s, i) => `<li>${{i + 1}}. ${{escHtml(s)}}</li>`).join('');
   const fields = card.config_fields || {{}};
   const fieldRows = [
     ['Address', fields.server],
@@ -3399,6 +3673,36 @@ function renderDeviceCard(card) {{
   const fallbackHtml = fallbackUrl
     ? `<div class="muted" style="margin-top:6px;">If install page is unavailable, use <a href="${{fallbackUrl}}" target="_blank" rel="noopener noreferrer">${{fallbackLabel}}</a>.</div>`
     : '';
+  const wgFallbackHtml = wgFallbackUrl
+    ? `<div class="muted" style="margin-top:6px;">If WG install page is unavailable, use <a href="${{wgFallbackUrl}}" target="_blank" rel="noopener noreferrer">${{wgFallbackLabel}}</a>.</div>`
+    : '';
+  const wgClientHtml = wgInstallUrl
+    ? `
+      <h4 style="margin:12px 0 6px;">WireGuard client (paired mode)</h4>
+      <div style="margin-top:10px;display:grid;grid-template-columns:2fr 1fr auto;gap:8px;align-items:end;">
+        <div>
+          <div class="label-muted">WireGuard public key (paired mode)</div>
+          <input id="wg-public-key" placeholder="Paste device WG public key (base64, 44 chars)" />
+        </div>
+        <div>
+          <div class="label-muted">Label</div>
+          <input id="wg-public-key-label" placeholder="phone / laptop" />
+        </div>
+        <button data-action="register-wg-key">Register key</button>
+      </div>
+      <pre id="wg-register-out" style="margin-top:8px;">WG key: not registered</pre>
+      <p class="muted" style="margin:6px 0 8px;">${{wgAbout}}</p>
+      <div style="margin-top:8px;">
+        <a href="${{wgInstallUrl}}" target="_blank" rel="noopener noreferrer"><button>Install ${{wgClientName}}</button></a>
+        <span class="status-pill status-stopped" style="margin-left:8px;">${{wgSource}}</span>
+      </div>
+      ${{wgFallbackHtml}}
+      <details style="margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);padding:8px 10px;">
+        <summary style="cursor:pointer;font-weight:600;">WireGuard instructions${{wgPlatformTag ? (' (' + wgPlatformTag + ')') : ''}}</summary>
+        <ul style="margin:8px 0 4px 14px;padding:0;">${{wgInstructionRows || '<li class="muted">No WireGuard instructions.</li>'}}</ul>
+      </details>
+    `
+    : '';
   out.innerHTML = `
     <div class="card" style="margin-bottom:0;">
       <h3 style="margin-top:0;">${{escHtml(card.title || 'Configuration')}}</h3>
@@ -3408,26 +3712,31 @@ function renderDeviceCard(card) {{
       <div style="margin-top:8px;">
         <button class="btn-ghost" data-action="copy-config-uri">Copy URI</button>
       </div>
-      <h4 style="margin:12px 0 6px;">Manual fields (client menu)</h4>
-      <div style="overflow:auto;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);">
-        <table style="width:100%;border-collapse:collapse;">
-          <thead>
-            <tr>
-              <th style="text-align:left;padding:8px;">Field</th>
-              <th style="text-align:left;padding:8px;">Value</th>
-              <th style="text-align:right;padding:8px;">Action</th>
-            </tr>
-          </thead>
-          <tbody>${{fieldRows || '<tr><td colspan="3" style="padding:8px;" class="muted">No manual fields.</td></tr>'}}</tbody>
-        </table>
-      </div>
+      <details style="margin-top:12px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);padding:8px 10px;">
+        <summary style="cursor:pointer;font-weight:600;">Manual fields (client menu)</summary>
+        <div style="overflow:auto;margin-top:8px;">
+          <table style="width:100%;border-collapse:collapse;">
+            <thead>
+              <tr>
+                <th style="text-align:left;padding:8px;">Field</th>
+                <th style="text-align:left;padding:8px;">Value</th>
+                <th style="text-align:right;padding:8px;">Action</th>
+              </tr>
+            </thead>
+            <tbody>${{fieldRows || '<tr><td colspan="3" style="padding:8px;" class="muted">No manual fields.</td></tr>'}}</tbody>
+          </table>
+        </div>
+      </details>
       <div style="margin-top:8px;">
         <a href="${{installUrl}}" target="_blank" rel="noopener noreferrer"><button>Install ${{clientName}}</button></a>
         <span class="status-pill status-stopped" style="margin-left:8px;">${{source}}</span>
       </div>
       ${{fallbackHtml}}
-      <h4 style="margin:12px 0 6px;">Instructions</h4>
-      <ul style="margin:0 0 4px 14px;padding:0;">${{lines}}</ul>
+      <details open style="margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);padding:8px 10px;">
+        <summary style="cursor:pointer;font-weight:600;">Instructions</summary>
+        <ul style="margin:8px 0 4px 14px;padding:0;">${{lines}}</ul>
+      </details>
+      ${{wgClientHtml}}
     </div>
   `;
 }}
@@ -3468,15 +3777,147 @@ function pairedBadge(state) {{
   if (s === 'degraded') return '<span class="status-pill status-pending">degraded</span>';
   return '<span class="status-pill status-in_error">incomplete</span>';
 }}
-function renderCabinetPairedStatus(paired) {{
+function getPlatformContext() {{
+  const typeEl = document.getElementById('dev-type');
+  const platformEl = document.getElementById('dev-platform');
+  const deviceType = String((typeEl && typeEl.value) || 'mobile').toLowerCase();
+  const platform = String((platformEl && platformEl.value) || 'apple').toLowerCase();
+  return {{deviceType, platform}};
+}}
+function protocolClientLabel(protocol, ctx) {{
+  const p = String(protocol || '').toLowerCase();
+  const deviceType = String((ctx || {{}}).deviceType || 'mobile');
+  const platform = String((ctx || {{}}).platform || 'apple');
+  if (p === 'wireguard') {{
+    if (deviceType === 'mobile' && platform === 'apple') return 'WireGuard (iOS)';
+    if (deviceType === 'mobile' && platform === 'android') return 'WireGuard (Android)';
+    if (deviceType === 'desktop' && platform === 'windows') return 'WireGuard for Windows';
+    if (deviceType === 'desktop' && platform === 'apple') return 'WireGuard (macOS)';
+    if (deviceType === 'desktop' && platform === 'linux') return 'WireGuard (Linux)';
+    return 'WireGuard client';
+  }}
+  if (p === 'xray') {{
+    if (deviceType === 'mobile' && platform === 'apple') return 'Karing';
+    if (deviceType === 'mobile' && platform === 'android') return 'Hiddify Next / v2rayNG';
+    if (deviceType === 'desktop' && platform === 'windows') return 'v2rayN';
+    if (deviceType === 'desktop' && platform === 'apple') return 'V2rayU';
+    if (deviceType === 'desktop' && platform === 'linux') return 'Karing';
+    return 'Xray client';
+  }}
+  return protocol || 'client';
+}}
+function renderSwitchAlert(protocolState) {{
+  const el = document.getElementById('proto-switch-alert');
+  if (!el) return;
+  const st = protocolState || {{}};
+  const recommended = !!st.switch_recommended;
+  if (!recommended) {{
+    el.style.display = 'none';
+    el.textContent = '';
+    return;
+  }}
+  const fromProtocol = String(st.current_protocol || st.primary_protocol || 'primary');
+  const toProtocol = String(st.fallback_protocol || 'fallback');
+  const reason = String(st.switch_reason || 'fallback condition detected');
+  const ctx = getPlatformContext();
+  const fromClient = protocolClientLabel(fromProtocol, ctx);
+  const toClient = protocolClientLabel(toProtocol, ctx);
+  const message = 'Fallback event detected. Switch client from ' + fromProtocol + ' (' + fromClient + ') to ' +
+    toProtocol + ' (' + toClient + '). Reason: ' + reason + '.';
+  el.textContent = message;
+  el.style.display = '';
+  const noticeKey = [fromProtocol, toProtocol, reason, ctx.deviceType, ctx.platform].join('|');
+  if (window.__lastFallbackNoticeKey !== noticeKey && window.Notification) {{
+    try {{
+      if (Notification.permission === 'granted') {{
+        new Notification('proxy-vpn: fallback switch', {{ body: message }});
+      }} else if (Notification.permission !== 'denied') {{
+        Notification.requestPermission().then((perm) => {{
+          if (perm === 'granted') new Notification('proxy-vpn: fallback switch', {{ body: message }});
+        }});
+      }}
+    }} catch (e) {{}}
+  }}
+  window.__lastFallbackNoticeKey = noticeKey;
+}}
+function buildSwitchGuide(protocolState) {{
+  const st = protocolState || {{}};
+  const mode = String(st.mode || 'unconfigured');
+  const primary = String(st.primary_protocol || '-');
+  const fallback = String(st.fallback_protocol || '');
+  const current = String(st.current_protocol || '-');
+  const recommended = !!st.switch_recommended;
+  const reason = String(st.switch_reason || '');
+  const lines = [];
+  lines.push('Mode: ' + mode + ' | primary=' + primary + ' | fallback=' + (fallback || 'none') + ' | current=' + current);
+  if (!recommended) {{
+    lines.push('No immediate switch required.');
+    lines.push('If connectivity degrades, reopen this guide and follow fallback steps.');
+    return lines.join('\\n');
+  }}
+  lines.push('Switch recommended: YES');
+  lines.push('Reason: ' + (reason || 'primary degradation detected'));
+  if (!fallback) {{
+    lines.push('Fallback protocol is not configured for this account.');
+    lines.push('Action: set fallback protocol in policy, then prepare second client profile.');
+    return lines.join('\\n');
+  }}
+  if (fallback === 'wireguard') {{
+    lines.push('1) Open your WireGuard client and activate tunnel for this account.');
+    lines.push('2) Disable/stop Xray client tunnel to avoid route conflicts.');
+    lines.push('3) Verify internet access through fallback path.');
+    lines.push('4) In this cabinet set active protocol=wireguard and click "Confirm active protocol".');
+    return lines.join('\\n');
+  }}
+  if (fallback === 'xray') {{
+    lines.push('1) Open your Xray client (Karing/v2rayN/V2rayU) and activate this profile.');
+    lines.push('2) Disable/stop WireGuard tunnel to avoid route conflicts.');
+    lines.push('3) Verify blocked resources are accessible.');
+    lines.push('4) In this cabinet set active protocol=xray and click "Confirm active protocol".');
+    return lines.join('\\n');
+  }}
+  lines.push('Fallback protocol "' + fallback + '" is unknown.');
+  return lines.join('\\n');
+}}
+function renderSwitchGuide(protocolState) {{
+  const el = document.getElementById('proto-switch-guide');
+  if (!el) return;
+  el.textContent = buildSwitchGuide(protocolState);
+}}
+function renderCabinetPairedStatus(paired, protocolState) {{
   const root = document.getElementById('cab-paired-status');
   if (!root) return;
   const p = paired || {{}};
   const wg = p.wg || {{}};
   const xray = p.xray || {{}};
+  const st = protocolState || {{}};
+  const protoPrimary = String(st.primary_protocol || '');
+  const protoFallback = String(st.fallback_protocol || '');
+  const protoCurrent = String(st.current_protocol || '');
+  const switchRecommended = !!st.switch_recommended;
+  const switchReason = String(st.switch_reason || '');
   root.innerHTML = 'Paired status: ' + pairedBadge(p.status) +
     ' · WG: ' + (wg.bound ? 'bound' : 'not bound') + ', ' + (wg.active ? 'active' : 'idle') +
-    ' · Xray: ' + (xray.bound ? 'bound' : 'not bound') + ', ' + (xray.active ? 'active' : 'idle');
+    ' · Xray: ' + (xray.bound ? 'bound' : 'not bound') + ', ' + (xray.active ? 'active' : 'idle') +
+    ' · policy: primary=' + (protoPrimary || '-') + ', fallback=' + (protoFallback || 'none') + ', current=' + (protoCurrent || '-') +
+    (switchRecommended ? (' · switch recommended: ' + escHtml(switchReason || 'check protocol state')) : '');
+  const pOut = document.getElementById('proto-state-out');
+  if (pOut) {{
+    pOut.textContent = 'Mode: ' + String(st.mode || 'unconfigured') +
+      ' | primary=' + (protoPrimary || '-') +
+      ' | fallback=' + (protoFallback || 'none') +
+      ' | current=' + (protoCurrent || '-') +
+      ' | T_fail=' + String(st.fail_threshold_seconds || '-') + 's' +
+      (switchRecommended ? (' | SWITCH: ' + (switchReason || 'recommended')) : '');
+  }}
+  const primaryEl = document.getElementById('proto-primary');
+  const fallbackEl = document.getElementById('proto-fallback');
+  const tfailEl = document.getElementById('proto-tfail');
+  if (primaryEl && protoPrimary) primaryEl.value = protoPrimary;
+  if (fallbackEl) fallbackEl.value = protoFallback;
+  if (tfailEl && st.fail_threshold_seconds) tfailEl.value = String(st.fail_threshold_seconds);
+  renderSwitchAlert(st);
+  renderSwitchGuide(st);
 }}
 function renderCabinetTrafficChart(points) {{
   const canvas = document.getElementById('cab-traffic-canvas');
@@ -3519,15 +3960,74 @@ async function loadCabinetTraffic() {{
   }}
   if (pairedR.ok) {{
     const d = await pairedR.json();
-    renderCabinetPairedStatus(d.paired || {{}});
+    renderCabinetPairedStatus(d.paired || {{}}, d.protocol_state || {{}});
   }}
+}}
+async function saveProtocolPreference() {{
+  const primaryEl = document.getElementById('proto-primary');
+  const fallbackEl = document.getElementById('proto-fallback');
+  const tfailEl = document.getElementById('proto-tfail');
+  const out = document.getElementById('proto-state-out');
+  const primary_protocol = String((primaryEl && primaryEl.value) || '').trim();
+  const fallback_protocol = String((fallbackEl && fallbackEl.value) || '').trim();
+  const fail_threshold_seconds = Number((tfailEl && tfailEl.value) || 120);
+  if (!primary_protocol) {{
+    if (out) out.textContent = 'Primary protocol is required.';
+    return;
+  }}
+  if (out) out.textContent = 'Saving protocol policy...';
+  const r = await fetch('/api/v1/user/protocol/preference', {{
+    method:'POST',
+    headers: {{'Content-Type':'application/json', 'X-CSRF-Token': getCsrfToken()}},
+    body: JSON.stringify({{primary_protocol, fallback_protocol, fail_threshold_seconds}})
+  }});
+  const t = await r.text();
+  if (!r.ok) {{
+    if (out) out.textContent = t;
+    return;
+  }}
+  let j = null;
+  try {{ j = JSON.parse(t); }} catch (e) {{ j = null; }}
+  if (j && j.protocol_state) {{
+    renderCabinetPairedStatus(null, j.protocol_state);
+  }}
+  if (out) out.textContent = (j && j.message) ? j.message : t;
+}}
+async function confirmProtocolSwitch() {{
+  const out = document.getElementById('proto-state-out');
+  const primaryEl = document.getElementById('proto-primary');
+  const active_protocol = String((primaryEl && primaryEl.value) || '').trim();
+  if (!active_protocol) {{
+    if (out) out.textContent = 'Select active protocol first.';
+    return;
+  }}
+  if (out) out.textContent = 'Confirming active protocol...';
+  const r = await fetch('/api/v1/user/protocol/switch-confirm', {{
+    method:'POST',
+    headers: {{'Content-Type':'application/json', 'X-CSRF-Token': getCsrfToken()}},
+    body: JSON.stringify({{active_protocol, note: 'confirmed from cabinet'}})
+  }});
+  const t = await r.text();
+  if (!r.ok) {{
+    if (out) out.textContent = t;
+    return;
+  }}
+  if (out) out.textContent = t;
+  await loadCabinetTraffic();
+}}
+async function showSwitchGuideNow() {{
+  const r = await fetch('/api/v1/user/paired-status');
+  if (!r.ok) return;
+  const d = await r.json();
+  renderSwitchGuide(d.protocol_state || {{}});
 }}
 async function registerWireGuardKey() {{
   const keyEl = document.getElementById('wg-public-key');
   const labelEl = document.getElementById('wg-public-key-label');
   const out = document.getElementById('wg-register-out');
   const public_key = String((keyEl && keyEl.value) || '').trim();
-  const label = String((labelEl && labelEl.value) || '').trim() || 'self-registered';
+  const rawLabel = String((labelEl && labelEl.value) || '').trim();
+  const label = rawLabel || defaultWireGuardLabel();
   if (!public_key) {{
     if (out) out.textContent = 'WireGuard key is required.';
     return;
@@ -3561,10 +4061,11 @@ async function loadDeviceCard() {{
   }}
   let j = null;
   try {{ j = JSON.parse(t); }} catch (e) {{ j = null; }}
-  const wgInput = document.getElementById('wg-public-key');
   const wgKey = String(((((j || {{}}).card || {{}}).config_fields || {{}}).wireguard_public_key) || '');
-  if (wgInput && wgKey) wgInput.value = wgKey;
   renderDeviceCard(j ? j.card : null);
+  ensureWireGuardLabel(true);
+  const wgInput = document.getElementById('wg-public-key');
+  if (wgInput && wgKey) wgInput.value = wgKey;
 }}
 async function initDeviceCard() {{
   const out = document.getElementById('device-card-out');
@@ -3588,10 +4089,11 @@ async function initDeviceCard() {{
   refreshPlatformOptions();
   if (platformEl && j.platform) platformEl.value = j.platform;
   if (regionEl && j.region_profile) regionEl.value = j.region_profile;
-  const wgInput = document.getElementById('wg-public-key');
   const wgKey = String((((j.card || {{}}).config_fields || {{}}).wireguard_public_key) || '');
-  if (wgInput && wgKey) wgInput.value = wgKey;
   renderDeviceCard(j.card || null);
+  ensureWireGuardLabel(true);
+  const wgInput = document.getElementById('wg-public-key');
+  if (wgInput && wgKey) wgInput.value = wgKey;
 }}
 async function saveProfile() {{
   const username = document.getElementById('cab-username').value.trim();
@@ -3616,10 +4118,16 @@ async function saveProfile() {{
 }}
 document.getElementById('dev-type').addEventListener('change', () => {{
   refreshPlatformOptions();
+  ensureWireGuardLabel(true);
   loadDeviceCard();
 }});
 document.getElementById('dev-region').addEventListener('change', () => {{
   loadDeviceCard();
+}});
+document.getElementById('dev-platform').addEventListener('change', () => {{
+  ensureWireGuardLabel(true);
+  loadDeviceCard();
+  loadCabinetTraffic();
 }});
 document.addEventListener('click', (event) => {{
   const target = event.target;
@@ -3644,6 +4152,9 @@ document.addEventListener('click', (event) => {{
   if (action === 'save-profile') return void saveProfile();
   if (action === 'load-device-card') return void loadDeviceCard();
   if (action === 'register-wg-key') return void registerWireGuardKey();
+  if (action === 'save-protocol-preference') return void saveProtocolPreference();
+  if (action === 'confirm-protocol-switch') return void confirmProtocolSwitch();
+  if (action === 'show-switch-guide') return void showSwitchGuideNow();
   if (action === 'copy-config-uri') return void copyConfigUri();
   if (action === 'copy-value') {{
     const encoded = String(btn.getAttribute('data-copy-value') || '');
@@ -3651,6 +4162,7 @@ document.addEventListener('click', (event) => {{
   }}
 }});
 refreshPlatformOptions();
+ensureWireGuardLabel(true);
 showCabSection('profile');
 initDeviceCard();
 loadCabinetTraffic();
@@ -4090,9 +4602,9 @@ def admin(request: Request) -> HTMLResponse:
   <p class="muted">Each user should have both bindings and recent traffic on both transports in the activity window.</p>
   <table style="width:100%; border-collapse:collapse;">
     <thead>
-      <tr><th align="left">User</th><th align="left">Role</th><th align="left">Pair status</th><th align="left">WG</th><th align="left">Xray</th></tr>
+      <tr><th align="left">User</th><th align="left">Role</th><th align="left">Pair status</th><th align="left">Protocol policy</th><th align="left">WG</th><th align="left">Xray</th></tr>
     </thead>
-    <tbody id="paired-status-body"><tr><td colspan="5" class="muted">Loading...</td></tr></tbody>
+    <tbody id="paired-status-body"><tr><td colspan="6" class="muted">Loading...</td></tr></tbody>
   </table>
 </div>
 
@@ -4640,7 +5152,7 @@ function renderAdminPairedStatus(items) {{
   const body = document.getElementById('paired-status-body');
   if (!body) return;
   if (!items || items.length === 0) {{
-    body.innerHTML = '<tr><td colspan="5" class="muted">No users.</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" class="muted">No users.</td></tr>';
     return;
   }}
   const badge = (s) => {{
@@ -4651,14 +5163,21 @@ function renderAdminPairedStatus(items) {{
   }};
   body.innerHTML = items.map((i) => {{
     const p = i.paired || {{}};
+    const ps = i.protocol_state || {{}};
     const wg = p.wg || {{}};
     const xray = p.xray || {{}};
+    const policy = 'mode=' + String(ps.mode || 'unconfigured') +
+      ' · primary=' + String(ps.primary_protocol || '-') +
+      ' · fallback=' + String(ps.fallback_protocol || 'none') +
+      ' · current=' + String(ps.current_protocol || '-') +
+      (ps.switch_recommended ? (' · SWITCH: ' + String(ps.switch_reason || 'recommended')) : '');
     const wgText = (wg.bound ? 'bound' : 'missing') + ' · ' + (wg.active ? 'active' : 'idle') + ' · ' + fmtBytes(wg.recent_bytes || 0);
     const xText = (xray.bound ? 'bound' : 'missing') + ' · ' + (xray.active ? 'active' : 'idle') + ' · ' + fmtBytes(xray.recent_bytes || 0);
     return `<tr>
       <td>${{escHtml(i.username || '-')}}<br><span class="muted">${{escHtml(i.email || '-')}}</span></td>
       <td>${{escHtml(i.role || '-')}}</td>
       <td>${{badge(p.status)}}</td>
+      <td>${{escHtml(policy)}}</td>
       <td>${{escHtml(wgText)}}</td>
       <td>${{escHtml(xText)}}</td>
     </tr>`;
@@ -5543,7 +6062,65 @@ def user_register_wireguard_key(request: Request, payload: UserWireGuardKeyReque
     key = _normalize_wg_public_key(payload.public_key)
     _set_user_wg_public_key(int(user["id"]), key)
     _ensure_wg_binding_for_user(int(user["id"]), key, payload.label or "self-registered")
+    with _db_connect() as con:
+        _evaluate_user_protocol_state(con, int(user["id"]))
+        con.commit()
     return JSONResponse({"status": "ok", "message": "WireGuard public key registered and bound"})
+
+
+@app.post("/api/v1/user/protocol/preference")
+def user_protocol_preference(request: Request, payload: UserProtocolPreferenceRequest) -> JSONResponse:
+    _ensure_csrf(request)
+    user = _require_user(request)
+    primary = _normalize_protocol_name(payload.primary_protocol)
+    fallback = _normalize_protocol_name(payload.fallback_protocol)
+    if not primary:
+        raise HTTPException(status_code=400, detail="primary_protocol must be xray or wireguard")
+    if fallback == primary:
+        fallback = ""
+    threshold = max(30, int(payload.fail_threshold_seconds or DEFAULT_PROTOCOL_FAIL_THRESHOLD_SECONDS))
+    with _db_connect() as con:
+        _ensure_user_protocol_state_row(con, int(user["id"]))
+        bindings = _protocol_binding_flags(con, int(user["id"]))
+        if not bindings.get(primary, False):
+            raise HTTPException(status_code=400, detail=f"primary_protocol '{primary}' is not configured for this user")
+        if fallback and not bindings.get(fallback, False):
+            raise HTTPException(status_code=400, detail=f"fallback_protocol '{fallback}' is not configured for this user")
+        con.execute(
+            """
+            UPDATE user_protocol_state
+            SET primary_protocol = ?, fallback_protocol = ?, fail_threshold_seconds = ?, updated_at = ?
+            WHERE user_id = ?
+            """,
+            (primary, fallback, threshold, _now().isoformat(), int(user["id"])),
+        )
+        state = _evaluate_user_protocol_state(con, int(user["id"]))
+        con.commit()
+    return JSONResponse({"status": "ok", "message": "protocol preference updated", "protocol_state": state})
+
+
+@app.post("/api/v1/user/protocol/switch-confirm")
+def user_protocol_switch_confirm(request: Request, payload: UserProtocolSwitchConfirmRequest) -> JSONResponse:
+    _ensure_csrf(request)
+    user = _require_user(request)
+    active_protocol = _normalize_protocol_name(payload.active_protocol)
+    if not active_protocol:
+        raise HTTPException(status_code=400, detail="active_protocol must be xray or wireguard")
+    note = str(payload.note or "").strip()
+    with _db_connect() as con:
+        _ensure_user_protocol_state_row(con, int(user["id"]))
+        con.execute(
+            """
+            UPDATE user_protocol_state
+            SET current_protocol = ?, switch_recommended = 0, switch_reason = '', primary_failed_since = '',
+                last_switch_at = ?, last_switch_note = ?, updated_at = ?
+            WHERE user_id = ?
+            """,
+            (active_protocol, _now().isoformat(), note, _now().isoformat(), int(user["id"])),
+        )
+        state = _evaluate_user_protocol_state(con, int(user["id"]))
+        con.commit()
+    return JSONResponse({"status": "ok", "message": "switch confirmed", "protocol_state": state})
 
 
 @app.get("/api/v1/user/paired-status")
@@ -5552,7 +6129,8 @@ def user_paired_status(request: Request) -> JSONResponse:
     _refresh_user_traffic_samples_once()
     with _db_connect() as con:
         paired = _paired_status_for_user(con, int(user["id"]))
-    return JSONResponse({"status": "ok", "paired": paired})
+        protocol_state = _get_user_protocol_state(con, int(user["id"]))
+    return JSONResponse({"status": "ok", "paired": paired, "protocol_state": protocol_state})
 
 
 @app.get("/api/v1/user/device-config")
@@ -5624,6 +6202,11 @@ def user_device_config(
     primary_client: dict[str, str] = {}
     client_candidates: list[dict[str, str]] = []
     client_about = "Free client for importing VLESS URI and connecting in VPN/proxy mode."
+    wg_client: dict[str, str] = {}
+    wg_candidates: list[dict[str, str]] = []
+    wg_about = "WireGuard client is required for paired mode fallback path."
+    wg_platform_tag = "generic"
+    wg_instructions: list[str] = []
     if device_type == "mobile" and platform == "apple":
         app_name = "Hiddify Next / Karing (free)"
         client_candidates = [
@@ -5642,6 +6225,23 @@ def user_device_config(
             bypass_hint,
             "Alternative quick path: Profiles -> + -> Import from Clipboard, then paste Config URI from this card.",
             "Tap Save -> Connect/Start tunnel -> open blocked site and verify traffic.",
+        ]
+        wg_candidates = [
+            {
+                "name": "WireGuard",
+                "install_url": "https://apps.apple.com/us/app/wireguard/id1441195209",
+                "source": "store",
+            }
+        ]
+        wg_about = "Install WireGuard for iOS to keep fallback path ready in paired mode."
+        wg_platform_tag = "iOS"
+        wg_instructions = [
+            "Install WireGuard from App Store using the button below.",
+            "WireGuard menu: Add a tunnel -> Create from QR code (recommended) or Create from file/archive.",
+            "Activate the tunnel and verify internet connectivity.",
+            "WireGuard menu: open tunnel details -> copy Public key.",
+            "Register this public key in User cabinet -> Device setup to enable paired fallback tracking.",
+            "When fallback is recommended, switch to this WireGuard tunnel and confirm active protocol in cabinet.",
         ]
     elif device_type == "mobile" and platform == "android":
         app_name = "v2rayNG / Hiddify Next (free)"
@@ -5667,6 +6267,28 @@ def user_device_config(
             "If profile form is unavailable, use Import from Clipboard and paste Config URI from this card.",
             "Tap Connect (Android VPN permission prompt -> Allow) and verify blocked resource access.",
         ]
+        wg_candidates = [
+            {
+                "name": "WireGuard",
+                "install_url": "https://play.google.com/store/apps/details?id=com.wireguard.android",
+                "source": "store",
+            },
+            {
+                "name": "WireGuard (GitHub)",
+                "install_url": "https://github.com/WireGuard/wireguard-android/releases",
+                "source": "github",
+            },
+        ]
+        wg_about = "Install WireGuard for Android to be able to switch from Xray on fallback events."
+        wg_platform_tag = "Android"
+        wg_instructions = [
+            "Install WireGuard from Google Play (or GitHub fallback) using the button below.",
+            "WireGuard menu: + -> Create from QR code or Import from file/archive.",
+            "Enable the tunnel (Android VPN permission -> Allow) and verify connectivity.",
+            "Open tunnel details and copy Public key.",
+            "Register this public key in User cabinet -> Device setup for paired mode.",
+            "Use this WireGuard tunnel during fallback events and confirm protocol switch in cabinet.",
+        ]
     elif device_type == "desktop" and platform == "windows":
         app_name = "v2rayN"
         client_candidates = [
@@ -5685,6 +6307,23 @@ def user_device_config(
             bypass_hint,
             "Set created node as active -> System Proxy -> Set system proxy.",
             "Start service (if needed) and verify traffic in v2rayN logs + blocked resource test.",
+        ]
+        wg_candidates = [
+            {
+                "name": "WireGuard for Windows",
+                "install_url": "https://www.wireguard.com/install/",
+                "source": "official",
+            }
+        ]
+        wg_about = "Install WireGuard for Windows for fallback protocol readiness."
+        wg_platform_tag = "Windows"
+        wg_instructions = [
+            "Install WireGuard for Windows from the official page.",
+            "WireGuard menu: Add Tunnel -> Add empty tunnel (or Import tunnel(s) from file).",
+            "If using an empty tunnel, paste config from administrator and save.",
+            "Activate the tunnel and verify traffic routing.",
+            "Copy Public key from tunnel details and register it in User cabinet -> Device setup.",
+            "Keep tunnel ready and activate it when fallback is recommended.",
         ]
     elif device_type == "desktop" and platform == "apple":
         app_name = "Nekoray / V2rayU (free)"
@@ -5705,6 +6344,23 @@ def user_device_config(
             "Select server as active -> V2rayU -> Turn On V2rayU -> Set System Proxy (Auto/PAC).",
             "Open blocked resource and verify traffic through tunnel.",
         ]
+        wg_candidates = [
+            {
+                "name": "WireGuard (macOS)",
+                "install_url": "https://apps.apple.com/us/app/wireguard/id1451685025",
+                "source": "store",
+            }
+        ]
+        wg_about = "Install WireGuard for macOS to keep paired fallback available."
+        wg_platform_tag = "macOS"
+        wg_instructions = [
+            "Install WireGuard for macOS from App Store using the button below.",
+            "WireGuard menu: Add Tunnel -> Create from QR code or Import tunnel(s) from file.",
+            "Activate the tunnel and verify network access through it.",
+            "Open tunnel details and copy Public key.",
+            "Register this public key in User cabinet -> Device setup to bind WG traffic.",
+            "When fallback is recommended, switch to this tunnel and confirm in cabinet.",
+        ]
     elif device_type == "desktop" and platform == "linux":
         app_name = "Nekoray / sing-box GUI"
         client_candidates = [
@@ -5724,6 +6380,23 @@ def user_device_config(
             "Enable Tun or System Proxy mode (according to distro/network manager setup).",
             "Connect and validate access to blocked endpoint.",
         ]
+        wg_candidates = [
+            {
+                "name": "WireGuard (Linux)",
+                "install_url": "https://www.wireguard.com/install/",
+                "source": "official",
+            }
+        ]
+        wg_about = "Install WireGuard tools/client for Linux fallback mode."
+        wg_platform_tag = "Linux"
+        wg_instructions = [
+            "Install WireGuard tools from the official install page for your distro.",
+            "Create or import tunnel config file (e.g. /etc/wireguard/wg0.conf) from administrator.",
+            "Start tunnel via wg-quick or NetworkManager and verify connectivity.",
+            "Read Public key from config or generated keypair and copy it.",
+            "Register public key in User cabinet -> Device setup for paired fallback operation.",
+            "Keep tunnel disabled by default and enable it when fallback switch is recommended.",
+        ]
 
     if client_candidates:
         store_client = next((c for c in client_candidates if c.get("source") == "store"), None)
@@ -5735,6 +6408,23 @@ def user_device_config(
 
     if not primary_client:
         primary_client = {"name": "Client", "install_url": "", "source": "unknown"}
+    if wg_candidates:
+        wg_primary = next((c for c in wg_candidates if c.get("source") == "store"), None)
+        wg_client = dict(wg_primary or wg_candidates[0])
+        wg_fallback = next((c for c in wg_candidates if c.get("install_url") != wg_client.get("install_url")), None)
+        if wg_fallback and wg_fallback.get("install_url"):
+            wg_client["fallback_url"] = str(wg_fallback["install_url"])
+            wg_client["fallback_label"] = f"{wg_fallback.get('name', 'Mirror')} ({wg_fallback.get('source', 'mirror')})"
+    if not wg_client:
+        wg_client = {"name": "WireGuard", "install_url": "", "source": "unknown"}
+    if not wg_instructions:
+        wg_instructions = [
+            "Install WireGuard client using the button below.",
+            "Create or import your WireGuard tunnel profile (from administrator config/QR).",
+            "Activate tunnel and verify connectivity.",
+            "Copy WireGuard public key and register it in User cabinet -> Device setup.",
+            "Use this tunnel when fallback is recommended and confirm active protocol in cabinet.",
+        ]
     instructions.append(
         "Paired mode requirement: register your device WireGuard public key in User cabinet -> Device setup so WG + Xray work together."
     )
@@ -5768,6 +6458,10 @@ def user_device_config(
                 "instructions": instructions,
                 "primary_client": primary_client,
                 "client_about": client_about,
+                "wireguard_client": wg_client,
+                "wireguard_about": wg_about,
+                "wireguard_platform_tag": wg_platform_tag,
+                "wireguard_instructions": wg_instructions,
             },
         }
     )
@@ -6340,6 +7034,7 @@ def admin_paired_status(request: Request) -> JSONResponse:
         items: list[dict[str, Any]] = []
         for u in users:
             paired = _paired_status_for_user(con, int(u["id"]))
+            protocol_state = _get_user_protocol_state(con, int(u["id"]))
             items.append(
                 {
                     "user_id": int(u["id"]),
@@ -6347,6 +7042,7 @@ def admin_paired_status(request: Request) -> JSONResponse:
                     "email": str(u["email"]),
                     "role": str(u["role"]),
                     "paired": paired,
+                    "protocol_state": protocol_state,
                 }
             )
     return JSONResponse({"status": "ok", "items": items, "window_seconds": PAIRED_ACTIVITY_WINDOW_SECONDS})
