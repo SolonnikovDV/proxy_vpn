@@ -541,6 +541,7 @@ Release notes source used by update UI:
 - version is taken from the first heading like `## vX.Y.Z`
 - notes are taken from that first section body (until next `##`)
 - build is current git short SHA; if `logs/app-release-state.json` is missing/stale, app falls back to live repo metadata (`RELEASE_NOTES.md` + `git rev-parse`)
+- `scripts/run.sh prod up|restart` refreshes `logs/app-release-state.json` automatically via `scripts/write-release-state.sh`
 
 Admin update audit table:
 - `/admin` -> `Overview` -> `Updates audit`

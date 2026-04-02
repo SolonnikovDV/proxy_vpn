@@ -112,6 +112,8 @@ run_prod_smoke_checks() {
 
 run_prod() {
   bash ./scripts/sync-env.sh prod
+  chmod +x ./scripts/write-release-state.sh >/dev/null 2>&1 || true
+  bash ./scripts/write-release-state.sh >/dev/null 2>&1 || true
   set -a
   . ./.env
   set +a
