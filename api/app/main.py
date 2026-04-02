@@ -2471,6 +2471,7 @@ def _wireguard_active_probe_for_public_key(public_key: str) -> dict[str, Any]:
     key = str(public_key or "").strip()
     wait_seconds = max(3, min(20, int(WG_ACTIVE_PROBE_SECONDS)))
     threshold = max(1024, int(WG_ACTIVE_PROBE_MIN_DELTA_BYTES))
+    now_ts = int(time.time())
     start_totals = _read_wg_runtime_totals_direct()
     start = start_totals.get(key, {})
     start_rx = int(start.get("rx_total", 0) or 0)
@@ -2485,7 +2486,12 @@ def _wireguard_active_probe_for_public_key(public_key: str) -> dict[str, Any]:
     delta_rx = max(0, end_rx - start_rx)
     delta_tx = max(0, end_tx - start_tx)
     delta_total = delta_rx + delta_tx
-    client_attempt_seen = bool(end_handshake > 0 and end_handshake != start_handshake)
+    handshake_was_recent_before_probe = bool(start_handshake > 0 and (now_ts - start_handshake) <= 300)
+    traffic_delta_seen = bool(delta_total > 0)
+    client_attempt_seen = bool(
+        (end_handshake > 0 and end_handshake != start_handshake)
+        or (handshake_was_recent_before_probe and traffic_delta_seen)
+    )
     verdict = "data_path_not_confirmed"
     note = "No meaningful traffic delta detected during active probe."
     if delta_total >= threshold:
@@ -2504,6 +2510,8 @@ def _wireguard_active_probe_for_public_key(public_key: str) -> dict[str, Any]:
         "end_tx_total": end_tx,
         "start_handshake": start_handshake,
         "end_handshake": end_handshake,
+        "handshake_was_recent_before_probe": bool(handshake_was_recent_before_probe),
+        "traffic_delta_seen": bool(traffic_delta_seen),
         "client_attempt_seen": bool(client_attempt_seen),
         "delta_rx_bytes": delta_rx,
         "delta_tx_bytes": delta_tx,
@@ -6530,6 +6538,8 @@ async function runAdminWgDiagnosticsForUser(userId, username, email) {{
     );
     lines.push(
       'client_attempt_seen=' + String(!!probe.client_attempt_seen) +
+      ' | handshake_was_recent_before_probe=' + String(!!probe.handshake_was_recent_before_probe) +
+      ' | traffic_delta_seen=' + String(!!probe.traffic_delta_seen) +
       ' | handshake_start=' + String(Number(probe.start_handshake || 0)) +
       ' | handshake_end=' + String(Number(probe.end_handshake || 0))
     );
