@@ -3878,10 +3878,23 @@ async function refreshGlobalReleaseState() {{
     const j = await r.json();
     const state = j.state || {{}};
     const current = state.current || {{}};
+    const historyItems = (j.history && Array.isArray(j.history.items)) ? j.history.items : [];
+    const historyTop = historyItems.length ? (historyItems[0] || {{}}) : {{}};
+    const historyTo = String(historyTop.to || '').trim();
     const available = state.available || null;
     const update = state.update || {{}};
     const currentVersion = String(current.version || 'unknown');
-    const currentBuild = String(current.build || ((current.sha ? String(current.sha).slice(0, 7) : 'unknown')));
+    let currentBuild = String(current.build || '').trim();
+    if (!currentBuild || currentBuild === 'unknown' || currentBuild === 'na') {{
+      const curSha = String(current.sha || '').trim();
+      if (curSha && curSha !== 'unknown' && curSha !== 'na') {{
+        currentBuild = curSha.slice(0, 7);
+      }}
+    }}
+    if ((!currentBuild || currentBuild === 'unknown' || currentBuild === 'na') && historyTo) {{
+      currentBuild = historyTo.slice(0, 7);
+    }}
+    if (!currentBuild || currentBuild === 'na') currentBuild = 'unknown';
     versionEl.textContent = 'version: ' + currentVersion + ' · build: ' + currentBuild;
     if (available && available.version && available.version !== currentVersion) {{
       banner.style.display = 'block';
@@ -4516,11 +4529,24 @@ async function loadAboutState() {{
   if (!j) return;
   const s = j.state || {{}};
   const cur = s.current || {{}};
+  const history = (j.history && Array.isArray(j.history.items)) ? j.history.items : [];
+  const historyTop = history.length ? (history[0] || {{}}) : {{}};
+  const historyTo = String(historyTop.to || '').trim();
   const av = s.available || null;
   const up = s.update || {{}};
   const notes = av && av.notes ? av.notes : (cur.notes || '-');
   const vCur = String(cur.version || 'unknown');
-  const buildCur = String(cur.build || (cur.sha ? String(cur.sha).slice(0, 7) : 'unknown'));
+  let buildCur = String(cur.build || '').trim();
+  if (!buildCur || buildCur === 'unknown' || buildCur === 'na') {{
+    const curSha = String(cur.sha || '').trim();
+    if (curSha && curSha !== 'unknown' && curSha !== 'na') {{
+      buildCur = curSha.slice(0, 7);
+    }}
+  }}
+  if ((!buildCur || buildCur === 'unknown' || buildCur === 'na') && historyTo) {{
+    buildCur = historyTo.slice(0, 7);
+  }}
+  if (!buildCur || buildCur === 'na') buildCur = 'unknown';
   const curVersionEl = document.getElementById('about-current-version');
   const curShaEl = document.getElementById('about-current-sha');
   const curAtEl = document.getElementById('about-current-at');
@@ -4533,7 +4559,6 @@ async function loadAboutState() {{
   if (avVersionEl) avVersionEl.textContent = av && av.version ? String(av.version) : 'no update';
   if (upStatusEl) upStatusEl.textContent = String(up.status || 'idle') + ' - ' + String(up.message || '-');
   if (notesEl) notesEl.textContent = String(notes || '-');
-  const history = (j.history && Array.isArray(j.history.items)) ? j.history.items : [];
   if (document.getElementById('about-history-body')) {{
     renderAboutHistory(history);
   }}

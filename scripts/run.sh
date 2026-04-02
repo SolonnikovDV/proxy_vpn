@@ -127,6 +127,7 @@ run_prod() {
   export WG_CLIENT_PORT="${WG_CLIENT_PORT:-${WG_PORT}}"
   export PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
   export VPN_CORE_REBUILD_MODE="${VPN_CORE_REBUILD_MODE:-never}" # auto | always | never
+  export CADDY_RECREATE_MODE="${CADDY_RECREATE_MODE:-auto}" # auto | always | never
   export PROD_DEPLOY_SHA_FILE="${PROD_DEPLOY_SHA_FILE:-logs/last-prod-up.sha}"
   mkdir -p "$(dirname "${PROD_DEPLOY_SHA_FILE}")"
   vpn_core_rebuild_required_for_range() {
@@ -215,12 +216,64 @@ EOF
       bash ./scripts/apply-port-map.sh
     fi
   }
+  caddy_recreate_required_for_range() {
+    local from_ref="$1"
+    local to_ref="$2"
+    local changed
+    changed="$(git diff --name-only "${from_ref}..${to_ref}" 2>/dev/null || true)"
+    [ -z "${changed}" ] && return 1
+    while IFS= read -r path; do
+      [ -z "${path}" ] && continue
+      case "${path}" in
+        caddy/*|Caddyfile*|compose.yaml|compose.prod.yaml|scripts/run.sh|scripts/preflight-prod.sh)
+          return 0
+          ;;
+      esac
+    done <<EOF
+${changed}
+EOF
+    return 1
+  }
+  should_force_recreate_caddy() {
+    case "${CADDY_RECREATE_MODE}" in
+      always) printf '1'; return 0 ;;
+      never) printf '0'; return 0 ;;
+      auto) ;;
+      *) die "Unknown CADDY_RECREATE_MODE=${CADDY_RECREATE_MODE}. Use auto|always|never." ;;
+    esac
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      printf '0'
+      return 0
+    fi
+    local current_sha previous_sha
+    current_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+    previous_sha="$( [ -f "${PROD_DEPLOY_SHA_FILE}" ] && tr -d '\r\n' < "${PROD_DEPLOY_SHA_FILE}" || true )"
+    if [ -z "${previous_sha}" ] || [ -z "${current_sha}" ] || [ "${previous_sha}" = "${current_sha}" ]; then
+      printf '0'
+      return 0
+    fi
+    if caddy_recreate_required_for_range "${previous_sha}" "${current_sha}"; then
+      printf '1'
+    else
+      printf '0'
+    fi
+  }
+  refresh_caddy() {
+    local force
+    force="$(should_force_recreate_caddy)"
+    if [ "${force}" = "1" ]; then
+      log "Applying Caddy force-recreate (config-related changes detected)."
+      dc -f compose.yaml -f compose.prod.yaml up -d --force-recreate caddy
+    else
+      dc -f compose.yaml -f compose.prod.yaml up -d caddy
+    fi
+  }
   case "${ACTION}" in
     up)
       bash ./scripts/preflight-prod.sh
       prod_up_stack
       apply_dynamic_port_map
-      dc -f compose.yaml -f compose.prod.yaml up -d --force-recreate caddy
+      refresh_caddy
       run_prod_smoke_checks
       dc -f compose.yaml -f compose.prod.yaml ps
       mark_prod_deploy_sha
@@ -242,7 +295,7 @@ EOF
       bash ./scripts/preflight-prod.sh
       prod_up_stack
       apply_dynamic_port_map
-      dc -f compose.yaml -f compose.prod.yaml up -d --force-recreate caddy
+      refresh_caddy
       run_prod_smoke_checks
       dc -f compose.yaml -f compose.prod.yaml ps
       mark_prod_deploy_sha

@@ -243,6 +243,7 @@ By default, production rebuild uses safe mode to preserve active VPN tunnels:
 - `VPN_CORE_REBUILD_MODE=auto`: rebuild VPN core only when git diff touches VPN core logic/files (`xray/*`, `wireguard/*`, related compose/setup/preflight files).
 - `VPN_CORE_REBUILD_MODE=always`: always rebuild VPN core.
 - for maintenance window only: set `VPN_CORE_REBUILD_MODE=always` for an explicit full VPN core rebuild.
+- `CADDY_RECREATE_MODE=auto` (default): force-recreate Caddy only when Caddy/compose config changed; otherwise Caddy is updated in-place to reduce brief client-visible downtime on `prod up`.
 
 Xray endpoint mismatch troubleshooting (`:443` vs `:8443`):
 - common issue: old client profile remains on `:443` while active service endpoint is `:8443`
