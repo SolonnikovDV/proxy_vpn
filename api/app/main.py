@@ -69,6 +69,8 @@ WG_CLIENT_DEFAULT_MTU = os.getenv("WG_CLIENT_DEFAULT_MTU", "1280")
 WG_ENABLE_IPV6 = os.getenv("WG_ENABLE_IPV6", "0").strip() in {"1", "true", "yes", "on"}
 WG_CLIENT_DEFAULT_ALLOWED_IPS = "0.0.0.0/0, ::/0" if WG_ENABLE_IPV6 else "0.0.0.0/0"
 WG_DIAG_MIN_TRAFFIC_BYTES = int(os.getenv("WG_DIAG_MIN_TRAFFIC_BYTES", "16384"))
+WG_ACTIVE_PROBE_SECONDS = int(os.getenv("WG_ACTIVE_PROBE_SECONDS", "8"))
+WG_ACTIVE_PROBE_MIN_DELTA_BYTES = int(os.getenv("WG_ACTIVE_PROBE_MIN_DELTA_BYTES", "16384"))
 WG_MANAGED_BEGIN = "# BEGIN PROXY_VPN_MANAGED_PEERS"
 WG_MANAGED_END = "# END PROXY_VPN_MANAGED_PEERS"
 DEPLOY_HISTORY_PATH = os.getenv("DEPLOY_HISTORY_PATH", "/logs/deploy-history.log")
@@ -1495,12 +1497,9 @@ def _online_user_ids(con: sqlite3.Connection) -> list[int]:
     return [int(r["user_id"]) for r in rows]
 
 
-def _read_wg_dump_totals() -> dict[str, dict[str, Any]]:
+def _parse_wg_dump_totals_lines(lines: list[str]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
-    try:
-        with open(WG_DUMP_PATH, "r", encoding="utf-8") as f:
-            lines = [line.strip() for line in f if line.strip()]
-    except Exception:
+    if not lines:
         return result
     # First line is interface data, next lines are peer rows.
     for line in lines[1:]:
@@ -1524,6 +1523,16 @@ def _read_wg_dump_totals() -> dict[str, dict[str, Any]]:
             "allowed_ips": allowed_ips,
         }
     return result
+
+
+def _read_wg_dump_totals() -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    try:
+        with open(WG_DUMP_PATH, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+    except Exception:
+        return result
+    return _parse_wg_dump_totals_lines(lines)
 
 
 def _collect_wireguard_user_traffic(con: sqlite3.Connection, ts_iso: str) -> None:
@@ -2444,6 +2453,54 @@ def _exec_wireguard_container(command: list[str]) -> tuple[int, str]:
                 client.close()
         except Exception:
             pass
+
+
+def _read_wg_runtime_totals_direct() -> dict[str, dict[str, Any]]:
+    code, text = _exec_wireguard_container(["wg", "show", "wg0", "dump"])
+    if code != 0:
+        return {}
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    return _parse_wg_dump_totals_lines(lines)
+
+
+def _wireguard_active_probe_for_public_key(public_key: str) -> dict[str, Any]:
+    key = str(public_key or "").strip()
+    wait_seconds = max(3, min(20, int(WG_ACTIVE_PROBE_SECONDS)))
+    threshold = max(1024, int(WG_ACTIVE_PROBE_MIN_DELTA_BYTES))
+    start_totals = _read_wg_runtime_totals_direct()
+    start = start_totals.get(key, {})
+    start_rx = int(start.get("rx_total", 0) or 0)
+    start_tx = int(start.get("tx_total", 0) or 0)
+    time.sleep(wait_seconds)
+    end_totals = _read_wg_runtime_totals_direct()
+    end = end_totals.get(key, {})
+    end_rx = int(end.get("rx_total", 0) or 0)
+    end_tx = int(end.get("tx_total", 0) or 0)
+    delta_rx = max(0, end_rx - start_rx)
+    delta_tx = max(0, end_tx - start_tx)
+    delta_total = delta_rx + delta_tx
+    verdict = "data_path_not_confirmed"
+    note = "No meaningful traffic delta detected during active probe."
+    if delta_total >= threshold:
+        verdict = "data_path_confirmed"
+        note = "Meaningful traffic delta detected during active probe."
+    elif delta_total > 0:
+        verdict = "data_path_low_delta"
+        note = "Traffic delta exists but below threshold."
+    return {
+        "status": "ok",
+        "wait_seconds": wait_seconds,
+        "threshold_bytes": threshold,
+        "start_rx_total": start_rx,
+        "start_tx_total": start_tx,
+        "end_rx_total": end_rx,
+        "end_tx_total": end_tx,
+        "delta_rx_bytes": delta_rx,
+        "delta_tx_bytes": delta_tx,
+        "delta_total_bytes": delta_total,
+        "verdict": verdict,
+        "note": note,
+    }
 
 
 def _wireguard_runtime_debug_snapshot() -> dict[str, Any]:
@@ -5370,7 +5427,10 @@ def admin(request: Request) -> HTMLResponse:
   <div class="modal-card">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
       <strong id="wg-diag-title">WireGuard diagnostics</strong>
-      <button class="btn-ghost" data-action="close-wg-diagnostics-modal">Close</button>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <button class="btn-ghost" data-action="copy-wg-diagnostics-log">Copy log</button>
+        <button class="btn-ghost" data-action="close-wg-diagnostics-modal">Close</button>
+      </div>
     </div>
     <pre id="wg-diag-content" style="margin-top:10px;max-height:65vh;overflow:auto;">Loading...</pre>
   </div>
@@ -6412,11 +6472,12 @@ async function runAdminWgDiagnosticsForUser(userId, username, email) {{
   const items = Array.isArray(j.items) ? j.items : [];
   const item = items.length ? items[0] : null;
   const lines = [];
+  lines.push('=== Meta ===');
   lines.push('generated_at: ' + String(j.generated_at || '-'));
   lines.push('window_seconds: ' + String(j.window_seconds || '-'));
   lines.push('runtime_peer_count: ' + String(j.runtime_peer_count || 0));
   lines.push('');
-  lines.push('Per-user diagnostics:');
+  lines.push('=== Per-user diagnostics ===');
   if (!item) {{
     lines.push('- no WG binding found for selected user');
   }} else {{
@@ -6431,7 +6492,25 @@ async function runAdminWgDiagnosticsForUser(userId, username, email) {{
     );
   }}
   lines.push('');
-  lines.push('Runtime debug snapshot:');
+  lines.push('=== Active data-path probe ===');
+  const probe = j.active_probe || {{}};
+  if (!probe || !probe.status) {{
+    lines.push('- probe unavailable');
+  }} else {{
+    lines.push(
+      'verdict=' + String(probe.verdict || '-') +
+      ' | wait=' + String(probe.wait_seconds || '-') + 's' +
+      ' | threshold=' + fmtBytes(Number(probe.threshold_bytes || 0))
+    );
+    lines.push(
+      'delta: RX ' + fmtBytes(Number(probe.delta_rx_bytes || 0)) +
+      ' / TX ' + fmtBytes(Number(probe.delta_tx_bytes || 0)) +
+      ' / total ' + fmtBytes(Number(probe.delta_total_bytes || 0))
+    );
+    lines.push('note: ' + String(probe.note || '-'));
+  }}
+  lines.push('');
+  lines.push('=== Runtime debug snapshot ===');
   const debug = j.debug || {{}};
   ['ip_forward', 'wg_show', 'nat_postrouting', 'forward_chain', 'mangle_forward'].forEach((key) => {{
     const part = debug[key] || {{}};
@@ -6596,6 +6675,17 @@ document.addEventListener('click', (event) => {{
     if (action === 'create-user') return void createUser();
     if (action === 'bind-wg-peer') return void bindWgPeer();
     if (action === 'close-wg-diagnostics-modal') return void closeWgDiagnosticsModal();
+    if (action === 'copy-wg-diagnostics-log') {{
+      const out = document.getElementById('wg-diag-content');
+      const text = String((out && out.textContent) || '').trim();
+      if (!text) return;
+      navigator.clipboard.writeText(text).then(() => {{
+        document.getElementById('admin-out').textContent = 'WG diagnostics log copied to clipboard.';
+      }}).catch(() => {{
+        document.getElementById('admin-out').textContent = 'Failed to copy WG diagnostics log.';
+      }});
+      return;
+    }}
     if (action === 'run-wg-diagnostics-user') {{
       const userId = Number(actionBtn.getAttribute('data-user-id') || 0);
       const username = String(actionBtn.getAttribute('data-username') || '');
@@ -8055,6 +8145,9 @@ def admin_wireguard_diagnostics(
                     "diagnostics": diag,
                 }
             )
+    active_probe: dict[str, Any] = {}
+    if len(items) == 1:
+        active_probe = _wireguard_active_probe_for_public_key(str(items[0].get("public_key", "")))
     debug = _wireguard_runtime_debug_snapshot()
     return JSONResponse(
         {
@@ -8062,6 +8155,7 @@ def admin_wireguard_diagnostics(
             "window_seconds": max(30, min(900, int(window_seconds))),
             "items": items,
             "runtime_peer_count": len(runtime_totals),
+            "active_probe": active_probe,
             "debug": debug,
             "generated_at": _now().isoformat(),
         }
