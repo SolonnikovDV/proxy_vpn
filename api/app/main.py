@@ -2475,14 +2475,17 @@ def _wireguard_active_probe_for_public_key(public_key: str) -> dict[str, Any]:
     start = start_totals.get(key, {})
     start_rx = int(start.get("rx_total", 0) or 0)
     start_tx = int(start.get("tx_total", 0) or 0)
+    start_handshake = int(start.get("latest_handshake", 0) or 0)
     time.sleep(wait_seconds)
     end_totals = _read_wg_runtime_totals_direct()
     end = end_totals.get(key, {})
     end_rx = int(end.get("rx_total", 0) or 0)
     end_tx = int(end.get("tx_total", 0) or 0)
+    end_handshake = int(end.get("latest_handshake", 0) or 0)
     delta_rx = max(0, end_rx - start_rx)
     delta_tx = max(0, end_tx - start_tx)
     delta_total = delta_rx + delta_tx
+    client_attempt_seen = bool(end_handshake > 0 and end_handshake != start_handshake)
     verdict = "data_path_not_confirmed"
     note = "No meaningful traffic delta detected during active probe."
     if delta_total >= threshold:
@@ -2499,6 +2502,9 @@ def _wireguard_active_probe_for_public_key(public_key: str) -> dict[str, Any]:
         "start_tx_total": start_tx,
         "end_rx_total": end_rx,
         "end_tx_total": end_tx,
+        "start_handshake": start_handshake,
+        "end_handshake": end_handshake,
+        "client_attempt_seen": bool(client_attempt_seen),
         "delta_rx_bytes": delta_rx,
         "delta_tx_bytes": delta_tx,
         "delta_total_bytes": delta_total,
@@ -6521,6 +6527,11 @@ async function runAdminWgDiagnosticsForUser(userId, username, email) {{
       'verdict=' + String(probe.verdict || '-') +
       ' | wait=' + String(probe.wait_seconds || '-') + 's' +
       ' | threshold=' + fmtBytes(Number(probe.threshold_bytes || 0))
+    );
+    lines.push(
+      'client_attempt_seen=' + String(!!probe.client_attempt_seen) +
+      ' | handshake_start=' + String(Number(probe.start_handshake || 0)) +
+      ' | handshake_end=' + String(Number(probe.end_handshake || 0))
     );
     lines.push(
       'delta: RX ' + fmtBytes(Number(probe.delta_rx_bytes || 0)) +
