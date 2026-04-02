@@ -63,6 +63,7 @@ XRAY_STATS_PATH = "/xray-config/stats_raw.txt"
 XRAY_CONFIG_PATH = "/xray-config/config.json"
 XRAY_CLIENT_INFO_PATH = "/xray-config/client-connection.txt"
 WG_CLIENT_TEMPLATE_PATH = "/wireguard-config/client1.conf"
+WG_CLIENT_DEFAULT_MTU = os.getenv("WG_CLIENT_DEFAULT_MTU", "1280")
 DEPLOY_HISTORY_PATH = os.getenv("DEPLOY_HISTORY_PATH", "/logs/deploy-history.log")
 APP_RELEASE_STATE_PATH = os.getenv("APP_RELEASE_STATE_PATH", "/logs/app-release-state.json")
 UPDATE_CHECK_REQUEST_PATH = os.getenv("UPDATE_CHECK_REQUEST_PATH", "/logs/update-check-request.json")
@@ -1847,6 +1848,8 @@ def _parse_wireguard_client_template(path: str = WG_CLIENT_TEMPLATE_PATH) -> dic
         "server_public_key": data.get("peer.publickey", ""),
         "allowed_ips": data.get("peer.allowedips", "0.0.0.0/0, ::/0"),
         "endpoint": data.get("peer.endpoint", ""),
+        "mtu": data.get("interface.mtu", WG_CLIENT_DEFAULT_MTU),
+        "preshared_key": data.get("peer.presharedkey", ""),
         "persistent_keepalive": data.get("peer.persistentkeepalive", "25"),
         "template_address": data.get("interface.address", "10.13.0.2/32"),
     }
@@ -1862,6 +1865,15 @@ def _allocate_wireguard_client_address(user_id: int, template_address: str) -> s
         return "10.13.0.2/32"
     host = 2 + (int(user_id) % 200)
     return f"{octets[0]}.{octets[1]}.{octets[2]}.{host}/{mask}"
+
+
+def _normalize_endpoint_with_port(endpoint: str, wg_port: str) -> str:
+    raw = str(endpoint or "").strip()
+    if not raw:
+        return f"127.0.0.1:{wg_port}"
+    if ":" in raw:
+        return raw
+    return f"{raw}:{wg_port}"
 
 
 def _generate_wireguard_keypair() -> tuple[str, str]:
@@ -1909,12 +1921,12 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
     wg_port = str(os.getenv("WG_PORT", "51820") or "51820").strip()
     if panel_domain and panel_domain != "panel.example.com":
         endpoint = f"{panel_domain}:{wg_port}"
-    if not endpoint:
-        endpoint = f"127.0.0.1:{wg_port}"
+    endpoint = _normalize_endpoint_with_port(endpoint, wg_port)
     with _db_connect() as con:
         row = con.execute(
             """
-            SELECT private_key, public_key, client_address, dns, endpoint, server_public_key, allowed_ips, persistent_keepalive
+            SELECT private_key, public_key, client_address, dns, endpoint, server_public_key, allowed_ips,
+                   persistent_keepalive, mtu, preshared_key
             FROM user_wireguard_profiles
             WHERE user_id = ?
             """,
@@ -1930,6 +1942,8 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
                 "server_public_key": str(row["server_public_key"] or tpl.get("server_public_key", "")),
                 "allowed_ips": str(row["allowed_ips"] or tpl.get("allowed_ips", "0.0.0.0/0, ::/0")),
                 "persistent_keepalive": str(row["persistent_keepalive"] or tpl.get("persistent_keepalive", "25")),
+                "mtu": str(row["mtu"] or tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)),
+                "preshared_key": str(row["preshared_key"] or tpl.get("preshared_key", "")),
             }
         else:
             private_key, public_key = _generate_wireguard_keypair()
@@ -1942,13 +1956,15 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
                 "server_public_key": str(tpl.get("server_public_key", "")),
                 "allowed_ips": str(tpl.get("allowed_ips", "0.0.0.0/0, ::/0")),
                 "persistent_keepalive": str(tpl.get("persistent_keepalive", "25")),
+                "mtu": str(tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)),
+                "preshared_key": str(tpl.get("preshared_key", "")),
             }
             con.execute(
                 """
                 INSERT INTO user_wireguard_profiles (
                     user_id, private_key, public_key, client_address, dns, endpoint, server_public_key,
-                    allowed_ips, persistent_keepalive, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    allowed_ips, persistent_keepalive, mtu, preshared_key, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -1960,6 +1976,8 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
                     profile["server_public_key"],
                     profile["allowed_ips"],
                     profile["persistent_keepalive"],
+                    profile["mtu"],
+                    profile["preshared_key"],
                     now_iso,
                 ),
             )
@@ -1987,17 +2005,30 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
 
 
 def _wireguard_profile_to_conf(profile: dict[str, str]) -> str:
-    return (
-        "[Interface]\n"
-        f"PrivateKey = {profile['private_key']}\n"
-        f"Address = {profile['client_address']}\n"
-        f"DNS = {profile['dns']}\n\n"
-        "[Peer]\n"
-        f"PublicKey = {profile['server_public_key']}\n"
-        f"AllowedIPs = {profile['allowed_ips']}\n"
-        f"Endpoint = {profile['endpoint']}\n"
-        f"PersistentKeepalive = {profile['persistent_keepalive']}\n"
+    interface_lines = [
+        "[Interface]",
+        f"PrivateKey = {profile['private_key']}",
+        f"Address = {profile['client_address']}",
+        f"DNS = {profile['dns']}",
+    ]
+    mtu = str(profile.get("mtu", "") or "").strip()
+    if mtu:
+        interface_lines.append(f"MTU = {mtu}")
+    peer_lines = [
+        "[Peer]",
+        f"PublicKey = {profile['server_public_key']}",
+    ]
+    preshared = str(profile.get("preshared_key", "") or "").strip()
+    if preshared:
+        peer_lines.append(f"PresharedKey = {preshared}")
+    peer_lines.extend(
+        [
+            f"AllowedIPs = {profile['allowed_ips']}",
+            f"Endpoint = {profile['endpoint']}",
+            f"PersistentKeepalive = {profile['persistent_keepalive']}",
+        ]
     )
+    return "\n".join(interface_lines + [""] + peer_lines) + "\n"
 
 
 def _set_user_wg_public_key(user_id: int, public_key: str) -> None:
@@ -3115,6 +3146,8 @@ def startup() -> None:
                 server_public_key TEXT NOT NULL,
                 allowed_ips TEXT NOT NULL,
                 persistent_keepalive TEXT NOT NULL,
+                mtu TEXT NOT NULL DEFAULT '',
+                preshared_key TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL
             )
             """
@@ -3192,6 +3225,10 @@ def startup() -> None:
             con, "user_access_profiles", "last_region_profile", "last_region_profile TEXT NOT NULL DEFAULT 'ru'"
         )
         _ensure_column(con, "user_access_profiles", "wg_public_key", "wg_public_key TEXT NOT NULL DEFAULT ''")
+        _ensure_column(con, "user_wireguard_profiles", "mtu", "mtu TEXT NOT NULL DEFAULT ''")
+        _ensure_column(
+            con, "user_wireguard_profiles", "preshared_key", "preshared_key TEXT NOT NULL DEFAULT ''"
+        )
         _ensure_column(
             con, "user_protocol_state", "primary_protocol", "primary_protocol TEXT NOT NULL DEFAULT 'xray'"
         )
@@ -3841,7 +3878,8 @@ function renderDeviceCard(card) {{
   const wgQuickJsonUrl = escHtml(wgQuick.json_url || '');
   const wgQuickDownloadUrl = escHtml(wgQuick.download_url || '');
   const fields = card.config_fields || {{}};
-  const fieldRows = [
+  const wgFields = card.wireguard_manual_fields || {{}};
+  const xrayFieldPairs = [
     ['Address', fields.server],
     ['Port', fields.port],
     ['UUID', fields.uuid],
@@ -3852,7 +3890,17 @@ function renderDeviceCard(card) {{
     ['Network', 'tcp'],
     ['Security', 'reality'],
     ['Encryption', 'none'],
-  ]
+  ];
+  const wgFieldPairs = [
+    ['WG Endpoint', wgFields.endpoint],
+    ['WG Server PublicKey', wgFields.server_public_key],
+    ['WG PresharedKey', wgFields.preshared_key],
+    ['WG AllowedIPs', wgFields.allowed_ips],
+    ['WG PersistentKeepalive', wgFields.persistent_keepalive],
+    ['WG MTU', wgFields.mtu],
+    ['WG DNS', wgFields.dns],
+  ];
+  const renderPairs = (pairs) => pairs
     .filter(([, value]) => String((value === undefined || value === null) ? '' : value).trim() !== '')
     .map(([name, value]) => {{
       const safeName = escHtml(name);
@@ -3869,6 +3917,14 @@ function renderDeviceCard(card) {{
       `;
     }})
     .join('');
+  const xrayFieldRows = renderPairs(xrayFieldPairs);
+  const wgFieldRows = renderPairs(wgFieldPairs);
+  const fieldRows = `
+    <tr><td colspan="3" style="padding:8px;background:rgba(37,99,235,0.08);border-bottom:1px solid rgba(50,65,90,0.12);"><b>Xray fields</b></td></tr>
+    ${{xrayFieldRows || '<tr><td colspan="3" style="padding:8px;" class="muted">No Xray fields.</td></tr>'}}
+    <tr><td colspan="3" style="padding:8px;background:rgba(15,118,110,0.08);border-bottom:1px solid rgba(50,65,90,0.12);"><b>WireGuard fields</b></td></tr>
+    ${{wgFieldRows || '<tr><td colspan="3" style="padding:8px;" class="muted">No WireGuard fields.</td></tr>'}}
+  `;
   const fallbackHtml = fallbackUrl
     ? `<div class="muted" style="margin-top:6px;">If install page is unavailable, use <a href="${{fallbackUrl}}" target="_blank" rel="noopener noreferrer">${{fallbackLabel}}</a>.</div>`
     : '';
@@ -6473,6 +6529,25 @@ def user_device_config(
         f"Manual fields from this card: Address={host}, Port={port}, UUID={profile['xray_uuid']}, "
         f"Network=tcp, TLS/Reality SNI={sni}, Public Key={pbk}, Short ID={sid}, Flow={flow}, Encryption=none."
     )
+    try:
+        wg_tpl = _parse_wireguard_client_template()
+    except HTTPException:
+        wg_tpl = {
+            "dns": "1.1.1.1,1.0.0.1",
+            "server_public_key": "",
+            "allowed_ips": "0.0.0.0/0, ::/0",
+            "endpoint": "",
+            "mtu": WG_CLIENT_DEFAULT_MTU,
+            "preshared_key": "",
+            "persistent_keepalive": "25",
+            "template_address": "10.13.0.2/32",
+        }
+    wg_port = str(os.getenv("WG_PORT", "51820") or "51820").strip()
+    panel_domain = str(os.getenv("VPN_PANEL_DOMAIN", "") or "").strip()
+    wg_endpoint = str(wg_tpl.get("endpoint", "") or "").strip()
+    if panel_domain and panel_domain != "panel.example.com":
+        wg_endpoint = f"{panel_domain}:{wg_port}"
+    wg_endpoint = _normalize_endpoint_with_port(wg_endpoint, wg_port)
 
     instructions: list[str] = []
     app_name = ""
@@ -6739,6 +6814,15 @@ def user_device_config(
                 "wireguard_about": wg_about,
                 "wireguard_platform_tag": wg_platform_tag,
                 "wireguard_instructions": wg_instructions,
+                "wireguard_manual_fields": {
+                    "endpoint": wg_endpoint,
+                    "server_public_key": str(wg_tpl.get("server_public_key", "")),
+                    "preshared_key": str(wg_tpl.get("preshared_key", "")),
+                    "allowed_ips": str(wg_tpl.get("allowed_ips", "0.0.0.0/0, ::/0")),
+                    "persistent_keepalive": str(wg_tpl.get("persistent_keepalive", "25")),
+                    "mtu": str(wg_tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)),
+                    "dns": str(wg_tpl.get("dns", "1.1.1.1,1.0.0.1")),
+                },
                 "wireguard_quick_setup": {
                     "json_url": f"/api/v1/user/wireguard/client-config?device_type={device_type}&platform={platform}",
                     "download_url": f"/api/v1/user/wireguard/client-config?device_type={device_type}&platform={platform}&format=conf",
