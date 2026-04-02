@@ -1858,6 +1858,30 @@ def _parse_wireguard_client_template(path: str = WG_CLIENT_TEMPLATE_PATH) -> dic
     }
 
 
+def _get_wireguard_server_public_key(default_key: str = "") -> str:
+    fallback = str(default_key or "").strip()
+    if docker is None:
+        return fallback
+    client = None
+    try:
+        client = docker.from_env()
+        container = client.containers.get("proxy-vpn-wireguard")
+        result = container.exec_run(["wg", "show", "wg0", "public-key"], stdout=True, stderr=True)
+        output = getattr(result, "output", b"")
+        text = output.decode("utf-8", errors="replace").strip() if output else ""
+        if int(getattr(result, "exit_code", 1)) == 0 and text:
+            return text.splitlines()[0].strip()
+        return fallback
+    except Exception:
+        return fallback
+    finally:
+        try:
+            if client is not None:
+                client.close()
+        except Exception:
+            pass
+
+
 def _allocate_wireguard_client_address(user_id: int, template_address: str) -> str:
     raw = str(template_address or "10.13.0.2/32").strip()
     if "/" not in raw:
@@ -1919,6 +1943,7 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
     user_id = int(user["id"])
     now_iso = _now().isoformat()
     tpl = _parse_wireguard_client_template()
+    server_public_key = _get_wireguard_server_public_key(str(tpl.get("server_public_key", "")))
     endpoint = str(tpl.get("endpoint") or "").strip()
     panel_domain = str(os.getenv("VPN_PANEL_DOMAIN", "") or "").strip()
     wg_port = str(os.getenv("WG_PORT", "51820") or "51820").strip()
@@ -1942,12 +1967,31 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
                 "client_address": str(row["client_address"] or ""),
                 "dns": str(row["dns"] or ""),
                 "endpoint": str(row["endpoint"] or endpoint),
-                "server_public_key": str(row["server_public_key"] or tpl.get("server_public_key", "")),
+                "server_public_key": server_public_key,
                 "allowed_ips": str(row["allowed_ips"] or tpl.get("allowed_ips", "0.0.0.0/0, ::/0")),
                 "persistent_keepalive": str(row["persistent_keepalive"] or tpl.get("persistent_keepalive", "25")),
                 "mtu": str(row["mtu"] or tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)),
                 "preshared_key": str(row["preshared_key"] or tpl.get("preshared_key", "")),
             }
+            con.execute(
+                """
+                UPDATE user_wireguard_profiles
+                SET endpoint = ?, server_public_key = ?, allowed_ips = ?, persistent_keepalive = ?,
+                    mtu = ?, preshared_key = ?, dns = ?, updated_at = ?
+                WHERE user_id = ?
+                """,
+                (
+                    profile["endpoint"],
+                    profile["server_public_key"],
+                    profile["allowed_ips"],
+                    profile["persistent_keepalive"],
+                    profile["mtu"],
+                    profile["preshared_key"],
+                    profile["dns"],
+                    now_iso,
+                    user_id,
+                ),
+            )
         else:
             private_key, public_key = _generate_wireguard_keypair()
             profile = {
@@ -1956,7 +2000,7 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
                 "client_address": _allocate_wireguard_client_address(user_id, tpl.get("template_address", "10.13.0.2/32")),
                 "dns": str(tpl.get("dns", "1.1.1.1,1.0.0.1")),
                 "endpoint": endpoint,
-                "server_public_key": str(tpl.get("server_public_key", "")),
+                "server_public_key": server_public_key,
                 "allowed_ips": str(tpl.get("allowed_ips", "0.0.0.0/0, ::/0")),
                 "persistent_keepalive": str(tpl.get("persistent_keepalive", "25")),
                 "mtu": str(tpl.get("mtu", WG_CLIENT_DEFAULT_MTU)),
@@ -1984,31 +2028,7 @@ def _load_or_create_user_wireguard_profile(user: dict[str, Any], device_type: st
                     now_iso,
                 ),
             )
-        label = f"auto-{device_type}-{platform}"
-        con.execute(
-            """
-            UPDATE user_access_profiles
-            SET wg_public_key = ?, updated_at = ?
-            WHERE user_id = ?
-            """,
-            (profile["public_key"], now_iso, user_id),
-        )
-        con.execute(
-            """
-            INSERT INTO wg_peer_bindings (user_id, public_key, label, created_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(public_key)
-            DO UPDATE SET user_id = excluded.user_id, label = excluded.label
-            """,
-            (user_id, profile["public_key"], label, now_iso),
-        )
-        con.execute(
-            "DELETE FROM wg_peer_bindings WHERE user_id = ? AND public_key != ?",
-            (user_id, profile["public_key"]),
-        )
-        _evaluate_user_protocol_state(con, user_id)
         con.commit()
-    _sync_wireguard_server_peers()
     return profile
 
 
@@ -6648,6 +6668,7 @@ def user_device_config(
             "persistent_keepalive": "25",
             "template_address": "10.13.0.2/32",
         }
+    wg_server_public_key = _get_wireguard_server_public_key(str(wg_tpl.get("server_public_key", "")))
     wg_port = str(os.getenv("WG_PORT", "51820") or "51820").strip()
     panel_domain = str(os.getenv("VPN_PANEL_DOMAIN", "") or "").strip()
     wg_endpoint = str(wg_tpl.get("endpoint", "") or "").strip()
@@ -6922,7 +6943,7 @@ def user_device_config(
                 "wireguard_instructions": wg_instructions,
                 "wireguard_manual_fields": {
                     "endpoint": wg_endpoint,
-                    "server_public_key": str(wg_tpl.get("server_public_key", "")),
+                    "server_public_key": wg_server_public_key,
                     "preshared_key": str(wg_tpl.get("preshared_key", "")),
                     "allowed_ips": str(wg_tpl.get("allowed_ips", "0.0.0.0/0, ::/0")),
                     "persistent_keepalive": str(wg_tpl.get("persistent_keepalive", "25")),
@@ -6971,6 +6992,11 @@ def user_wireguard_client_config(
         import_hint = "WireGuard macOS: Add Tunnel -> Import tunnel(s) from file."
     elif device_type == "desktop" and platform == "linux":
         import_hint = "WireGuard Linux: import .conf into NetworkManager or use wg-quick up <file>."
+    import_hint = (
+        import_hint
+        + " After import, copy the tunnel Public key from your client and register it in User cabinet -> Register key. "
+        + "Only then the key is bound on server (wg0)."
+    )
     return JSONResponse(
         {
             "status": "ok",
