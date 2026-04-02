@@ -2417,6 +2417,46 @@ def _wireguard_diagnostics_for_user(
     }
 
 
+def _exec_wireguard_container(command: list[str]) -> tuple[int, str]:
+    if docker is None:
+        return 1, "docker SDK unavailable in api container"
+    client = None
+    try:
+        client = docker.from_env()
+        container = client.containers.get("proxy-vpn-wireguard")
+        result = container.exec_run(command, stdout=True, stderr=True)
+        output = getattr(result, "output", b"")
+        text = output.decode("utf-8", errors="replace") if output else ""
+        return int(getattr(result, "exit_code", 1) or 1), text.strip()
+    except Exception as e:
+        return 1, str(e)
+    finally:
+        try:
+            if client is not None:
+                client.close()
+        except Exception:
+            pass
+
+
+def _wireguard_runtime_debug_snapshot() -> dict[str, Any]:
+    checks = {
+        "ip_forward": ["sh", "-lc", "cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || true"],
+        "wg_show": ["wg", "show", "wg0"],
+        "nat_postrouting": ["sh", "-lc", "iptables -t nat -L POSTROUTING -n -v"],
+        "forward_chain": ["sh", "-lc", "iptables -L FORWARD -n -v"],
+        "mangle_forward": ["sh", "-lc", "iptables -t mangle -L FORWARD -n -v"],
+    }
+    out: dict[str, Any] = {}
+    for key, command in checks.items():
+        code, text = _exec_wireguard_container(command)
+        out[key] = {
+            "exit_code": int(code),
+            "ok": int(code) == 0,
+            "output": str(text or ""),
+        }
+    return out
+
+
 def _paired_coverage_summary(con: sqlite3.Connection) -> dict[str, Any]:
     wg_runtime_totals = _read_wg_dump_totals()
     rows = con.execute(
@@ -4181,7 +4221,6 @@ function renderDeviceCard(card) {{
   const wgQuick = card.wireguard_quick_setup || {{}};
   const wgQuickJsonUrl = escHtml(wgQuick.json_url || '');
   const wgQuickDownloadUrl = escHtml(wgQuick.download_url || '');
-  const wgDiagnosticsUrl = escHtml(wgQuick.diagnostics_url || '');
   const fields = card.config_fields || {{}};
   const wgFields = card.wireguard_manual_fields || {{}};
   const xrayFieldPairs = [
@@ -4260,10 +4299,8 @@ function renderDeviceCard(card) {{
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
         <button class="btn-ghost" data-action="show-wg-quick-config" data-url="${{wgQuickJsonUrl}}">Show WireGuard config</button>
         <a href="${{wgQuickDownloadUrl}}" target="_blank" rel="noopener noreferrer"><button class="btn-ghost">Download .conf</button></a>
-        <button class="btn-ghost" data-action="show-wg-diagnostics" data-url="${{wgDiagnosticsUrl}}">Validate WG tunnel</button>
       </div>
       <pre id="wg-quick-out" style="margin-top:8px;">WireGuard quick setup: press "Show WireGuard config".</pre>
-      <pre id="wg-diag-out" style="margin-top:8px;">WG diagnostics: press "Validate WG tunnel".</pre>
       <details data-accordion="device-card" style="margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);padding:8px 10px;">
         <summary style="cursor:pointer;font-weight:600;">WireGuard instructions${{wgPlatformTag ? (' (' + wgPlatformTag + ')') : ''}}</summary>
         <ul style="margin:8px 0 4px 14px;padding:0;">${{wgInstructionRows || '<li class="muted">No WireGuard instructions.</li>'}}</ul>
@@ -4640,12 +4677,7 @@ async function registerWireGuardKey() {{
   }});
   const t = await r.text();
   if (out) out.textContent = t;
-  if (r.ok) {{
-    await loadCabinetTraffic();
-    const diagBtn = document.querySelector('[data-action="show-wg-diagnostics"]');
-    const diagUrl = String((diagBtn && diagBtn.getAttribute('data-url')) || '');
-    if (diagUrl) await showWireGuardDiagnostics(diagUrl);
-  }}
+  if (r.ok) await loadCabinetTraffic();
 }}
 async function copyConfigUri() {{
   const el = document.getElementById('cfg-uri');
@@ -4677,41 +4709,6 @@ async function showWireGuardQuickConfig(url) {{
   const hint = String(j.import_hint || '');
   const cfg = String(j.config || '');
   if (out) out.textContent = (hint ? ('Import hint: ' + hint + '\\n\\n') : '') + cfg;
-}}
-async function showWireGuardDiagnostics(url) {{
-  const out = document.getElementById('wg-diag-out');
-  const target = String(url || '').trim();
-  if (!target) {{
-    if (out) out.textContent = 'WG diagnostics endpoint is unavailable.';
-    return;
-  }}
-  if (out) out.textContent = 'Running WG diagnostics...';
-  const r = await fetch(target);
-  const t = await r.text();
-  if (!r.ok) {{
-    if (out) out.textContent = t;
-    return;
-  }}
-  let j = null;
-  try {{ j = JSON.parse(t); }} catch (e) {{ j = null; }}
-  if (!j) {{
-    if (out) out.textContent = t;
-    return;
-  }}
-  const verdict = String(j.verdict || 'unknown');
-  const hand = j.handshake_age_seconds;
-  const handText = (hand === null || hand === undefined) ? 'n/a' : (String(hand) + ' sec');
-  const msg = [
-    'Verdict: ' + verdict,
-    'Bound key: ' + String(j.bound_public_key || '-'),
-    'Profile key: ' + String(j.profile_public_key || '-'),
-    'Handshake age: ' + handText,
-    'Recent window: ' + String(j.window_seconds || 0) + ' sec',
-    'Recent RX/TX: ' + fmtBytes(j.recent_rx_bytes || 0) + ' / ' + fmtBytes(j.recent_tx_bytes || 0),
-    'Runtime totals RX/TX: ' + fmtBytes(j.runtime_rx_total || 0) + ' / ' + fmtBytes(j.runtime_tx_total || 0),
-    'Recommendation: ' + String(j.recommendation || ''),
-  ].join('\\n');
-  if (out) out.textContent = msg;
 }}
 async function loadDeviceCard() {{
   const type = document.getElementById('dev-type').value;
@@ -4822,7 +4819,6 @@ document.addEventListener('click', (event) => {{
   if (action === 'confirm-protocol-switch') return void confirmProtocolSwitch();
   if (action === 'show-switch-guide') return void showSwitchGuideNow();
   if (action === 'show-wg-quick-config') return void showWireGuardQuickConfig(btn.getAttribute('data-url') || '');
-  if (action === 'show-wg-diagnostics') return void showWireGuardDiagnostics(btn.getAttribute('data-url') || '');
   if (action === 'copy-config-uri') return void copyConfigUri();
   if (action === 'copy-value') {{
     const encoded = String(btn.getAttribute('data-copy-value') || '');
@@ -5246,6 +5242,11 @@ def admin(request: Request) -> HTMLResponse:
     </thead>
     <tbody id="wg-bindings-body">{wg_bindings_html}</tbody>
   </table>
+  <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <button class="btn-ghost" data-action="run-admin-wg-diagnostics">Run WG diagnostics (admin)</button>
+    <span class="muted">Server-side validator: works even when user tunnel breaks page access.</span>
+  </div>
+  <pre id="admin-wg-diagnostics-out" style="margin-top:8px;">WG diagnostics: press "Run WG diagnostics (admin)".</pre>
 </div>
 
 <div class="card admin-section" data-section="traffic" data-subsection="xray-bindings">
@@ -6356,6 +6357,55 @@ async function refreshAdminLive() {{
     renderAdminPairedStatus(pairedStatusCache);
   }}
 }}
+async function runAdminWgDiagnostics() {{
+  const out = document.getElementById('admin-wg-diagnostics-out');
+  if (out) out.textContent = 'Running WG diagnostics...';
+  const r = await fetch('/api/v1/admin/wireguard/diagnostics?window_seconds=120');
+  const txt = await r.text();
+  if (!r.ok) {{
+    if (out) out.textContent = txt;
+    return;
+  }}
+  let j = null;
+  try {{ j = JSON.parse(txt); }} catch (e) {{ j = null; }}
+  if (!j) {{
+    if (out) out.textContent = txt;
+    return;
+  }}
+  const items = Array.isArray(j.items) ? j.items : [];
+  const lines = [];
+  lines.push('generated_at: ' + String(j.generated_at || '-'));
+  lines.push('window_seconds: ' + String(j.window_seconds || '-'));
+  lines.push('runtime_peer_count: ' + String(j.runtime_peer_count || 0));
+  lines.push('');
+  lines.push('Per-user diagnostics:');
+  if (!items.length) {{
+    lines.push('- no WG bindings');
+  }} else {{
+    items.forEach((item) => {{
+      const d = item.diagnostics || {{}};
+      lines.push(
+        '- ' + String(item.username || '-') + ' <' + String(item.email || '-') + '>' +
+        ' | verdict=' + String(d.verdict || '-') +
+        ' | handshake_age=' + String((d.handshake_age_seconds === null || d.handshake_age_seconds === undefined) ? 'n/a' : (String(d.handshake_age_seconds) + 's')) +
+        ' | recent=' + fmtBytes(Number(d.recent_total_bytes || 0)) +
+        ' | runtime=' + fmtBytes(Number(d.runtime_rx_total || 0)) + '/' + fmtBytes(Number(d.runtime_tx_total || 0)) +
+        ' | note=' + String(d.recommendation || '-')
+      );
+    }});
+  }}
+  lines.push('');
+  lines.push('Runtime debug snapshot:');
+  const debug = j.debug || {{}};
+  ['ip_forward', 'wg_show', 'nat_postrouting', 'forward_chain', 'mangle_forward'].forEach((key) => {{
+    const part = debug[key] || {{}};
+    lines.push('[' + key + '] exit=' + String(part.exit_code === undefined ? '-' : part.exit_code) + ' ok=' + String(!!part.ok));
+    const body = String(part.output || '').trim();
+    if (body) lines.push(body);
+    lines.push('');
+  }});
+  if (out) out.textContent = lines.join('\\n').trim();
+}}
 async function bindWgPeer() {{
   const userId = Number(document.getElementById('wg-bind-user').value || 0);
   const publicKey = document.getElementById('wg-bind-key').value.trim();
@@ -6505,6 +6555,7 @@ document.addEventListener('click', (event) => {{
     if (action === 'close-create-user-modal') return void closeCreateUserModal();
     if (action === 'create-user') return void createUser();
     if (action === 'bind-wg-peer') return void bindWgPeer();
+    if (action === 'run-admin-wg-diagnostics') return void runAdminWgDiagnostics();
     if (action === 'bind-xray-client') return void bindXrayClient();
     if (action === 'load-user-traffic-details') return void loadAdminUserTrafficDetails();
     if (action === 'refresh-service-logs') return void refreshServiceLogsNow();
@@ -7259,7 +7310,6 @@ def user_device_config(
                 "wireguard_quick_setup": {
                     "json_url": f"/api/v1/user/wireguard/client-config?device_type={device_type}&platform={platform}",
                     "download_url": f"/api/v1/user/wireguard/client-config?device_type={device_type}&platform={platform}&format=conf",
-                    "diagnostics_url": "/api/v1/user/wireguard/diagnostics?window_seconds=120",
                 },
             },
         }
@@ -7912,6 +7962,57 @@ def admin_paired_status(request: Request) -> JSONResponse:
                 }
             )
     return JSONResponse({"status": "ok", "items": items, "window_seconds": PAIRED_ACTIVITY_WINDOW_SECONDS})
+
+
+@app.get("/api/v1/admin/wireguard/diagnostics")
+def admin_wireguard_diagnostics(request: Request, window_seconds: int = 120) -> JSONResponse:
+    _require_admin(request)
+    _refresh_user_traffic_samples_once()
+    with _db_connect() as con:
+        rows = con.execute(
+            """
+            SELECT b.user_id, b.public_key, b.label, u.username, u.email, u.role
+            FROM wg_peer_bindings b
+            JOIN users u ON u.id = b.user_id
+            ORDER BY b.id DESC
+            """
+        ).fetchall()
+        runtime_totals = _read_wg_dump_totals()
+        items: list[dict[str, Any]] = []
+        seen_users: set[int] = set()
+        for row in rows:
+            uid = int(row["user_id"])
+            if uid in seen_users:
+                continue
+            seen_users.add(uid)
+            diag = _wireguard_diagnostics_for_user(
+                con,
+                uid,
+                window_seconds=window_seconds,
+                wg_runtime_totals=runtime_totals,
+            )
+            items.append(
+                {
+                    "user_id": uid,
+                    "username": str(row["username"]),
+                    "email": str(row["email"]),
+                    "role": str(row["role"]),
+                    "public_key": str(row["public_key"]),
+                    "label": str(row["label"] or ""),
+                    "diagnostics": diag,
+                }
+            )
+    debug = _wireguard_runtime_debug_snapshot()
+    return JSONResponse(
+        {
+            "status": "ok",
+            "window_seconds": max(30, min(900, int(window_seconds))),
+            "items": items,
+            "runtime_peer_count": len(runtime_totals),
+            "debug": debug,
+            "generated_at": _now().isoformat(),
+        }
+    )
 
 
 @app.get("/api/v1/admin/wireguard-bindings")
