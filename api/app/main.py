@@ -1,6 +1,8 @@
 import hashlib
 import hmac
 import ipaddress
+import base64
+import binascii
 import os
 import re
 import secrets
@@ -39,6 +41,7 @@ LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
 LOGIN_WINDOW_MINUTES = int(os.getenv("LOGIN_WINDOW_MINUTES", "10"))
 LOGIN_LOCK_MINUTES = int(os.getenv("LOGIN_LOCK_MINUTES", "15"))
 ONLINE_WINDOW_SECONDS = 300
+PAIRED_ACTIVITY_WINDOW_SECONDS = int(os.getenv("PAIRED_ACTIVITY_WINDOW_SECONDS", "900"))
 METRICS_SAMPLE_INTERVAL_SECONDS = 10
 CAPACITY_TARGET_ACTIVE_USERS = int(os.getenv("CAPACITY_TARGET_ACTIVE_USERS", "15"))
 CAPACITY_CPU_WARN_P95 = float(os.getenv("CAPACITY_CPU_WARN_P95", "70"))
@@ -1362,6 +1365,7 @@ def _read_capacity_status(window_minutes: int = 60) -> dict[str, Any]:
             """,
             (_now().isoformat(), online_threshold),
         ).fetchone()
+        paired = _paired_coverage_summary(con)
     if not rows:
         return {
             "status": "degraded",
@@ -1403,6 +1407,7 @@ def _read_capacity_status(window_minutes: int = 60) -> dict[str, Any]:
         "memory": _signal_by_threshold(mem_p95, float(cfg["ram_warn_p95"]), float(cfg["ram_crit_p95"])),
         "disk": _signal_by_threshold(disk_p95, float(cfg["disk_warn_p95"]), float(cfg["disk_crit_p95"])),
         "concurrency": "warn" if active_sessions > int(cfg["target_active_users"]) else "ok",
+        "paired": "ok" if bool(paired.get("strict_ok", False)) else "critical",
     }
     overall = "ok"
     if "critical" in signals.values():
@@ -1418,6 +1423,7 @@ def _read_capacity_status(window_minutes: int = 60) -> dict[str, Any]:
         "overall": overall,
         "signals": signals,
         "active_sessions": active_sessions,
+        "paired": paired,
         "avg": {"cpu_pct": cpu_avg, "mem_pct": mem_avg, "disk_pct": disk_avg},
         "p95": {"cpu_pct": cpu_p95, "mem_pct": mem_p95, "disk_pct": disk_p95},
         "traffic_window_bytes": {"rx": max(0, rx1 - rx0), "tx": max(0, tx1 - tx0)},
@@ -1565,12 +1571,17 @@ def _read_xray_user_totals() -> dict[str, dict[str, int]]:
             result = container.exec_run(
                 ["xray", "api", "statsquery", "--server=127.0.0.1:10085"],
                 stdout=True,
-                stderr=False,
+                stderr=True,
             )
             exit_code = int(getattr(result, "exit_code", 1))
             output = getattr(result, "output", b"")
             if exit_code == 0 and output:
-                text = output.decode("utf-8", errors="replace")
+                if isinstance(output, tuple):
+                    # Some Docker SDK variants can return (stdout, stderr).
+                    combined = b"".join(chunk for chunk in output if isinstance(chunk, (bytes, bytearray)))
+                    text = combined.decode("utf-8", errors="replace")
+                else:
+                    text = output.decode("utf-8", errors="replace")
                 lines = [line.strip() for line in text.splitlines() if line.strip()]
         except Exception:
             lines = []
@@ -1792,6 +1803,139 @@ def _ensure_xray_binding_for_user(user_id: int, client_email: str, label: str = 
                 (int(user_id), key, str(label or "auto-profile"), _now().isoformat()),
             )
         con.commit()
+
+
+def _normalize_wg_public_key(public_key: str) -> str:
+    key = str(public_key or "").strip()
+    if len(key) < 40:
+        raise HTTPException(status_code=400, detail="Invalid WireGuard public key")
+    try:
+        decoded = base64.b64decode(key.encode("utf-8"), validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid WireGuard public key")
+    if len(decoded) != 32:
+        raise HTTPException(status_code=400, detail="Invalid WireGuard public key")
+    return key
+
+
+def _set_user_wg_public_key(user_id: int, public_key: str) -> None:
+    with _db_connect() as con:
+        con.execute(
+            """
+            UPDATE user_access_profiles
+            SET wg_public_key = ?, updated_at = ?
+            WHERE user_id = ?
+            """,
+            (public_key, _now().isoformat(), int(user_id)),
+        )
+        con.commit()
+
+
+def _ensure_wg_binding_for_user(user_id: int, public_key: str, label: str = "auto-profile") -> None:
+    key = str(public_key or "").strip()
+    if not key:
+        return
+    with _db_connect() as con:
+        con.execute(
+            """
+            INSERT INTO wg_peer_bindings (user_id, public_key, label, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(public_key)
+            DO UPDATE SET user_id = excluded.user_id, label = excluded.label
+            """,
+            (int(user_id), key, str(label or "auto-profile"), _now().isoformat()),
+        )
+        con.commit()
+
+
+def _paired_status_for_user(con: sqlite3.Connection, user_id: int) -> dict[str, Any]:
+    uid = int(user_id)
+    threshold = (_now() - timedelta(seconds=PAIRED_ACTIVITY_WINDOW_SECONDS)).isoformat()
+    wg_bound_row = con.execute(
+        "SELECT public_key FROM wg_peer_bindings WHERE user_id = ? LIMIT 1",
+        (uid,),
+    ).fetchone()
+    xray_bound_row = con.execute(
+        "SELECT client_email FROM xray_client_bindings WHERE user_id = ? LIMIT 1",
+        (uid,),
+    ).fetchone()
+    wg_recent_row = con.execute(
+        """
+        SELECT COALESCE(SUM(rx_bytes + tx_bytes), 0) AS total_bytes
+        FROM user_wireguard_traffic_samples
+        WHERE user_id = ? AND ts >= ?
+        """,
+        (uid, threshold),
+    ).fetchone()
+    xray_recent_row = con.execute(
+        """
+        SELECT COALESCE(SUM(rx_bytes + tx_bytes), 0) AS total_bytes
+        FROM user_xray_traffic_samples
+        WHERE user_id = ? AND ts >= ?
+        """,
+        (uid, threshold),
+    ).fetchone()
+    wg_recent_bytes = int((wg_recent_row["total_bytes"] if wg_recent_row else 0) or 0)
+    xray_recent_bytes = int((xray_recent_row["total_bytes"] if xray_recent_row else 0) or 0)
+    wg_bound = bool(wg_bound_row)
+    xray_bound = bool(xray_bound_row)
+    wg_active = wg_recent_bytes > 0
+    xray_active = xray_recent_bytes > 0
+    if wg_bound and xray_bound and wg_active and xray_active:
+        status = "active"
+    elif wg_bound and xray_bound:
+        status = "degraded"
+    else:
+        status = "incomplete"
+    return {
+        "status": status,
+        "window_seconds": PAIRED_ACTIVITY_WINDOW_SECONDS,
+        "wg": {
+            "bound": wg_bound,
+            "public_key": str(wg_bound_row["public_key"]) if wg_bound_row else "",
+            "active": wg_active,
+            "recent_bytes": wg_recent_bytes,
+        },
+        "xray": {
+            "bound": xray_bound,
+            "client_email": str(xray_bound_row["client_email"]) if xray_bound_row else "",
+            "active": xray_active,
+            "recent_bytes": xray_recent_bytes,
+        },
+    }
+
+
+def _paired_coverage_summary(con: sqlite3.Connection) -> dict[str, Any]:
+    rows = con.execute(
+        """
+        SELECT id
+        FROM users
+        WHERE role = 'user' AND is_active = 1
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    total = len(rows)
+    active = 0
+    degraded = 0
+    incomplete = 0
+    for row in rows:
+        paired = _paired_status_for_user(con, int(row["id"]))
+        status = str(paired.get("status", "incomplete"))
+        if status == "active":
+            active += 1
+        elif status == "degraded":
+            degraded += 1
+        else:
+            incomplete += 1
+    coverage_pct = round((active / total) * 100.0, 2) if total > 0 else 100.0
+    return {
+        "paired_total_users": total,
+        "paired_active_users": active,
+        "paired_degraded_users": degraded,
+        "paired_incomplete_users": incomplete,
+        "paired_coverage_pct": coverage_pct,
+        "strict_ok": (total == 0) or (active == total),
+    }
 
 
 def _collect_xray_user_traffic(con: sqlite3.Connection, ts_iso: str) -> None:
@@ -2448,6 +2592,11 @@ class AdminBindXrayClientRequest(BaseModel):
     label: str = ""
 
 
+class UserWireGuardKeyRequest(BaseModel):
+    public_key: str
+    label: str = "self-registered"
+
+
 class UserProfileUpdateRequest(BaseModel):
     username: str
     email: str
@@ -2645,6 +2794,7 @@ def startup() -> None:
         _ensure_column(
             con, "user_access_profiles", "last_region_profile", "last_region_profile TEXT NOT NULL DEFAULT 'ru'"
         )
+        _ensure_column(con, "user_access_profiles", "wg_public_key", "wg_public_key TEXT NOT NULL DEFAULT ''")
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS registration_requests (
@@ -3123,11 +3273,24 @@ def cabinet(request: Request) -> HTMLResponse:
     </div>
     <button data-action="load-device-card">Load card</button>
   </div>
+  <div style="margin-top:10px;display:grid;grid-template-columns:2fr 1fr auto;gap:8px;align-items:end;">
+    <div>
+      <div class="label-muted">WireGuard public key (paired mode)</div>
+      <input id="wg-public-key" placeholder="Paste device WG public key (base64, 44 chars)" />
+    </div>
+    <div>
+      <div class="label-muted">Label</div>
+      <input id="wg-public-key-label" placeholder="phone / laptop" />
+    </div>
+    <button data-action="register-wg-key">Register key</button>
+  </div>
+  <pre id="wg-register-out" style="margin-top:8px;">WG key: not registered</pre>
   <div id="device-card-out" style="margin-top:12px;"></div>
 </div>
 <div class="card cab-section" data-cab-section="traffic">
   <h2>Traffic and resource usage</h2>
   <p class="muted">Live counters and aggregated usage for your profile.</p>
+  <div id="cab-paired-status" class="muted" style="margin-bottom:8px;">Paired status: loading...</div>
   <div id="cab-traffic-resources" class="muted">Resources: loading...</div>
   <div style="overflow:auto;margin-top:8px;border:1px solid rgba(50,65,90,0.14);border-radius:10px;background:rgba(255,255,255,0.65);">
     <table style="width:100%;border-collapse:collapse;">
@@ -3299,6 +3462,22 @@ function renderCabinetTrafficSummary(summary) {{
       Number(r.memory_used_pct || 0).toFixed(1) + '% · Disk ' + Number(r.disk_used_pct || 0).toFixed(1) + '%';
   }}
 }}
+function pairedBadge(state) {{
+  const s = String(state || 'incomplete');
+  if (s === 'active') return '<span class="status-pill status-running">active</span>';
+  if (s === 'degraded') return '<span class="status-pill status-pending">degraded</span>';
+  return '<span class="status-pill status-in_error">incomplete</span>';
+}}
+function renderCabinetPairedStatus(paired) {{
+  const root = document.getElementById('cab-paired-status');
+  if (!root) return;
+  const p = paired || {{}};
+  const wg = p.wg || {{}};
+  const xray = p.xray || {{}};
+  root.innerHTML = 'Paired status: ' + pairedBadge(p.status) +
+    ' · WG: ' + (wg.bound ? 'bound' : 'not bound') + ', ' + (wg.active ? 'active' : 'idle') +
+    ' · Xray: ' + (xray.bound ? 'bound' : 'not bound') + ', ' + (xray.active ? 'active' : 'idle');
+}}
 function renderCabinetTrafficChart(points) {{
   const canvas = document.getElementById('cab-traffic-canvas');
   if (!canvas || !canvas.getContext) return;
@@ -3325,9 +3504,10 @@ function renderCabinetTrafficChart(points) {{
   ctx.stroke();
 }}
 async function loadCabinetTraffic() {{
-  const [sumR, tsR] = await Promise.all([
+  const [sumR, tsR, pairedR] = await Promise.all([
     fetch('/api/v1/user/traffic/summary'),
-    fetch('/api/v1/user/traffic/timeseries?minutes=1440')
+    fetch('/api/v1/user/traffic/timeseries?minutes=1440'),
+    fetch('/api/v1/user/paired-status')
   ]);
   if (sumR.ok) {{
     const s = await sumR.json();
@@ -3337,6 +3517,30 @@ async function loadCabinetTraffic() {{
     const t = await tsR.json();
     renderCabinetTrafficChart(t.points || []);
   }}
+  if (pairedR.ok) {{
+    const d = await pairedR.json();
+    renderCabinetPairedStatus(d.paired || {{}});
+  }}
+}}
+async function registerWireGuardKey() {{
+  const keyEl = document.getElementById('wg-public-key');
+  const labelEl = document.getElementById('wg-public-key-label');
+  const out = document.getElementById('wg-register-out');
+  const public_key = String((keyEl && keyEl.value) || '').trim();
+  const label = String((labelEl && labelEl.value) || '').trim() || 'self-registered';
+  if (!public_key) {{
+    if (out) out.textContent = 'WireGuard key is required.';
+    return;
+  }}
+  if (out) out.textContent = 'Registering...';
+  const r = await fetch('/api/v1/user/wireguard/register-key', {{
+    method:'POST',
+    headers: {{'Content-Type':'application/json', 'X-CSRF-Token': getCsrfToken()}},
+    body: JSON.stringify({{public_key, label}})
+  }});
+  const t = await r.text();
+  if (out) out.textContent = t;
+  if (r.ok) await loadCabinetTraffic();
 }}
 async function copyConfigUri() {{
   const el = document.getElementById('cfg-uri');
@@ -3357,6 +3561,9 @@ async function loadDeviceCard() {{
   }}
   let j = null;
   try {{ j = JSON.parse(t); }} catch (e) {{ j = null; }}
+  const wgInput = document.getElementById('wg-public-key');
+  const wgKey = String(((((j || {{}}).card || {{}}).config_fields || {{}}).wireguard_public_key) || '');
+  if (wgInput && wgKey) wgInput.value = wgKey;
   renderDeviceCard(j ? j.card : null);
 }}
 async function initDeviceCard() {{
@@ -3381,6 +3588,9 @@ async function initDeviceCard() {{
   refreshPlatformOptions();
   if (platformEl && j.platform) platformEl.value = j.platform;
   if (regionEl && j.region_profile) regionEl.value = j.region_profile;
+  const wgInput = document.getElementById('wg-public-key');
+  const wgKey = String((((j.card || {{}}).config_fields || {{}}).wireguard_public_key) || '');
+  if (wgInput && wgKey) wgInput.value = wgKey;
   renderDeviceCard(j.card || null);
 }}
 async function saveProfile() {{
@@ -3433,6 +3643,7 @@ document.addEventListener('click', (event) => {{
   if (action === 'close-edit-profile-modal') return void closeEditProfileModal();
   if (action === 'save-profile') return void saveProfile();
   if (action === 'load-device-card') return void loadDeviceCard();
+  if (action === 'register-wg-key') return void registerWireGuardKey();
   if (action === 'copy-config-uri') return void copyConfigUri();
   if (action === 'copy-value') {{
     const encoded = String(btn.getAttribute('data-copy-value') || '');
@@ -3611,6 +3822,7 @@ def admin(request: Request) -> HTMLResponse:
   <h2>Realtime system overview</h2>
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;">
     <div><div class="muted">Online users</div><div id="m-online" style="font-size:24px;font-weight:700;">-</div></div>
+    <div><div class="muted">Paired users (strict)</div><div id="m-paired" style="font-size:24px;font-weight:700;">-</div></div>
     <div><div class="muted">CPU load</div><div id="m-cpu" style="font-size:24px;font-weight:700;">-</div></div>
     <div><div class="muted">Memory used</div><div id="m-mem" style="font-size:24px;font-weight:700;">-</div></div>
     <div><div class="muted">Disk used</div><div id="m-disk" style="font-size:24px;font-weight:700;">-</div></div>
@@ -3624,6 +3836,7 @@ def admin(request: Request) -> HTMLResponse:
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;">
     <div><div class="muted">Overall</div><div id="cap-overall" style="font-size:24px;font-weight:700;">-</div></div>
     <div><div class="muted">Target active users</div><div id="cap-target" style="font-size:24px;font-weight:700;">-</div></div>
+    <div><div class="muted">Paired strict KPI</div><div id="cap-paired-kpi" style="font-size:24px;font-weight:700;">-</div></div>
     <div><div class="muted">CPU p95</div><div id="cap-cpu-p95" style="font-size:24px;font-weight:700;">-</div></div>
     <div><div class="muted">RAM p95</div><div id="cap-mem-p95" style="font-size:24px;font-weight:700;">-</div></div>
     <div><div class="muted">Disk p95</div><div id="cap-disk-p95" style="font-size:24px;font-weight:700;">-</div></div>
@@ -3872,6 +4085,17 @@ def admin(request: Request) -> HTMLResponse:
   </table>
 </div>
 
+<div class="card admin-section" data-section="traffic" data-subsection="paired">
+  <h2>Paired mode status (WireGuard + Xray)</h2>
+  <p class="muted">Each user should have both bindings and recent traffic on both transports in the activity window.</p>
+  <table style="width:100%; border-collapse:collapse;">
+    <thead>
+      <tr><th align="left">User</th><th align="left">Role</th><th align="left">Pair status</th><th align="left">WG</th><th align="left">Xray</th></tr>
+    </thead>
+    <tbody id="paired-status-body"><tr><td colspan="5" class="muted">Loading...</td></tr></tbody>
+  </table>
+</div>
+
 <div class="card admin-section" data-section="traffic" data-subsection="per-user">
   <h2>Per-user traffic (WG + Xray exact)</h2>
   <p class="muted">Data is based on WireGuard/Xray counters and binding tables above.</p>
@@ -3965,7 +4189,7 @@ const sectionSubsections = {{
   configurator: [['settings', 'Settings']],
   approvals: [['requests', 'Requests']],
   users: [['management', 'Management'], ['recent', 'Recent users']],
-  traffic: [['wg-bindings', 'WG bindings'], ['xray-bindings', 'Xray bindings'], ['per-user', 'Per-user']],
+  traffic: [['wg-bindings', 'WG bindings'], ['xray-bindings', 'Xray bindings'], ['paired', 'Paired mode'], ['per-user', 'Per-user']],
   logs: [['admin-log', 'Admin log']],
 }};
 const escHtml = (s) => String((s === undefined || s === null) ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -4412,6 +4636,34 @@ function renderUserTraffic(items) {{
     </tr>`;
   }}).join('');
 }}
+function renderAdminPairedStatus(items) {{
+  const body = document.getElementById('paired-status-body');
+  if (!body) return;
+  if (!items || items.length === 0) {{
+    body.innerHTML = '<tr><td colspan="5" class="muted">No users.</td></tr>';
+    return;
+  }}
+  const badge = (s) => {{
+    const st = String(s || 'incomplete');
+    if (st === 'active') return '<span class="status-pill status-running">active</span>';
+    if (st === 'degraded') return '<span class="status-pill status-pending">degraded</span>';
+    return '<span class="status-pill status-in_error">incomplete</span>';
+  }};
+  body.innerHTML = items.map((i) => {{
+    const p = i.paired || {{}};
+    const wg = p.wg || {{}};
+    const xray = p.xray || {{}};
+    const wgText = (wg.bound ? 'bound' : 'missing') + ' · ' + (wg.active ? 'active' : 'idle') + ' · ' + fmtBytes(wg.recent_bytes || 0);
+    const xText = (xray.bound ? 'bound' : 'missing') + ' · ' + (xray.active ? 'active' : 'idle') + ' · ' + fmtBytes(xray.recent_bytes || 0);
+    return `<tr>
+      <td>${{escHtml(i.username || '-')}}<br><span class="muted">${{escHtml(i.email || '-')}}</span></td>
+      <td>${{escHtml(i.role || '-')}}</td>
+      <td>${{badge(p.status)}}</td>
+      <td>${{escHtml(wgText)}}</td>
+      <td>${{escHtml(xText)}}</td>
+    </tr>`;
+  }}).join('');
+}}
 function renderAdminUserTrafficPeriods(periods) {{
   const body = document.getElementById('admin-user-traffic-periods-body');
   if (!body) return;
@@ -4502,6 +4754,7 @@ function renderCapacityStatus(c) {{
   if (!c || c.status !== 'ok') return;
   const overallEl = document.getElementById('cap-overall');
   const targetEl = document.getElementById('cap-target');
+  const pairedEl = document.getElementById('cap-paired-kpi');
   const cpuEl = document.getElementById('cap-cpu-p95');
   const memEl = document.getElementById('cap-mem-p95');
   const diskEl = document.getElementById('cap-disk-p95');
@@ -4517,12 +4770,20 @@ function renderCapacityStatus(c) {{
   if (targetEl) targetEl.textContent = `${{Number(c.active_sessions || 0)}} / ${{Number(c.target_active_users || 15)}}`;
   const p95 = c && c.p95 ? c.p95 : {{}};
   const signals = c && c.signals ? c.signals : {{}};
+  const paired = c && c.paired ? c.paired : {{}};
   if (cpuEl) cpuEl.textContent = `${{Number(p95.cpu_pct || 0).toFixed(1)}}%`;
   if (memEl) memEl.textContent = `${{Number(p95.mem_pct || 0).toFixed(1)}}%`;
   if (diskEl) diskEl.textContent = `${{Number(p95.disk_pct || 0).toFixed(1)}}%`;
+  if (pairedEl) {{
+    const active = Number(paired.paired_active_users || 0);
+    const total = Number(paired.paired_total_users || 0);
+    const ok = !!paired.strict_ok;
+    const color = ok ? '#15803d' : '#b91c1c';
+    pairedEl.innerHTML = `<span style="color:${{color}}">${{active}} / ${{total}}</span>`;
+  }}
   if (summaryEl) {{
     summaryEl.textContent = `window: ${{Number(c.window_minutes || 0)}} min, samples: ${{Number(c.samples || 0)}}. ` +
-      `signals -> cpu:${{signals.cpu || '-'}}, mem:${{signals.memory || '-'}}, disk:${{signals.disk || '-'}}, concurrency:${{signals.concurrency || '-'}}.`;
+      `signals -> cpu:${{signals.cpu || '-'}}, mem:${{signals.memory || '-'}}, disk:${{signals.disk || '-'}}, concurrency:${{signals.concurrency || '-'}}, paired:${{signals.paired || '-'}}.`;
   }}
   renderConfigRuntime(c);
 }}
@@ -4758,7 +5019,7 @@ async function applyConfigurator() {{
   await refreshAdminLive();
 }}
 async function refreshAdminLive() {{
-  const [statsR, onlineR, tsR, trafficR, servicesR, deployEventsR, updateAuditR, capacityR, backupStatusR, securityEventsR, securityBlockedR] = await Promise.all([
+  const [statsR, onlineR, tsR, trafficR, servicesR, deployEventsR, updateAuditR, capacityR, backupStatusR, securityEventsR, securityBlockedR, pairedR] = await Promise.all([
     fetch('/api/v1/admin/stats'),
     fetch('/api/v1/admin/online-users'),
     fetch('/api/v1/admin/system-metrics/timeseries?minutes=60'),
@@ -4769,11 +5030,20 @@ async function refreshAdminLive() {{
     fetch('/api/v1/admin/capacity-status?window_minutes=60'),
     fetch('/api/v1/admin/backup-status'),
     fetch('/api/v1/admin/security/events?limit=120'),
-    fetch('/api/v1/admin/security/blocked?limit=120')
+    fetch('/api/v1/admin/security/blocked?limit=120'),
+    fetch('/api/v1/admin/paired-status')
   ]);
   if (statsR.ok) {{
     const s = (await statsR.json()).stats || {{}};
     document.getElementById('m-online').textContent = String((s.active_sessions === undefined || s.active_sessions === null) ? '-' : s.active_sessions);
+    const pairedEl = document.getElementById('m-paired');
+    if (pairedEl) {{
+      const a = Number(s.paired_active_users || 0);
+      const t = Number(s.paired_total_users || 0);
+      const ok = !!s.paired_strict_ok;
+      const color = ok ? '#15803d' : '#b91c1c';
+      pairedEl.innerHTML = `<span style="color:${{color}}">${{a}} / ${{t}}</span>`;
+    }}
     document.getElementById('m-cpu').textContent = `${{Number(s.current_cpu_load_pct || 0).toFixed(1)}}%`;
     document.getElementById('m-mem').textContent = `${{Number(s.current_memory_used_pct || 0).toFixed(1)}}%`;
     document.getElementById('m-disk').textContent = `${{Number(s.current_disk_used_pct || 0).toFixed(1)}}%`;
@@ -4838,6 +5108,10 @@ async function refreshAdminLive() {{
   if (securityBlockedR.ok) {{
     const s = await securityBlockedR.json();
     renderSecurityBlocked(s.items || [], s.reason || '');
+  }}
+  if (pairedR.ok) {{
+    const p = await pairedR.json();
+    renderAdminPairedStatus(p.items || []);
   }}
 }}
 async function bindWgPeer() {{
@@ -5261,6 +5535,26 @@ def update_user_profile(request: Request, payload: UserProfileUpdateRequest) -> 
     return JSONResponse({"status": "ok", "message": "profile updated"})
 
 
+@app.post("/api/v1/user/wireguard/register-key")
+def user_register_wireguard_key(request: Request, payload: UserWireGuardKeyRequest) -> JSONResponse:
+    _ensure_csrf(request)
+    user = _require_user(request)
+    _ensure_user_xray_profile(user)
+    key = _normalize_wg_public_key(payload.public_key)
+    _set_user_wg_public_key(int(user["id"]), key)
+    _ensure_wg_binding_for_user(int(user["id"]), key, payload.label or "self-registered")
+    return JSONResponse({"status": "ok", "message": "WireGuard public key registered and bound"})
+
+
+@app.get("/api/v1/user/paired-status")
+def user_paired_status(request: Request) -> JSONResponse:
+    user = _require_user(request)
+    _refresh_user_traffic_samples_once()
+    with _db_connect() as con:
+        paired = _paired_status_for_user(con, int(user["id"]))
+    return JSONResponse({"status": "ok", "paired": paired})
+
+
 @app.get("/api/v1/user/device-config")
 def user_device_config(
     request: Request,
@@ -5286,6 +5580,11 @@ def user_device_config(
     _set_user_device_preferences(int(user["id"]), device_type, platform, region_profile)
     _ensure_xray_client_in_config(profile["xray_uuid"], profile["xray_email"])
     _ensure_xray_binding_for_user(int(user["id"]), profile["xray_email"], "auto-profile")
+    with _db_connect() as con:
+        row = con.execute("SELECT wg_public_key FROM user_access_profiles WHERE user_id = ?", (int(user["id"]),)).fetchone()
+    wg_public_key = str((row["wg_public_key"] if row else "") or "").strip()
+    if wg_public_key:
+        _ensure_wg_binding_for_user(int(user["id"]), wg_public_key, "auto-profile")
     tpl = _read_xray_connection_template()
 
     host = tpl.get("server_address", "").strip() or request.url.hostname or "127.0.0.1"
@@ -5436,6 +5735,9 @@ def user_device_config(
 
     if not primary_client:
         primary_client = {"name": "Client", "install_url": "", "source": "unknown"}
+    instructions.append(
+        "Paired mode requirement: register your device WireGuard public key in User cabinet -> Device setup so WG + Xray work together."
+    )
 
     return JSONResponse(
         {
@@ -5461,6 +5763,7 @@ def user_device_config(
                     "bypass_geosite": "category-ru",
                     "bypass_custom": ", ".join(bypass_all[:20]) if bypass_all else "",
                     "bypass_ru_examples": ", ".join(bypass_ru_domains),
+                    "wireguard_public_key": wg_public_key,
                 },
                 "instructions": instructions,
                 "primary_client": primary_client,
@@ -5514,6 +5817,7 @@ def admin_stats(request: Request) -> JSONResponse:
             WHERE ts >= datetime('now', '-24 hour')
             """
         ).fetchone()
+        paired = _paired_coverage_summary(con)
     return JSONResponse(
         {
             "status": "ok",
@@ -5532,6 +5836,12 @@ def admin_stats(request: Request) -> JSONResponse:
                 "avg_cpu_1h_pct": round(float(one_hour["avg_cpu"] or 0.0), 2) if one_hour else 0.0,
                 "avg_mem_1h_pct": round(float(one_hour["avg_mem"] or 0.0), 2) if one_hour else 0.0,
                 "avg_disk_1h_pct": round(float(one_hour["avg_disk"] or 0.0), 2) if one_hour else 0.0,
+                "paired_total_users": int(paired["paired_total_users"]),
+                "paired_active_users": int(paired["paired_active_users"]),
+                "paired_degraded_users": int(paired["paired_degraded_users"]),
+                "paired_incomplete_users": int(paired["paired_incomplete_users"]),
+                "paired_coverage_pct": float(paired["paired_coverage_pct"]),
+                "paired_strict_ok": bool(paired["strict_ok"]),
             },
         }
     )
@@ -6015,6 +6325,33 @@ def admin_user_traffic_timeseries(request: Request, user_id: int, minutes: int =
     return _build_user_traffic_timeseries_response(user_id=int(user_id), minutes=minutes)
 
 
+@app.get("/api/v1/admin/paired-status")
+def admin_paired_status(request: Request) -> JSONResponse:
+    _require_admin(request)
+    _refresh_user_traffic_samples_once()
+    with _db_connect() as con:
+        users = con.execute(
+            """
+            SELECT id, username, email, role
+            FROM users
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        for u in users:
+            paired = _paired_status_for_user(con, int(u["id"]))
+            items.append(
+                {
+                    "user_id": int(u["id"]),
+                    "username": str(u["username"]),
+                    "email": str(u["email"]),
+                    "role": str(u["role"]),
+                    "paired": paired,
+                }
+            )
+    return JSONResponse({"status": "ok", "items": items, "window_seconds": PAIRED_ACTIVITY_WINDOW_SECONDS})
+
+
 @app.get("/api/v1/admin/wireguard-bindings")
 def admin_wireguard_bindings(request: Request) -> JSONResponse:
     _require_admin(request)
@@ -6037,13 +6374,24 @@ def admin_wireguard_bindings(request: Request) -> JSONResponse:
 def admin_wireguard_bind(request: Request, payload: AdminBindWireGuardRequest) -> JSONResponse:
     _ensure_csrf(request)
     _require_admin(request)
-    public_key = payload.public_key.strip()
-    if len(public_key) < 20:
-        raise HTTPException(status_code=400, detail="Invalid WireGuard public key")
+    public_key = _normalize_wg_public_key(payload.public_key)
     with _db_connect() as con:
-        user = con.execute("SELECT id FROM users WHERE id = ?", (payload.user_id,)).fetchone()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+        user_row = con.execute(
+            "SELECT id, username, email, role, is_active FROM users WHERE id = ?",
+            (payload.user_id,),
+        ).fetchone()
+    if not user_row:
+        raise HTTPException(status_code=404, detail="User not found")
+    _ensure_user_xray_profile(
+        {
+            "id": int(user_row["id"]),
+            "username": str(user_row["username"]),
+            "email": str(user_row["email"]),
+            "role": str(user_row["role"]),
+            "is_active": int(user_row["is_active"]),
+        }
+    )
+    with _db_connect() as con:
         con.execute(
             """
             INSERT INTO wg_peer_bindings (user_id, public_key, label, created_at)
@@ -6053,6 +6401,14 @@ def admin_wireguard_bind(request: Request, payload: AdminBindWireGuardRequest) -
             """,
             (payload.user_id, public_key, payload.label.strip(), _now().isoformat()),
         )
+        con.execute(
+            """
+            UPDATE user_access_profiles
+            SET wg_public_key = ?, updated_at = ?
+            WHERE user_id = ?
+            """,
+            (public_key, _now().isoformat(), int(payload.user_id)),
+        )
         con.commit()
     return JSONResponse({"status": "ok", "message": "wireguard peer bound"})
 
@@ -6061,9 +6417,16 @@ def admin_wireguard_bind(request: Request, payload: AdminBindWireGuardRequest) -
 def admin_wireguard_unbind(public_key: str, request: Request) -> JSONResponse:
     _ensure_csrf(request)
     _require_admin(request)
+    key = str(public_key or "").strip()
     with _db_connect() as con:
-        con.execute("DELETE FROM wg_peer_bindings WHERE public_key = ?", (public_key,))
-        con.execute("DELETE FROM wg_peer_counters WHERE public_key = ?", (public_key,))
+        row = con.execute("SELECT user_id FROM wg_peer_bindings WHERE public_key = ?", (key,)).fetchone()
+        con.execute("DELETE FROM wg_peer_bindings WHERE public_key = ?", (key,))
+        con.execute("DELETE FROM wg_peer_counters WHERE public_key = ?", (key,))
+        if row:
+            con.execute(
+                "UPDATE user_access_profiles SET wg_public_key = '', updated_at = ? WHERE user_id = ?",
+                (_now().isoformat(), int(row["user_id"])),
+            )
         con.commit()
     return JSONResponse({"status": "ok", "message": "wireguard peer unbound"})
 
