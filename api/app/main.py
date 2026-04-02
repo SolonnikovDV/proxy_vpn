@@ -5931,7 +5931,7 @@ def admin_user_traffic_summary(request: Request, hours: int = 24) -> JSONRespons
               WHERE ts >= datetime('now', ?)
               GROUP BY user_id
             ) e ON e.user_id = u.id
-            ORDER BY (rx_bytes + tx_bytes) DESC, u.username ASC
+            ORDER BY (5 + 6) DESC, u.username ASC
             """,
             (f"-{hours} hours", f"-{hours} hours", f"-{hours} hours"),
         ).fetchall()
