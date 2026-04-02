@@ -71,6 +71,7 @@ WG_CLIENT_DEFAULT_ALLOWED_IPS = "0.0.0.0/0, ::/0" if WG_ENABLE_IPV6 else "0.0.0.
 WG_DIAG_MIN_TRAFFIC_BYTES = int(os.getenv("WG_DIAG_MIN_TRAFFIC_BYTES", "16384"))
 WG_ACTIVE_PROBE_SECONDS = int(os.getenv("WG_ACTIVE_PROBE_SECONDS", "8"))
 WG_ACTIVE_PROBE_MIN_DELTA_BYTES = int(os.getenv("WG_ACTIVE_PROBE_MIN_DELTA_BYTES", "16384"))
+WG_ACTIVE_PROBE_MIN_DELTA_BYTES_MOBILE = int(os.getenv("WG_ACTIVE_PROBE_MIN_DELTA_BYTES_MOBILE", "4096"))
 WG_MANAGED_BEGIN = "# BEGIN PROXY_VPN_MANAGED_PEERS"
 WG_MANAGED_END = "# END PROXY_VPN_MANAGED_PEERS"
 DEPLOY_HISTORY_PATH = os.getenv("DEPLOY_HISTORY_PATH", "/logs/deploy-history.log")
@@ -2467,10 +2468,11 @@ def _read_wg_runtime_totals_direct() -> dict[str, dict[str, Any]]:
     return _parse_wg_dump_totals_lines(lines)
 
 
-def _wireguard_active_probe_for_public_key(public_key: str) -> dict[str, Any]:
+def _wireguard_active_probe_for_public_key(public_key: str, threshold_override: Optional[int] = None) -> dict[str, Any]:
     key = str(public_key or "").strip()
     wait_seconds = max(3, min(20, int(WG_ACTIVE_PROBE_SECONDS)))
-    threshold = max(1024, int(WG_ACTIVE_PROBE_MIN_DELTA_BYTES))
+    raw_threshold = int(threshold_override if threshold_override is not None else WG_ACTIVE_PROBE_MIN_DELTA_BYTES)
+    threshold = max(1024, raw_threshold)
     now_ts = int(time.time())
     start_totals = _read_wg_runtime_totals_direct()
     start = start_totals.get(key, {})
@@ -6534,7 +6536,8 @@ async function runAdminWgDiagnosticsForUser(userId, username, email) {{
     lines.push(
       'verdict=' + String(probe.verdict || '-') +
       ' | wait=' + String(probe.wait_seconds || '-') + 's' +
-      ' | threshold=' + fmtBytes(Number(probe.threshold_bytes || 0))
+      ' | threshold=' + fmtBytes(Number(probe.threshold_bytes || 0)) +
+      ' | threshold_source=' + String(j.active_probe_threshold_source || 'default')
     );
     lines.push(
       'client_attempt_seen=' + String(!!probe.client_attempt_seen) +
@@ -6549,6 +6552,18 @@ async function runAdminWgDiagnosticsForUser(userId, username, email) {{
       ' / total ' + fmtBytes(Number(probe.delta_total_bytes || 0))
     );
     lines.push('note: ' + String(probe.note || '-'));
+  }}
+  lines.push('');
+  lines.push('=== Web-load sanity guidance ===');
+  const probeVerdict = String((probe && probe.verdict) || '');
+  if (probeVerdict === 'data_path_confirmed') {{
+    lines.push('Result: data path confirmed for web traffic class.');
+  }} else if (probeVerdict === 'data_path_low_delta') {{
+    lines.push('Result: minimal traffic only. Keep diagnostics running while opening 2-3 websites in browser.');
+  }} else if (probeVerdict === 'data_path_not_confirmed') {{
+    lines.push('Result: no payload in probe window. Ensure this exact tunnel is active and retry immediately.');
+  }} else {{
+    lines.push('Result: probe status unavailable.');
   }}
   lines.push('');
   lines.push('=== Client-routing suspicion ===');
@@ -8169,7 +8184,6 @@ def admin_wireguard_diagnostics(
             ORDER BY b.id DESC
             """
         ).fetchall()
-        runtime_totals = _read_wg_dump_totals()
         items: list[dict[str, Any]] = []
         seen_users: set[int] = set()
         for row in rows:
@@ -8236,9 +8250,19 @@ def admin_wireguard_diagnostics(
                     "persistent_keepalive": str(tpl.get("persistent_keepalive", "25") or ""),
                     "updated_at": "fallback-template",
                 }
+    probe_threshold = int(WG_ACTIVE_PROBE_MIN_DELTA_BYTES)
+    probe_threshold_source = "default"
     active_probe: dict[str, Any] = {}
     if len(items) == 1:
-        active_probe = _wireguard_active_probe_for_public_key(str(items[0].get("public_key", "")))
+        uid = int(items[0].get("user_id", 0) or 0)
+        prefs = _get_user_device_preferences(uid) if uid > 0 else {"device_type": ""}
+        if str((prefs or {}).get("device_type", "")).strip().lower() == "mobile":
+            probe_threshold = int(WG_ACTIVE_PROBE_MIN_DELTA_BYTES_MOBILE)
+            probe_threshold_source = "mobile"
+        active_probe = _wireguard_active_probe_for_public_key(
+            str(items[0].get("public_key", "")),
+            threshold_override=probe_threshold,
+        )
     debug = _wireguard_runtime_debug_snapshot()
     server_path_ok = all(bool((debug.get(k) or {}).get("ok")) for k in ["ip_forward", "wg_show", "nat_postrouting", "forward_chain", "mangle_forward"])
     probe_verdict = str(active_probe.get("verdict", ""))
@@ -8254,6 +8278,7 @@ def admin_wireguard_diagnostics(
             "items": items,
             "runtime_peer_count": len(runtime_totals),
             "active_probe": active_probe,
+            "active_probe_threshold_source": probe_threshold_source,
             "client_routing_suspicion": {
                 "server_path_ok": bool(server_path_ok),
                 "payload_from_client": bool(payload_from_client),
