@@ -186,13 +186,27 @@ EOF
       dc -f compose.yaml -f compose.prod.yaml up -d xray wireguard
     fi
   }
+  vpn_core_ids() {
+    docker inspect -f '{{.Id}}' proxy-vpn-xray proxy-vpn-wireguard 2>/dev/null | tr '\n' ' ' | sed -e 's/[[:space:]]\+$//'
+  }
+  assert_vpn_core_unchanged() {
+    local before_ids="$1"
+    local after_ids
+    after_ids="$(vpn_core_ids)"
+    if [ -n "${before_ids}" ] && [ -n "${after_ids}" ] && [ "${before_ids}" != "${after_ids}" ]; then
+      die "VPN core containers changed during safe deploy (xray/wireguard recreation detected)."
+    fi
+  }
   prod_up_stack() {
+    local core_ids_before=""
+    core_ids_before="$(vpn_core_ids)"
     local vpn_core_rebuild
     vpn_core_rebuild="$(detect_vpn_core_rebuild_flag)"
     if [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${vpn_core_rebuild}" != "1" ]; then
       log "Safe mode: no VPN core changes detected; preserving active VPN tunnels."
-      dc -f compose.yaml -f compose.prod.yaml up -d --build api security-guard caddy
+      dc -f compose.yaml -f compose.prod.yaml up -d --no-deps --build api security-guard caddy
       ensure_vpn_core_running
+      assert_vpn_core_unchanged "${core_ids_before}"
     elif [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${vpn_core_rebuild}" = "1" ]; then
       log "VPN core rebuild explicitly enabled; rebuilding full stack (including xray/wireguard)."
       dc -f compose.yaml -f compose.prod.yaml up -d --build
@@ -265,7 +279,7 @@ EOF
       log "Applying Caddy force-recreate (config-related changes detected)."
       dc -f compose.yaml -f compose.prod.yaml up -d --force-recreate caddy
     else
-      dc -f compose.yaml -f compose.prod.yaml up -d caddy
+      dc -f compose.yaml -f compose.prod.yaml up -d --no-deps caddy
     fi
   }
   case "${ACTION}" in

@@ -127,6 +127,19 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   die "Current directory is not a git repository"
 fi
 
+vpn_core_ids() {
+  docker inspect -f '{{.Id}}' proxy-vpn-xray proxy-vpn-wireguard 2>/dev/null | tr '\n' ' ' | sed -e 's/[[:space:]]\+$//'
+}
+
+assert_vpn_core_unchanged() {
+  local before_ids="$1"
+  local after_ids
+  after_ids="$(vpn_core_ids)"
+  if [ -n "${before_ids}" ] && [ -n "${after_ids}" ] && [ "${before_ids}" != "${after_ids}" ]; then
+    die "VPN core containers changed during safe auto-update (xray/wireguard recreation detected)."
+  fi
+}
+
 vpn_core_rebuild_required_for_range() {
   local from_ref="$1"
   local to_ref="$2"
@@ -455,6 +468,8 @@ fi
 
 deploy_current() {
   if [ "${MODE}" = "prod" ]; then
+    local core_ids_before=""
+    core_ids_before="$(vpn_core_ids)"
     bash ./scripts/sync-env.sh prod
     log "Running production preflight"
     bash ./scripts/preflight-prod.sh
@@ -475,10 +490,11 @@ deploy_current() {
     esac
     if [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${vpn_core_rebuild}" != "1" ]; then
       log "Safe mode: no VPN core changes detected; rebuilding edge only."
-      dc -f compose.yaml -f compose.prod.yaml up -d --build api security-guard caddy
+      dc -f compose.yaml -f compose.prod.yaml up -d --no-deps --build api security-guard caddy
       if ! dc -f compose.yaml -f compose.prod.yaml start xray wireguard >/dev/null 2>&1; then
         dc -f compose.yaml -f compose.prod.yaml up -d xray wireguard
       fi
+      assert_vpn_core_unchanged "${core_ids_before}"
     elif [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${vpn_core_rebuild}" = "1" ]; then
       log "VPN core rebuild explicitly enabled; rebuilding full stack (including xray/wireguard)."
       dc -f compose.yaml -f compose.prod.yaml up -d --build
@@ -507,6 +523,8 @@ rollback_to_previous() {
   log "Rolling back to previous commit: ${LOCAL_SHA}"
   git checkout -f "${LOCAL_SHA}"
   if [ "${MODE}" = "prod" ]; then
+    local core_ids_before=""
+    core_ids_before="$(vpn_core_ids)"
     PRESERVE_VPN_CORE_ON_REBUILD="${PRESERVE_VPN_CORE_ON_REBUILD:-1}"
     XRAY_CLIENT_PORT="${XRAY_CLIENT_PORT:-${XRAY_PORT:-8443}}"
     WG_CLIENT_PORT="${WG_CLIENT_PORT:-${WG_PORT:-51820}}"
@@ -523,10 +541,11 @@ rollback_to_previous() {
       *) die "Unknown VPN_CORE_REBUILD_MODE=${VPN_CORE_REBUILD_MODE}. Use auto|always|never." ;;
     esac
     if [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${rollback_vpn_core_rebuild}" != "1" ]; then
-      dc -f compose.yaml -f compose.prod.yaml up -d --build api security-guard caddy
+      dc -f compose.yaml -f compose.prod.yaml up -d --no-deps --build api security-guard caddy
       if ! dc -f compose.yaml -f compose.prod.yaml start xray wireguard >/dev/null 2>&1; then
         dc -f compose.yaml -f compose.prod.yaml up -d xray wireguard
       fi
+      assert_vpn_core_unchanged "${core_ids_before}"
     elif [ "${PRESERVE_VPN_CORE_ON_REBUILD}" = "1" ] && [ "${rollback_vpn_core_rebuild}" = "1" ]; then
       dc -f compose.yaml -f compose.prod.yaml up -d --build
     else
