@@ -77,9 +77,11 @@ PrivateKey = ${SERVER_PRIVATE_KEY}
 PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 PostUp = iptables -A FORWARD -i wg0 -j ACCEPT
 PostUp = iptables -A FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT
 PostDown = iptables -D FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
 [Peer]
 PublicKey = ${CLIENT_PUBLIC_KEY}
