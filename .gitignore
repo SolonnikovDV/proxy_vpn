@@ -18,6 +18,8 @@ logs/app-release-state.json
 logs/update-check-request.json
 logs/update-apply-request.json
 logs/backup-status.json
+logs/list-sync-status.json
+logs/list-sync-audit.jsonl
 logs/update-audit.jsonl
 logs/pull-audit-*.log
 backups/

@@ -24,9 +24,11 @@ bash ./scripts/run.sh prod up
 # 5) Validate health
 MODE=prod HEALTH_TIMEOUT=120 bash ./scripts/healthcheck-stack.sh
 
-# 6) Enable scheduled auto-update and backups
+# 6) Enable scheduled auto-update, list sync and backups
 sudo DEPLOY_PATH=/opt/proxy_vpn RUN_USER=root BRANCH=main MODE=prod ON_CALENDAR="*:0/15" UPDATE_APPROVAL_REQUIRED=0 \
   bash ./scripts/setup-auto-update.sh
+sudo DEPLOY_PATH=/opt/proxy_vpn RUN_USER=root ON_CALENDAR="*:0/30" \
+  bash ./scripts/setup-list-sync.sh
 sudo DEPLOY_PATH=/opt/proxy_vpn RUN_USER=root MODE=prod ON_CALENDAR="daily" RETENTION_COUNT=14 \
   bash ./scripts/setup-backup.sh
 ```
@@ -83,6 +85,10 @@ Proxy bypass whitelist (traffic saving):
   - `Load preset: traffic-saving` (extended DIRECT baseline)
   - `Add resource` controls to append/update one rule without manual text editing
   - `Remove` button per resource row in preview table
+- dedicated resolve flow:
+  - `Admin -> Whitelist -> Need resolve` shows only unresolved conflicts
+  - each conflict supports `Keep` (acknowledge) or `Exclude` (remove from whitelist)
+  - apply is blocked while unresolved conflicts remain
 - RKN blacklist cross-check:
   - source file: `config/rkn-blacklist-rules.txt` (used for whitelist conflict detection)
   - if Direct resource overlaps blacklist, UI shows warning badge and requires explicit resolve action:
@@ -387,6 +393,8 @@ Optional bootstrap flags:
 - `GITHUB_ACTIONS_REPO=owner/repo` - explicit repository for server-side GitHub Actions config
 - `GITHUB_ACTIONS_TOKEN=<token>` - token for server-side GitHub Actions config
 - `GITHUB_ACTIONS_INCLUDE_SSH_PASSWORD=1` - additionally store `SSH_PASSWORD` secret from interactive prompt
+- `ENABLE_LIST_SYNC_TIMER=1` - install/enable scheduled whitelist/blacklist sync timer during bootstrap
+- `LIST_SYNC_ON_CALENDAR="*:0/30"` - systemd `OnCalendar` for list sync timer
 
 If you want to prepare server environment first and clone later:
 
@@ -510,6 +518,8 @@ Release metadata and update requests files:
 - `logs/update-check-request.json`
 - `logs/update-apply-request.json`
 - `logs/update-audit.jsonl`
+- `logs/list-sync-status.json`
+- `logs/list-sync-audit.jsonl`
 
 Release notes source used by update UI:
 - `RELEASE_NOTES.md` (latest section is shown as update notes)
@@ -524,6 +534,44 @@ Green CI gate:
 - auto-update checks GitHub commit status API (`/repos/<repo>/commits/<sha>/status`)
 - for private repositories set `GITHUB_API_TOKEN` in auto-update service environment
 - if status is not `success` (or API check fails), update is skipped and recorded in update audit/deploy history
+
+## Dynamic whitelist/blacklist sync
+
+To keep bypass routing current in dynamic mode, configure scheduled feed sync:
+- whitelist sources -> `PROXY_BYPASS_FEED_URLS`
+- blacklist sources -> `RKN_BLACKLIST_FEED_URLS`
+
+Supported source formats:
+- plain text (one resource per line)
+- CSV-like (resource in first column)
+- JSON payloads containing string resources/domains
+
+Sync behavior controls:
+- `PROXY_BYPASS_SYNC_MODE=merge|replace`
+- `RKN_BLACKLIST_SYNC_MODE=merge|replace`
+- `PROXY_BYPASS_PRESERVE_FORCE_VPN_ON_REPLACE=1` keeps manual `resource,true` overrides
+- `LIST_SYNC_HTTP_TIMEOUT_SECONDS`, `LIST_SYNC_MAX_ITEMS`, `LIST_SYNC_STRICT`
+
+Manual run:
+
+```bash
+bash ./scripts/sync-resource-lists.sh
+```
+
+Install periodic timer (example: every 30 minutes):
+
+```bash
+sudo DEPLOY_PATH=/opt/proxy_vpn RUN_USER=root ON_CALENDAR="*:0/30" \
+  bash ./scripts/setup-list-sync.sh
+```
+
+Logs and status:
+- `logs/list-sync-status.json` (last sync snapshot)
+- `logs/list-sync-audit.jsonl` (incremental history)
+- `journalctl -u proxy-vpn-list-sync.service -n 100 --no-pager`
+- Admin UI:
+  - `Overview -> List sync` card reads `/api/v1/admin/list-sync-status`
+  - `Run sync now` button triggers background sync via `POST /api/v1/admin/list-sync/run`
 
 ## Backup and restore (critical data)
 

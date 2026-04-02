@@ -8,6 +8,7 @@ import re
 import secrets
 import socket
 import sqlite3
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -80,6 +81,7 @@ APP_RELEASE_STATE_PATH = os.getenv("APP_RELEASE_STATE_PATH", "/logs/app-release-
 UPDATE_CHECK_REQUEST_PATH = os.getenv("UPDATE_CHECK_REQUEST_PATH", "/logs/update-check-request.json")
 UPDATE_APPLY_REQUEST_PATH = os.getenv("UPDATE_APPLY_REQUEST_PATH", "/logs/update-apply-request.json")
 BACKUP_STATUS_PATH = os.getenv("BACKUP_STATUS_PATH", "/logs/backup-status.json")
+LIST_SYNC_STATUS_PATH = os.getenv("LIST_SYNC_STATUS_PATH", "/logs/list-sync-status.json")
 UPDATE_AUDIT_PATH = os.getenv("UPDATE_AUDIT_PATH", "/logs/update-audit.jsonl")
 PROXY_BYPASS_RULES_PATH = os.getenv("PROXY_BYPASS_RULES_PATH", "config/proxy-bypass-rules.txt")
 RKN_BLACKLIST_RULES_PATH = os.getenv("RKN_BLACKLIST_RULES_PATH", "config/rkn-blacklist-rules.txt")
@@ -1369,6 +1371,104 @@ def _read_backup_state() -> dict[str, Any]:
             "reason": str(integ.get("reason", "")),
         }
     return merged
+
+
+def _default_list_sync_state() -> dict[str, Any]:
+    return {
+        "status": "unknown",
+        "updated_at": None,
+        "path": str(Path(LIST_SYNC_STATUS_PATH)),
+        "whitelist": {
+            "enabled": False,
+            "mode": "merge",
+            "sources": [],
+            "fetched_count": 0,
+            "before_count": 0,
+            "after_count": 0,
+            "changed": False,
+        },
+        "blacklist": {
+            "enabled": False,
+            "mode": "merge",
+            "sources": [],
+            "fetched_count": 0,
+            "before_count": 0,
+            "after_count": 0,
+            "changed": False,
+        },
+        "errors": [],
+        "reason": "list sync status file not found yet",
+    }
+
+
+def _read_list_sync_state() -> dict[str, Any]:
+    path = Path(LIST_SYNC_STATUS_PATH)
+    base = _default_list_sync_state()
+    base["path"] = str(path)
+    if not path.exists():
+        return base
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        out = dict(base)
+        out["status"] = "degraded"
+        out["reason"] = f"list sync status read error: {e}"
+        return out
+    if not isinstance(raw, dict):
+        out = dict(base)
+        out["status"] = "degraded"
+        out["reason"] = "list sync status payload is not an object"
+        return out
+    out = dict(base)
+    out.update(
+        {
+            "status": str(raw.get("status", base["status"])),
+            "updated_at": raw.get("updated_at"),
+            "errors": raw.get("errors") if isinstance(raw.get("errors"), list) else [],
+        }
+    )
+    wl = raw.get("whitelist")
+    if isinstance(wl, dict):
+        out["whitelist"] = {
+            "enabled": bool(wl.get("enabled", False)),
+            "mode": str(wl.get("mode", "merge")),
+            "sources": wl.get("sources") if isinstance(wl.get("sources"), list) else [],
+            "fetched_count": int(wl.get("fetched_count", 0) or 0),
+            "before_count": int(wl.get("before_count", 0) or 0),
+            "after_count": int(wl.get("after_count", 0) or 0),
+            "changed": bool(wl.get("changed", False)),
+        }
+    bl = raw.get("blacklist")
+    if isinstance(bl, dict):
+        out["blacklist"] = {
+            "enabled": bool(bl.get("enabled", False)),
+            "mode": str(bl.get("mode", "merge")),
+            "sources": bl.get("sources") if isinstance(bl.get("sources"), list) else [],
+            "fetched_count": int(bl.get("fetched_count", 0) or 0),
+            "before_count": int(bl.get("before_count", 0) or 0),
+            "after_count": int(bl.get("after_count", 0) or 0),
+            "changed": bool(bl.get("changed", False)),
+        }
+    out["reason"] = str(raw.get("reason", "")) if raw.get("reason") else ""
+    return out
+
+
+def _run_list_sync_async() -> None:
+    def _worker() -> None:
+        try:
+            script_path = (Path(__file__).resolve().parents[2] / "scripts" / "sync-resource-lists.sh").resolve()
+            subprocess.run(
+                ["bash", str(script_path)],
+                cwd=str(script_path.parents[1]),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as e:
+            print(f"[list-sync] WARN: async run failed: {e}")
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
 
 
 def _read_security_events(limit: int = 150) -> dict[str, Any]:
@@ -5615,6 +5715,22 @@ def admin(request: Request) -> HTMLResponse:
   <pre id="backup-message">No backup status yet.</pre>
 </div>
 
+<div class="card admin-section" data-section="overview" data-subsection="list-sync">
+  <h2>Resource list sync status</h2>
+  <p class="muted">Scheduled sync of whitelist/blacklist feeds for dynamic traffic optimization.</p>
+  <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <button data-action="run-list-sync-now">Run sync now</button>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;">
+    <div><div class="muted">Overall status</div><div id="list-sync-overall" style="font-size:24px;font-weight:700;">-</div></div>
+    <div><div class="muted">Last sync</div><div id="list-sync-updated" style="font-size:14px;font-weight:700;">-</div></div>
+    <div><div class="muted">Whitelist result</div><div id="list-sync-whitelist" style="font-size:14px;font-weight:700;">-</div></div>
+    <div><div class="muted">Blacklist result</div><div id="list-sync-blacklist" style="font-size:14px;font-weight:700;">-</div></div>
+  </div>
+  <p class="muted" id="list-sync-path">path: -</p>
+  <pre id="list-sync-message">No list sync status yet.</pre>
+</div>
+
 <div class="card admin-section" data-section="security" data-subsection="incidents">
   <h2>Security incidents</h2>
   <p class="muted">Telemetry from dedicated security-guard container: DDoS, brute-force, scan/probe and mitigation actions.</p>
@@ -5927,6 +6043,7 @@ const sectionSubsections = {{
     ['deploy', 'Deploy'],
     ['updates', 'Updates audit'],
     ['backup', 'Backup'],
+    ['list-sync', 'List sync'],
   ],
   security: [
     ['incidents', 'Incidents'],
@@ -6347,6 +6464,55 @@ function renderBackupStatus(data) {{
   const msg = (data && data.message) ? data.message : 'No backup status yet.';
   const reason = (data && data.integrity && data.integrity.reason) ? data.integrity.reason : '';
   msgEl.textContent = reason ? (String(msg) + '\\n' + String(reason)) : String(msg);
+}}
+function renderListSyncStatus(data) {{
+  const overallEl = document.getElementById('list-sync-overall');
+  const updatedEl = document.getElementById('list-sync-updated');
+  const whitelistEl = document.getElementById('list-sync-whitelist');
+  const blacklistEl = document.getElementById('list-sync-blacklist');
+  const pathEl = document.getElementById('list-sync-path');
+  const msgEl = document.getElementById('list-sync-message');
+  if (!overallEl || !updatedEl || !whitelistEl || !blacklistEl || !pathEl || !msgEl) return;
+  const st = String((data && data.status) || 'unknown');
+  overallEl.innerHTML = backupBadge(st);
+  updatedEl.textContent = String((data && data.updated_at) || '-');
+  const wl = (data && data.whitelist) ? data.whitelist : {{}};
+  const bl = (data && data.blacklist) ? data.blacklist : {{}};
+  const wlChanged = !!wl.changed;
+  const blChanged = !!bl.changed;
+  whitelistEl.innerHTML =
+    `mode=${{escHtml(String(wl.mode || '-'))}} · ${{Number(wl.before_count || 0)}} -> ${{Number(wl.after_count || 0)}} ` +
+    (wlChanged ? '<span class="status-pill status-pending">changed</span>' : '<span class="status-pill status-running">stable</span>');
+  blacklistEl.innerHTML =
+    `mode=${{escHtml(String(bl.mode || '-'))}} · ${{Number(bl.before_count || 0)}} -> ${{Number(bl.after_count || 0)}} ` +
+    (blChanged ? '<span class="status-pill status-pending">changed</span>' : '<span class="status-pill status-running">stable</span>');
+  pathEl.textContent = 'path: ' + String((data && data.path) || '-');
+  const errs = Array.isArray(data && data.errors) ? data.errors : [];
+  const reason = String((data && data.reason) || '');
+  if (errs.length) {{
+    msgEl.textContent = errs.slice(0, 20).join('\\n');
+  }} else if (reason) {{
+    msgEl.textContent = reason;
+  }} else {{
+    msgEl.textContent = 'List sync is healthy.';
+  }}
+}}
+async function runListSyncNow() {{
+  const msgEl = document.getElementById('list-sync-message');
+  if (msgEl) msgEl.textContent = 'Starting list sync...';
+  const r = await fetch('/api/v1/admin/list-sync/run', {{
+    method: 'POST',
+    headers: {{'X-CSRF-Token': getCsrfToken()}},
+  }});
+  const txt = await r.text();
+  if (!r.ok) {{
+    if (msgEl) msgEl.textContent = txt;
+    return;
+  }}
+  let j = null;
+  try {{ j = JSON.parse(txt); }} catch (e) {{ j = null; }}
+  if (msgEl) msgEl.textContent = (j && j.message) ? String(j.message) : txt;
+  setTimeout(refreshAdminLive, 1200);
 }}
 async function openServiceLogs(containerName) {{
   currentServiceLogContainer = containerName;
@@ -7178,7 +7344,7 @@ async function applyProxyBypass() {{
 }}
 async function refreshAdminLive() {{
   const nc = () => 'ts=' + Date.now() + '&r=' + Math.random().toString(36).slice(2, 8);
-  const [statsR, onlineR, tsR, trafficR, servicesR, deployEventsR, updateAuditR, capacityR, backupStatusR, securityEventsR, securityBlockedR, pairedR, wgBindingsR, xrayBindingsR] = await Promise.all([
+  const [statsR, onlineR, tsR, trafficR, servicesR, deployEventsR, updateAuditR, capacityR, backupStatusR, listSyncStatusR, securityEventsR, securityBlockedR, pairedR, wgBindingsR, xrayBindingsR] = await Promise.all([
     fetch('/api/v1/admin/stats?' + nc(), {{ cache: 'no-store' }}),
     fetch('/api/v1/admin/online-users?' + nc(), {{ cache: 'no-store' }}),
     fetch('/api/v1/admin/system-metrics/timeseries?minutes=60&' + nc(), {{ cache: 'no-store' }}),
@@ -7188,6 +7354,7 @@ async function refreshAdminLive() {{
     fetch('/api/v1/admin/update-audit?' + buildUpdateAuditQuery() + '&' + nc(), {{ cache: 'no-store' }}),
     fetch('/api/v1/admin/capacity-status?window_minutes=60&' + nc(), {{ cache: 'no-store' }}),
     fetch('/api/v1/admin/backup-status?' + nc(), {{ cache: 'no-store' }}),
+    fetch('/api/v1/admin/list-sync-status?' + nc(), {{ cache: 'no-store' }}),
     fetch('/api/v1/admin/security/events?limit=120&' + nc(), {{ cache: 'no-store' }}),
     fetch('/api/v1/admin/security/blocked?limit=120&' + nc(), {{ cache: 'no-store' }}),
     fetch('/api/v1/admin/paired-status?' + nc(), {{ cache: 'no-store' }}),
@@ -7259,6 +7426,10 @@ async function refreshAdminLive() {{
   if (backupStatusR.ok) {{
     const b = await backupStatusR.json();
     renderBackupStatus(b);
+  }}
+  if (listSyncStatusR.ok) {{
+    const ls = await listSyncStatusR.json();
+    renderListSyncStatus(ls);
   }}
   if (securityEventsR.ok) {{
     const s = await securityEventsR.json();
@@ -7575,6 +7746,7 @@ document.addEventListener('click', (event) => {{
     if (action === 'reload-configurator') return void loadConfigurator();
     if (action === 'apply-proxy-bypass') return void applyProxyBypass();
     if (action === 'reload-proxy-bypass') return void loadProxyBypass();
+    if (action === 'run-list-sync-now') return void runListSyncNow();
     if (action === 'apply-update-filters') return void applyUpdateAuditFilters();
     if (action === 'reset-update-filters') return void resetUpdateAuditFilters();
     if (action === 'apply-security-filters') return void applySecurityFilters();
@@ -8528,6 +8700,25 @@ def admin_capacity_status(request: Request, window_minutes: int = 60) -> JSONRes
 def admin_backup_status(request: Request) -> JSONResponse:
     _require_admin(request)
     return JSONResponse(_read_backup_state())
+
+
+@app.get("/api/v1/admin/list-sync-status")
+def admin_list_sync_status(request: Request) -> JSONResponse:
+    _require_admin(request)
+    return JSONResponse(_read_list_sync_state())
+
+
+@app.post("/api/v1/admin/list-sync/run")
+def admin_list_sync_run(request: Request) -> JSONResponse:
+    _require_admin(request)
+    _ensure_csrf(request)
+    _run_list_sync_async()
+    return JSONResponse(
+        {
+            "status": "ok",
+            "message": "List sync started in background. Refresh status in a few seconds.",
+        }
+    )
 
 
 @app.get("/api/v1/admin/security/events")

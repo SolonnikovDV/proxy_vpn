@@ -23,6 +23,8 @@ check_repo_contract() {
   require_file_nonempty "scripts/backup-critical.sh"
   require_file_nonempty "scripts/restore-critical.sh"
   require_file_nonempty "scripts/setup-backup.sh"
+  require_file_nonempty "scripts/sync-resource-lists.sh"
+  require_file_nonempty "scripts/setup-list-sync.sh"
   require_file_nonempty "scripts/pull-audit.sh"
   require_file_nonempty "scripts/bootstrap-ubuntu.sh"
   require_file_nonempty "security_guard/app.py"
@@ -31,7 +33,7 @@ check_repo_contract() {
   grep -Eq "name:[[:space:]]*proxy-vpn_api_data" compose.yaml || die "compose.yaml missing api data volume"
   grep -Eq "security-guard:" compose.yaml || die "compose.yaml missing security-guard service"
 
-  for k in APP_SECRET_KEY_FILE ADMIN_PASSWORD_FILE; do
+  for k in APP_SECRET_KEY_FILE ADMIN_PASSWORD_FILE PROXY_BYPASS_FEED_URLS RKN_BLACKLIST_FEED_URLS PROXY_BYPASS_SYNC_MODE RKN_BLACKLIST_SYNC_MODE; do
     grep -Eq "^${k}=" .env.production.example || die ".env.production.example missing ${k}"
   done
 
@@ -45,7 +47,7 @@ check_repo_contract() {
   grep -Eq "REPO_SYNC_STRATEGY=.*mirror" scripts/auto-update.sh || die "auto-update.sh missing mirror sync strategy default"
 
   # Bootstrap contract: some vars have defaults, some are interactive-required.
-  for k in TARGET_USER DEPLOY_PATH CLONE_REPO AUTO_PULL_REPO CONFIGURE_GITHUB_REPO_ACCESS AUTO_GENERATE_VPN_CONFIGS CONFIGURE_GITHUB_ACTIONS_FROM_SERVER APP_SECRET_KEY_FILE ADMIN_PASSWORD_FILE; do
+  for k in TARGET_USER DEPLOY_PATH CLONE_REPO AUTO_PULL_REPO CONFIGURE_GITHUB_REPO_ACCESS AUTO_GENERATE_VPN_CONFIGS CONFIGURE_GITHUB_ACTIONS_FROM_SERVER APP_SECRET_KEY_FILE ADMIN_PASSWORD_FILE PROXY_BYPASS_FEED_URLS RKN_BLACKLIST_FEED_URLS PROXY_BYPASS_SYNC_MODE RKN_BLACKLIST_SYNC_MODE; do
     grep -Eq "^${k}=\\\"\\$\\{${k}:-.*\\}\\\"" scripts/bootstrap-ubuntu.sh || die "bootstrap-ubuntu.sh missing default assignment for ${k}"
   done
 
